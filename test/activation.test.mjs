@@ -314,7 +314,7 @@ test('orca-plugin.json은 스키마 필수 필드와 참조 일관성을 만족�
 
   assert.equal(manifest.manifestVersion, 1)
   assert.equal(manifest.id, 'cache-keepalive')
-  assert.equal(manifest.publisher, 'community-keepalive')
+  assert.equal(manifest.publisher, 'runaticmoon')
   assert.equal(manifest.name, 'Cache Keepalive')
   assert.equal(manifest.version, '0.1.0')
   assert.equal(manifest.pluginApi, 1)

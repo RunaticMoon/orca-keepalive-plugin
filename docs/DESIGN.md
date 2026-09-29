@@ -318,13 +318,13 @@ Cmd-J(Windows/Linux Ctrl-J)는 Orca 커맨드 UI에 진입하는 기존 사용 �
 
 ### 7.2 manifest 전체 초안
 
-publisher `community-keepalive`는 개발용 유효 slug다. 실제 소유자의 publisher slug/저장소 URL은 출시 직전에 지휘자가 교체하며, 설치 후 identity를 바꾸면 별도 플러그인이 되는 점에 유의한다. 저장소 이름은 `orca-keepalive-plugin`이어도 manifest id는 reserved `orca-` 접두를 사용하지 않는다.
+publisher는 개발 중 `community-keepalive`였고 출시 전 저장소 소유자 계정 `runaticmoon`으로 확정했다(저장소 https://github.com/RunaticMoon/orca-keepalive-plugin, 라이선스 MIT). 설치 후 identity를 바꾸면 별도 플러그인이 되는 점에 유의한다. 저장소 이름은 `orca-keepalive-plugin`이어도 manifest id는 reserved `orca-` 접두를 사용하지 않는다.
 
 ```json
 {
   "manifestVersion": 1,
   "id": "cache-keepalive",
-  "publisher": "community-keepalive",
+  "publisher": "runaticmoon",
   "name": "Cache Keepalive",
   "version": "0.1.0",
   "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",
@@ -687,7 +687,7 @@ node scripts/demo.mjs
   "owner": "PUBLISHER_ACCOUNT",
   "plugins": [
     {
-      "id": "community-keepalive.cache-keepalive",
+      "id": "runaticmoon.cache-keepalive",
       "source": {
         "kind": "git",
         "url": "https://github.com/PUBLISHER_ACCOUNT/orca-keepalive-plugin.git",

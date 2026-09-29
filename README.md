@@ -8,7 +8,9 @@ and per-terminal toggles, a global pause, and a small authenticated dashboard.
 This is a **community, experimental** plugin. It is not an official Stably plugin.
 
 - Plugin id: `cache-keepalive`
-- Publisher slug: `community-keepalive` (placeholder — see [docs/PUBLISHING.md](docs/PUBLISHING.md))
+- Publisher slug: `runaticmoon` (marketplace id `runaticmoon.cache-keepalive`)
+- License: MIT (see [LICENSE](LICENSE))
+- Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
 - Version: `0.1.0`
 - Minimum Orca engine declared: `>=1.4.214`
 - Plugin API: `pluginApi 1` (`contributes` is strict)

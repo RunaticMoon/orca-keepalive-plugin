@@ -1,7 +1,7 @@
 {
   "manifestVersion": 1,
   "id": "cache-keepalive",
-  "publisher": "community-keepalive",
+  "publisher": "runaticmoon",
   "name": "Cache Keepalive",
   "version": "0.1.0",
   "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",

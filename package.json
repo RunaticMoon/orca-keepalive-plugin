@@ -2,6 +2,11 @@
   "name": "orca-cache-keepalive",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RunaticMoon/orca-keepalive-plugin.git"
+  },
   "type": "module",
   "description": "Orca community plugin that schedules small keepalive messages for idle Claude terminals.",
   "engines": {

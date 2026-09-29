@@ -10,14 +10,14 @@ git tag whose commit contains `orca-plugin.json`, `main.mjs`, `src/`, `ui/`.
 
 ---
 
-## 1. Required inputs before release (some undecided)
+## 1. Required inputs before release
 
 | Input | Current state | Action |
 |---|---|---|
-| Publisher slug | **Placeholder**: manifest `publisher` is `"community-keepalive"`. | Replace with the real owner's publisher slug. |
+| Publisher slug | **Decided**: `runaticmoon` (the repository owner's GitHub account, lowercased to satisfy the kebab-case slug rule). | Keep it identical in the manifest and the marketplace entry. |
 | Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Keep or rename before first publish; changing identity after install creates a different plugin. |
-| License | **미정 — no `LICENSE` file exists in this repository** (checked). | Choose and add a license. If any reference-tool code were copied, its notice would need separate review; this repository implements its own code and does not copy `claude-cache-keepalive` code. |
-| Git remote URL | A remote is configured locally as `origin` = `https://github.com/RunaticMoon/orca-keepalive-plugin` **(확인 필요 — whether this is the public release remote is not confirmed)**. | Confirm the public remote URL (or create one). This is `<REMOTE_URL>` below. |
+| License | **Decided**: MIT (`LICENSE`, `package.json` `license`). | This repository implements its own code and does not copy `claude-cache-keepalive` code. |
+| Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin`. | The repository must be **public** before a marketplace entry can resolve it. This is `<REMOTE_URL>` below. |
 | Version tag | Manifest `version` is `0.1.0`; suggested tag `v0.1.0`. | Confirm the tag matches the manifest version and the resolved commit. |
 | Marketplace categories | **확인 필요** — see §2. | Pick categories that actually exist in the marketplace index. |
 
@@ -27,7 +27,7 @@ The manifest currently declares:
 {
   "manifestVersion": 1,
   "id": "cache-keepalive",
-  "publisher": "community-keepalive",
+  "publisher": "runaticmoon",
   "version": "0.1.0",
   "engines": { "orca": ">=1.4.214" },
   "pluginApi": 1
@@ -68,13 +68,12 @@ Example for this plugin (placeholders in angle brackets are **확인 필요**):
 }
 ```
 
-With the current placeholder publisher and observed remote, the entry would look
-like this — **do not publish until the publisher slug, remote, license and
-categories are confirmed**:
+With the decided publisher and remote, the entry looks like this — **do not submit
+until the repository is public, the tag exists, and the category is confirmed**:
 
 ```json
 {
-  "id": "community-keepalive.cache-keepalive",
+  "id": "runaticmoon.cache-keepalive",
   "source": {
     "kind": "git",
     "url": "https://github.com/RunaticMoon/orca-keepalive-plugin.git",
