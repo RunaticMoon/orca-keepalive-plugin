@@ -21,7 +21,7 @@ install time. A release is a git tag whose commit contains `orca-plugin.json`,
 | Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Changing identity after install creates a different plugin. |
 | License | **Decided**: MIT (`LICENSE`, `package.json` `license`). | This repository implements its own code and does not copy `claude-cache-keepalive` code. |
 | Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin` (public). | Users install from this URL. |
-| Version tag | Manifest `version` is `0.1.0`; release tag `v0.1.0`. | The tag must match the manifest version. |
+| Version tag | Manifest `version` is `0.1.0`. Tags are optional (e.g. `v0.1.0`). | If you tag, the tag must match the manifest version. |
 
 The manifest currently declares:
 
@@ -47,21 +47,30 @@ official or Stably-published.
 Orca's **Settings > Plugins > "Install plugin"** dialog offers two tabs that do not
 go through a marketplace:
 
-- **Git URL** — enter the repository URL with an explicit ref (tag or commit):
+- **Git URL** — enter the repository URL with a `#ref`:
 
   ```text
-  https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0
+  https://github.com/RunaticMoon/orca-keepalive-plugin#main     (latest code)
+  https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0   (fixed release)
   ```
 
-  Only HTTPS or SSH URLs are accepted, and the `#ref` is required. Orca copies the
-  plugin into its plugin directory and shows the requested permissions for review.
+  Only HTTPS or SSH URLs are accepted, and the dialog requires a non-empty `#ref`.
+  The dialog text says "tag or commit", but the installer runs
+  `git clone --depth 1 --branch <ref>` for anything that is not a full SHA, so a
+  branch name works too (`src/main/plugins/plugin-git-repository.ts`). Orca records
+  the resolved commit, copies the plugin into its plugin directory and shows the
+  requested permissions for review.
 - **Local folder** — point at a local clone of this repository.
 
 For development there is also **Settings > Plugins > Development > "Development
 plugin folder path"** + "Add path" (see the README), which loads the folder in place.
 
-Updating: a Git URL install is pinned to its ref. To update, install again with the
-new tag (e.g. `#v0.1.1`).
+Updating: Orca has no automatic update for Git URL installs; each install is frozen
+at the commit it resolved. To update, run **Install plugin** again — with the same
+`#main` URL to get the newest commit, or with a newer tag. Orca publishes the new
+copy under the same plugin key, keeps the plugin's stored data, and retains the
+previous copy for rollback (`src/main/plugins/plugin-install-publication.ts`). A
+permission change is shown for review again.
 
 ---
 
@@ -75,10 +84,11 @@ new tag (e.g. `#v0.1.1`).
        to the verified minimum. (`>=1.4.214` is the current declared minimum.)
 4. [ ] The release commit contains the full plugin (`orca-plugin.json`, `main.mjs`,
        `src/`, `ui/`); no install/build hook is required.
-5. [ ] Tag the release and push the tag:
-       `git tag v0.1.0 && git push origin v0.1.0`.
-6. [ ] Smoke-test the Git URL install in Orca with the new tag: install, permission
-       review, enable, disable, and remove.
+5. [ ] Optional: tag a fixed release and push the tag
+       (`git tag v0.1.0 && git push origin v0.1.0`). Users on `#main` do not need
+       tags; tags are for users who want a pinned version.
+6. [ ] Smoke-test the Git URL install in Orca (`#main` and, if tagged, the tag):
+       install, permission review, enable, reinstall to update, disable, remove.
 
 ---
 

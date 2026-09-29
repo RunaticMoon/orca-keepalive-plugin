@@ -101,19 +101,23 @@ in any marketplace; install it directly from Git or from a local folder.
 ### From the Git URL
 
 1. In Orca open **Settings > Plugins** and click **Install plugin**.
-2. Choose the **Git URL** tab and enter the repository URL with a release tag:
+2. Choose the **Git URL** tab and enter the repository URL with a `#ref`:
 
    ```text
-   https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0
+   https://github.com/RunaticMoon/orca-keepalive-plugin#main
    ```
 
-   The `#ref` (tag or commit) is required. Orca copies the plugin and shows the
-   requested permissions for review.
+   The dialog requires some `#ref`. It can be a branch (`#main`, follows the latest
+   code), a tag (e.g. `#v0.1.0`, a fixed release), or a full commit SHA. Orca copies
+   the plugin and shows the requested permissions for review.
 3. Approve the permissions, then run **Cache Keepalive: Open Dashboard** from the
    command palette.
 
-To update, install again with the newer tag. You can also use the **Local folder**
-tab with a local clone.
+Updating: Orca does not auto-update plugins installed from a Git URL. To update,
+run **Install plugin** again with the same URL (`#main` picks up the newest commit)
+or with a newer tag. Orca replaces the installed copy in place, keeps the plugin's
+stored settings, and keeps the previous copy for rollback. You can also use the
+**Local folder** tab with a local clone.
 
 ### Development path
 
@@ -297,8 +301,10 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   관측되면 카운터가 자동 초기화됩니다. `~/.claude/cwarm.disabled`를 존중합니다.
 - **설치:** 마켓플레이스에는 등록하지 않는 커뮤니티 플러그인입니다. Orca 설정 >
   Plugins > "Install plugin" > "Git URL" 탭에
-  `https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0`을 넣어 설치합니다
-  (`#태그`는 필수). 개발 중에는 Plugins > Development에서 폴더 절대 경로를 넣고
+  `https://github.com/RunaticMoon/orca-keepalive-plugin#main`을 넣어 설치합니다.
+  `#ref`는 필수이며 브랜치(`#main`, 최신 코드)·태그(`#v0.1.0`, 고정)·커밋 모두
+  됩니다. 자동 업데이트는 없고 같은 URL로 다시 설치하면 최신 커밋으로 교체되며
+  설정은 유지됩니다. 개발 중에는 Plugins > Development에서 폴더 절대 경로를 넣고
   "Add path". 어느 방식이든 권한 검토가 필요하며 빌드/설치 명령은 없습니다.
 - **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
   events:subscribe.
