@@ -12,7 +12,7 @@
  * @module coordinator
  */
 
-import { TIMING } from './contracts.mjs'
+import { REASON_CODES, TIMING } from './contracts.mjs'
 import { sameBinding } from './runtime-location.mjs'
 import { marginFor } from './scheduler.mjs'
 
@@ -264,18 +264,20 @@ export function createCoordinator({
 
   /**
    * targets Map의 최신 state에 reduce를 적용한다(클로저에 잡힌 옛 state 금지).
-   * 적용 뒤 RuntimeView용 decision을 갱신한다.
+   * 적용 뒤 RuntimeView용 decision을 갱신한다. config를 넘기면 그 값으로,
+   * 생략하면 refreshDecision이 그 시점의 store config를 읽는다.
    * @param {string} key
    * @param {object} input
+   * @param {object} [config]
    * @returns {any|null}
    */
-  function applyReduce(key, input) {
+  function applyReduce(key, input, config) {
     const entry = targets.get(key)
     if (!entry) {
       return null
     }
     entry.state = scheduler.reduceTarget(entry.state, input)
-    refreshDecision(key)
+    refreshDecision(key, config)
     return entry.state
   }
 
@@ -532,6 +534,10 @@ export function createCoordinator({
       return
     }
 
+    // 이번 tick에서 쓸 config를 한 번만 읽는다. store.snapshot()은 전체 상태를
+    // structuredClone+freeze 하므로 target마다 반복 호출하지 않는다.
+    let tickConfig = store.snapshot().config
+
     // a. clock gap 검사.
     const now = clock.now()
     const mono = clock.monoNow()
@@ -543,7 +549,7 @@ export function createCoordinator({
         monoElapsed > TIMING.clockGapMs + tickMs
       ) {
         for (const key of [...targets.keys()]) {
-          applyReduce(key, { type: 'CLOCK_GAP' })
+          applyReduce(key, { type: 'CLOCK_GAP' }, tickConfig)
         }
       }
     }
@@ -573,6 +579,9 @@ export function createCoordinator({
     // d. 대기 중 이벤트 drain.
     await drainEvents()
 
+    // 위 await 동안 대시보드에서 바뀐 config를 반영하도록 target 루프 직전에 다시 읽는다.
+    tickConfig = store.snapshot().config
+
     // e. supported target 결정.
     const candidates = []
     for (const key of [...targets.keys()]) {
@@ -590,7 +599,7 @@ export function createCoordinator({
         continue
       }
       const prevPhase = entry.state.phase
-      const ticked = applyReduce(key, { type: 'TICK', now: clock.now() })
+      const ticked = applyReduce(key, { type: 'TICK', now: clock.now() }, tickConfig)
       if (prevPhase !== 'NEEDS_REVIEW' && ticked !== null && ticked.phase === 'NEEDS_REVIEW') {
         // turn-start 확인 창이 지나 NEEDS_REVIEW로 전환됐다. store에도 기록해야
         // 대시보드 해제 버튼이 뜬다(§5.4/§7.3). 전환 시 1회만 호출된다.
@@ -600,7 +609,7 @@ export function createCoordinator({
       if (decision && decision.kind === 'expire') {
         const state = targets.get(key)?.state
         if (state && state.epoch !== null) {
-          applyReduce(key, { type: 'EXPIRE', epochId: state.epoch.id })
+          applyReduce(key, { type: 'EXPIRE', epochId: state.epoch.id }, tickConfig)
         }
         diagnostics.record({ event: 'epoch_expired', code: 'EXPIRED', targetId: key })
       } else if (decision && decision.kind === 'send') {
@@ -610,7 +619,7 @@ export function createCoordinator({
           // 대시보드에는 기존 reason 필드로 이유를 노출한다.
           entry.decision = {
             kind: 'wait',
-            reason: 'catalog_incomplete',
+            reason: REASON_CODES.CATALOG_INCOMPLETE,
             dueAt: decision.dueAt ?? null,
             expiresAt: decision.expiresAt ?? null,
           }
@@ -718,7 +727,7 @@ export function createCoordinator({
     }
     if (!catalogIncomplete) {
       catalogIncomplete = true
-      diagnostics.record({ event: 'safety_skipped', code: 'catalog_incomplete' })
+      diagnostics.record({ event: 'safety_skipped', code: REASON_CODES.CATALOG_INCOMPLETE })
     }
   }
 
@@ -1277,6 +1286,16 @@ export function createCoordinator({
           rpc.close()
         } catch {
           // ignore
+        }
+      }
+      // in-flight 전송을 abort하지 않는다. paste 이후 abort는 실제로 전달됐을 수 있는
+      // 입력을 "불확실"로 확정하지 못하게 만들기 때문이다. 대신 stopped 플래그와
+      // STALE_TARGET 게이트가 남은 전송을 막는다. 대기 중 저장은 여기서 비운다.
+      if (typeof store.flush === 'function') {
+        try {
+          await store.flush()
+        } catch {
+          // flush 미지원/실패는 무시한다.
         }
       }
     })()

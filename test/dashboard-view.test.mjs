@@ -129,7 +129,7 @@ test('formatRemaining: boundaries', () => {
 
 test('reasonText: every REASON_CODES value maps to a Korean sentence', () => {
   const codes = Object.keys(REASON_CODES);
-  assert.equal(codes.length, 23, 'expected 23 reason codes in contracts');
+  assert.equal(codes.length, 24, 'expected 24 reason codes in contracts');
   for (const code of codes) {
     const text = reasonText(code);
     assert.equal(typeof text, 'string', `${code} should map to a string`);

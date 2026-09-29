@@ -265,9 +265,9 @@ test('contracts 상수는 모두 frozen이다', () => {
   }
 });
 
-test('REASON_CODES는 23개이며 값이 key와 같다', () => {
+test('REASON_CODES는 24개이며 값이 key와 같다', () => {
   const codes = Object.keys(contracts.REASON_CODES);
-  assert.equal(codes.length, 23);
+  assert.equal(codes.length, 24);
   for (const code of codes) {
     assert.equal(contracts.REASON_CODES[code], code);
   }
@@ -295,6 +295,7 @@ test('REASON_CODES는 23개이며 값이 key와 같다', () => {
     'STALE_TARGET',
     'STORAGE_FAILED',
     'PARTIAL_OR_UNKNOWN_SEND',
+    'CATALOG_INCOMPLETE',
   ];
   assert.deepEqual(codes.sort(), [...expected].sort());
 });

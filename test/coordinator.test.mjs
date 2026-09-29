@@ -240,7 +240,7 @@ function createHarness(options = {}) {
         randomId: () => `att-${(attemptCounter += 1)}`,
       })
 
-  const spy = { resetBudget: [], confirmAttempt: [], markReview: [] }
+  const spy = { resetBudget: [], confirmAttempt: [], markReview: [], flush: [] }
   const store = Object.assign({}, rawStore, {
     resetBudget: async (scope, opts) => {
       spy.resetBudget.push(scope)
@@ -255,6 +255,12 @@ function createHarness(options = {}) {
       return rawStore.markReview(attemptIdOrScope, reason, opts)
     },
   })
+  if (typeof rawStore.flush === 'function') {
+    store.flush = async (...args) => {
+      spy.flush.push(args)
+      return rawStore.flush(...args)
+    }
+  }
 
   const resolveCalls = []
   async function resolveBinding(override) {
@@ -916,12 +922,51 @@ test('stop: timer를 정리하고 2회 안전하며 이후 send/timer가 없다'
   await h.coordinator.stop()
   assert.equal(h.clock.pendingCount(), 0)
   assert.equal(h.rpcClosed, true)
+  // stop은 대기 중 저장을 1회 flush한다.
+  assert.equal(h.spy.flush.length, 1)
 
   await h.coordinator.stop()
   const sentBefore = h.sendCalls.length
   await h.clock.advance(TTL_5M + 10000)
   assert.equal(h.sendCalls.length, sentBefore)
   assert.equal(h.clock.pendingCount(), 0)
+  // 두 번째 stop은 같은 stopPromise라 flush를 다시 호출하지 않는다.
+  assert.equal(h.spy.flush.length, 1)
+})
+
+test('Y3: tick 1회에서 store.snapshot 호출이 target 수에 비례하지 않는다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', paneKey: 'tab:leaf1', ptyId: 'pty1', incarnationId: 'inc1' }),
+    makeRow({ handle: 'h2', paneKey: 'tab:leaf2', ptyId: 'pty2', incarnationId: 'inc2' }),
+    makeRow({ handle: 'h3', paneKey: 'tab:leaf3', ptyId: 'pty3', incarnationId: 'inc3' }),
+  ]
+  const h = createHarness({ terminals: rows })
+  await startHarness(h)
+
+  const t0 = h.clock.now()
+  for (const paneKey of ['tab:leaf1', 'tab:leaf2', 'tab:leaf3']) {
+    h.coordinator.onAgentEvent({ worktreeId: 'w1', paneKey, state: 'working', receivedAt: t0 })
+    await h.clock.settle()
+    h.coordinator.onAgentEvent({ worktreeId: 'w1', paneKey, state: 'done', receivedAt: t0 + 1000 })
+    await h.clock.settle()
+  }
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].terminals.length, 3)
+  assert.ok(view.worktrees[0].terminals.every((term) => term.phase === 'ARMED'))
+
+  // arm까지의 이벤트 경로 호출은 제외하고 다음 tick만 센다.
+  const rawSnapshot = h.rawStore.snapshot
+  let snapshotCalls = 0
+  h.store.snapshot = (...args) => {
+    snapshotCalls += 1
+    return rawSnapshot.apply(h.rawStore, args)
+  }
+
+  await h.clock.advance(h.tickMs)
+  assert.ok(
+    snapshotCalls <= 2,
+    `tick 1회 snapshot 호출은 target 수(3)가 아니라 상수여야 한다: ${snapshotCalls}`,
+  )
 })
 
 test('bootstrap 실패: start는 throw하지 않고 connection을 unavailable로 표시한다', async () => {
@@ -1134,7 +1179,7 @@ test('U2: catalog가 불완전하면 due여도 전송 0, complete 복귀 후 재
 
   const incomplete = () =>
     h.diagEvents.filter(
-      (entry) => entry.event === 'safety_skipped' && entry.code === 'catalog_incomplete',
+      (entry) => entry.event === 'safety_skipped' && entry.code === 'CATALOG_INCOMPLETE',
     )
 
   // 불완전 전환: 다음 tick에서 1회 진단.
