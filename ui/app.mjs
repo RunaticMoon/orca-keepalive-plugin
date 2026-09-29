@@ -82,6 +82,8 @@ export const REASON_TEXT = Object.freeze({
     '상태 저장에 실패했습니다. 로그와 디스크 상태를 확인하세요.',
   PARTIAL_OR_UNKNOWN_SEND:
     '전송 결과를 확인할 수 없습니다. 터미널 입력창을 확인하세요.',
+  catalog_incomplete:
+    'Orca 터미널 목록이 불완전해 자동 전송을 멈췄습니다. 목록이 복구되면 다시 동작합니다.',
 });
 
 /** Em dash used for unknown numeric values. */

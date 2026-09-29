@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import { createCoordinator } from '../src/coordinator.mjs'
 import { createStateStore } from '../src/state-store.mjs'
+import { sendKeepalive } from '../src/guarded-send.mjs'
 import * as scheduler from '../src/scheduler.mjs'
 
 const DEFAULT_MESSAGE =
@@ -264,14 +265,16 @@ function createHarness(options = {}) {
 
   let getBindingRef = null
   let rpcClosed = false
-  const rpc = {
-    async call() {
-      return { terminals: [], truncated: false }
-    },
-    close() {
-      rpcClosed = true
-    },
-  }
+  const rpc =
+    options.rpc ??
+    {
+      async call() {
+        return { terminals: [], truncated: false }
+      },
+      close() {
+        rpcClosed = true
+      },
+    }
   function createRpc({ getBinding }) {
     getBindingRef = getBinding
     return rpc
@@ -339,7 +342,7 @@ function createHarness(options = {}) {
     createRpc,
     createObserver: () => observer,
     readSettings,
-    sendKeepalive,
+    sendKeepalive: options.sendKeepalive ?? sendKeepalive,
     scheduler,
     diagnostics,
     cwarmDisabled,
@@ -919,4 +922,260 @@ test('bootstrap 실패: wrong_runtime은 wrong_runtime으로 표시한다', asyn
   await h.clock.settle(3)
   assert.equal(h.coordinator.getRuntimeView().connection.state, 'wrong_runtime')
   await h.coordinator.stop()
+})
+
+// ---------------------------------------------------------------------------
+// 15. U1: 예약 후 LIMIT_REACHED 경계(off-by-one) 회귀
+//
+// 기존 테스트의 fake sendKeepalive는 gate2(예약 후 재확인)를 재현하지 않아
+// maxConsecutiveKeepalives 경계에서 guarded-send가 refused 되는 버그를 가렸다.
+// 여기서는 실제 sendKeepalive + 실제 createStateStore를 사용한다.
+// ---------------------------------------------------------------------------
+
+/** terminal.send를 실제 guarded-send 흐름처럼 응답하는 fake rpc. */
+function createRealSendRpc({ onPaste, onEnter } = {}) {
+  const calls = []
+  const rpc = {
+    calls,
+    async call(method, params) {
+      calls.push({ method, params })
+      if (method !== 'terminal.send') {
+        throw new Error(`unexpected method ${method}`)
+      }
+      if (typeof params.text === 'string') {
+        if (typeof onPaste === 'function') {
+          onPaste(params)
+        }
+        return {
+          send: { handle: params.terminal, accepted: true, bytesWritten: params.text.length },
+        }
+      }
+      if (params.enter === true) {
+        if (typeof onEnter === 'function') {
+          onEnter(params)
+        }
+        return { send: { handle: params.terminal, accepted: true, bytesWritten: 0 } }
+      }
+      throw new Error('unexpected terminal.send params')
+    },
+    close() {},
+  }
+  rpc.pasteCalls = () => calls.filter((call) => typeof call.params.text === 'string')
+  rpc.enterCalls = () => calls.filter((call) => call.params.enter === true)
+  return rpc
+}
+
+/**
+ * paste 전/Enter 후에는 draft=null, paste 후 Enter 전에는 draft=config.message를
+ * 돌려주는 observer. guarded-send의 preflight와 paste 확인 단계를 실제와 같게 만든다.
+ */
+function createRealSendObserver() {
+  let draft = null
+  return {
+    setDraft(value) {
+      draft = value
+    },
+    async list() {
+      return { complete: true, fetchedAt: 0, terminals: [makeRow()] }
+    },
+    resolveEvent(event, catalog) {
+      const payload = event && typeof event === 'object' && event.payload ? event.payload : event
+      if (!payload || typeof payload !== 'object') {
+        return null
+      }
+      const matches = (catalog?.terminals ?? []).filter(
+        (row) => row.worktreeId === payload.worktreeId && row.paneKey === payload.paneKey,
+      )
+      if (matches.length !== 1) {
+        return null
+      }
+      const row = matches[0]
+      return {
+        worktreeId: row.worktreeId,
+        paneKey: row.paneKey,
+        handle: row.handle,
+        ptyId: row.ptyId,
+        incarnationId: row.incarnationId,
+      }
+    },
+    async inspect() {
+      return {
+        stale: false,
+        identity: 'claude',
+        executionHostId: 'local',
+        connected: true,
+        writable: true,
+        agentStatus: 'idle',
+        isRunningAgent: true,
+        agentWait: 'none',
+        screen: 'ok',
+        screenTruncated: false,
+        draft,
+        lastOutputAt: 0,
+      }
+    },
+    async currentWorktree() {
+      return null
+    },
+  }
+}
+
+/** 실제 sendKeepalive/store를 쓰는 harness. 호출별 SendResult는 sendAttempts에 쌓인다. */
+function createRealSendHarness() {
+  const observer = createRealSendObserver()
+  const rpc = createRealSendRpc({
+    onPaste: () => observer.setDraft(DEFAULT_MESSAGE),
+    onEnter: () => observer.setDraft(null),
+  })
+  const sendAttempts = []
+  async function realSend(args) {
+    const result = await sendKeepalive(args)
+    sendAttempts.push(result)
+    return result
+  }
+  const h = createHarness({ observer, rpc, sendKeepalive: realSend })
+  h.sendAttempts = sendAttempts
+  return h
+}
+
+/** AWAITING_TURN까지 끝난 자체 turn을 다음 working→done→due로 이어 새 epoch를 만든다. */
+async function cycleRealSend(h) {
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+}
+
+test('U1: max=1에서도 예약 후 LIMIT_REACHED 경계를 통과해 첫 keepalive가 submitted', async () => {
+  const h = createRealSendHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ maxConsecutiveKeepalives: 1 })
+
+  await cycleRealSend(h)
+
+  assert.equal(h.sendAttempts.length, 1)
+  assert.equal(h.sendAttempts[0].kind, 'submitted')
+  assert.equal(h.store.getBudget(SCOPE).charged, 1)
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+
+  // 두 번째 epoch는 예약 전(decide/assertAllowed gate1)에서 LIMIT_REACHED로 막힌다.
+  await cycleRealSend(h)
+  assert.equal(h.sendAttempts.length, 1)
+  assert.equal(h.store.getBudget(SCOPE).charged, 1)
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  assert.equal(viewTerminal(h).reason, 'LIMIT_REACHED')
+})
+
+test('U1: max=3에서 연속 3회 submitted, 4번째는 예약 전 LIMIT_REACHED로 차단', async () => {
+  const h = createRealSendHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ maxConsecutiveKeepalives: 3 })
+
+  for (let i = 0; i < 3; i += 1) {
+    await cycleRealSend(h)
+  }
+
+  assert.equal(h.sendAttempts.length, 3)
+  assert.deepEqual(
+    h.sendAttempts.map((result) => result.kind),
+    ['submitted', 'submitted', 'submitted'],
+  )
+  assert.equal(h.store.getBudget(SCOPE).charged, 3)
+  // 실제 guarded-send가 paste 1 + Enter 1을 3회, 프레임 6을 보냈다.
+  assert.equal(h.rpc.pasteCalls().length, 3)
+  assert.equal(h.rpc.enterCalls().length, 3)
+
+  // 4번째: charged>=max이므로 decide가 예약 전에 막는다(charged 불변, 새 시도 없음).
+  await cycleRealSend(h)
+  assert.equal(h.sendAttempts.length, 3)
+  assert.equal(h.store.getBudget(SCOPE).charged, 3)
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  assert.equal(viewTerminal(h).reason, 'LIMIT_REACHED')
+})
+
+// ---------------------------------------------------------------------------
+// 16. U2: 불완전 catalog에서는 새 전송을 시작하지 않는다
+// ---------------------------------------------------------------------------
+
+test('U2: catalog가 불완전하면 due여도 전송 0, complete 복귀 후 재개', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const dueAt = viewTerminal(h).dueAt
+
+  const incomplete = () =>
+    h.diagEvents.filter(
+      (entry) => entry.event === 'safety_skipped' && entry.code === 'catalog_incomplete',
+    )
+
+  // 불완전 전환: 다음 tick에서 1회 진단.
+  h.observer.state.complete = false
+  await h.clock.advance(h.tickMs)
+  assert.equal(incomplete().length, 1)
+
+  // due를 지나도 새 전송을 시작하지 않는다.
+  await h.clock.advance(dueAt - h.clock.now() + h.tickMs + 100)
+  assert.equal(h.sendCalls.length, 0)
+
+  // 진단은 전환 시 1회만 남는다.
+  assert.equal(incomplete().length, 1)
+
+  // complete로 복귀하면 다음 tick에서 전송을 재개한다.
+  h.observer.state.complete = true
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.sendCalls.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 17. U3: 앱 타이머 off/unknown 전환은 예약 epoch를 폐기한다
+// ---------------------------------------------------------------------------
+
+test('U3: 앱 타이머 off 전환은 epoch를 폐기하고, 재켜도 새 turn 전에는 전송하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+
+  // enabled=true → false 전환.
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: false,
+    ttlMs: TTL_5M,
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h).reason, 'APP_TIMER_OFF')
+
+  // 다시 켜도(만료 전) 옛 epoch가 살아나지 않는다.
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: true,
+    ttlMs: TTL_5M,
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 0)
+
+  // 다음 fresh working→done 이후에는 정상 전송한다.
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+})
+
+test('U3: 앱 타이머 unknown 전환도 epoch를 폐기한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h).reason, 'SETTINGS_UNKNOWN')
+
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 0)
 })

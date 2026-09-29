@@ -198,6 +198,8 @@ export function createCoordinator({
   let observer = null
   /** @type {object|null} */
   let latestCatalog = null
+  /** 마지막 catalog가 complete가 아니면 true. true인 동안 새 전송을 시작하지 않는다. */
+  let catalogIncomplete = false
   /** @type {object|null} */
   let lastSettings = null
   /** @type {string|null} */
@@ -596,7 +598,19 @@ export function createCoordinator({
         }
         diagnostics.record({ event: 'epoch_expired', code: 'EXPIRED', targetId: key })
       } else if (decision && decision.kind === 'send') {
-        candidates.push({ key, dueAt: decision.dueAt ?? 0 })
+        if (catalogIncomplete) {
+          // 목록이 불완전하면 목록 전체를 정상으로 취급하지 않고 새 전송을
+          // 시작하지 않는다(§4.3/§5.5). 이미 진행 중인 전송은 건드리지 않는다.
+          // 대시보드에는 기존 reason 필드로 이유를 노출한다.
+          entry.decision = {
+            kind: 'wait',
+            reason: 'catalog_incomplete',
+            dueAt: decision.dueAt ?? null,
+            expiresAt: decision.expiresAt ?? null,
+          }
+        } else {
+          candidates.push({ key, dueAt: decision.dueAt ?? 0 })
+        }
       }
     }
 
@@ -613,6 +627,9 @@ export function createCoordinator({
     const known = settings.known === true
     const enabled = settings.enabled === true
     const profileId = known && typeof settings.profileId === 'string' ? settings.profileId : null
+    // 전환 판정을 위해 갱신 전의 활성 여부를 잡아 둔다. "활성"=known AND enabled.
+    const wasActive = lastSettingsKnown === true && lastSettingsEnabled === true
+    const isActive = known && enabled
     let changed = false
 
     if (!settingsInitialized) {
@@ -623,6 +640,16 @@ export function createCoordinator({
       lastSettingsKnown = known
       lastSettingsEnabled = enabled
       changed = true
+    }
+
+    // 앱 타이머가 켜짐에서 off/unknown으로 바뀌는 순간 예약 epoch를 폐기한다.
+    // §5.4 "any -- 설정 off/끊김 --> SUSPENDED". 진행 중 전송은 generation 불일치로
+    // assertAllowed가 STALE_TARGET을 주므로 별도 abort는 하지 않는다.
+    if (wasActive && !isActive) {
+      const reason = known ? 'APP_TIMER_OFF' : 'SETTINGS_UNKNOWN'
+      for (const key of [...targets.keys()]) {
+        applyReduce(key, { type: 'POLICY_INVALIDATED', reason })
+      }
     }
 
     if (profileId !== null) {
@@ -646,11 +673,30 @@ export function createCoordinator({
   }
 
   /**
+   * catalog 완전성 변화를 반영한다. 불완전(truncated/누락)으로 바뀌는 순간 1회
+   * 안전 진단을 남기고, 완전해지면 해제한다. §4.3 "truncated=true면 목록 전체
+   * 정상이라고 취급하지 말고 자동 전송 중단·진단".
+   * @param {any} catalog
+   */
+  function noteCatalogCompleteness(catalog) {
+    const complete = isObject(catalog) && catalog.complete === true
+    if (complete) {
+      catalogIncomplete = false
+      return
+    }
+    if (!catalogIncomplete) {
+      catalogIncomplete = true
+      diagnostics.record({ event: 'safety_skipped', code: 'catalog_incomplete' })
+    }
+  }
+
+  /**
    * catalog row를 targets Map에 반영한다. handle/ptyId/incarnationId가 바뀌면
    * TARGET_CHANGED, complete일 때만 catalog에 없는 target을 삭제한다.
    * @param {any} catalog
    */
   function reconcileCatalog(catalog) {
+    noteCatalogCompleteness(catalog)
     if (!isObject(catalog) || !Array.isArray(catalog.terminals)) {
       return
     }
@@ -780,7 +826,20 @@ export function createCoordinator({
       }
       const policy = safePolicy(target)
       if (policy.allowed !== true) {
-        return { allowed: false, reason: policy.reason ?? 'SCOPE_DISABLED' }
+        // 이번 전송의 attempt가 이미 예약된 뒤(gate2/gate3)라면 reserveAttempt가
+        // charged를 +1 했으므로 상한(maxConsecutiveKeepalives)에 정확히 도달하면
+        // LIMIT_REACHED가 온다. 예약 성공은 곧 저장 성공이므로, 예약 이후의
+        // LIMIT_REACHED만 허용으로 취급한다(그 앞 검사인 paused/scope/needsReview는
+        // isAllowedByPolicy가 LIMIT_REACHED보다 먼저 검사해 이미 통과했다는 뜻).
+        // 단 memoryPaused(저장 실패) 검사는 LIMIT 뒤에 있으므로 snapshot으로 함께
+        // 확인한다. state-store는 수정하지 않는다.
+        const limitFromReservation =
+          reservedAttemptId !== null &&
+          policy.reason === 'LIMIT_REACHED' &&
+          store.snapshot().memoryPaused !== true
+        if (!limitFromReservation) {
+          return { allowed: false, reason: policy.reason ?? 'SCOPE_DISABLED' }
+        }
       }
       if (config.respectCwarmDisabled === true) {
         let disabled = false
