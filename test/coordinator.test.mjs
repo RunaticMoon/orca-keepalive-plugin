@@ -519,6 +519,35 @@ test('설정 unknown이면 전송하지 않는다', async () => {
   assert.equal(h.coordinator.getRuntimeView().appTimer.known, false)
 })
 
+test('설정 unknown 동안 만든 target도 known 프로필 전환 후 전송된다', async () => {
+  const h = createHarness({ settings: { known: false, reason: 'index_missing', readAt: 0 } })
+  await startHarness(h)
+
+  // unknown 동안 target은 profileId=null로 만들어진다.
+  assert.equal(h.coordinator.getRuntimeView().profileId, null)
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+
+  // known 프로필로 전환하면 target을 재생성해야 한다(profileId null로 남으면 영구 거절).
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: true,
+    ttlMs: TTL_5M,
+    revision: 1,
+    source: 'sqlite',
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.coordinator.getRuntimeView().profileId, 'p1')
+
+  // 재생성된 target에서 새 working→done→due가 정상 전송된다.
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+  assert.equal(h.store.getBudget(SCOPE).charged, 1)
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+})
+
 // ---------------------------------------------------------------------------
 // 4. 정책 off
 // ---------------------------------------------------------------------------

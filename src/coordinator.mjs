@@ -684,15 +684,15 @@ export function createCoordinator({
       }
     }
 
-    if (profileId !== null) {
-      if (currentProfileId === null) {
-        currentProfileId = profileId
-      } else if (profileId !== currentProfileId) {
-        targets.clear()
-        skipUntil.clear()
-        currentProfileId = profileId
-        changed = true
-      }
+    if (profileId !== null && profileId !== currentProfileId) {
+      // 프로필 전환뿐 아니라 설정 unknown 동안 profileId=null로 만들어진 target이
+      // known 프로필로 승격되는 전환도 포함한다. 이때 비우지 않으면 target.profileId가
+      // null로 남아 assertAllowed/safePolicy가 영구히 거절한다. clear 뒤 같은 tick의
+      // reconcileCatalog가 올바른 profileId로 재생성한다.
+      targets.clear()
+      skipUntil.clear()
+      currentProfileId = profileId
+      changed = true
     }
 
     lastSettings = settings
