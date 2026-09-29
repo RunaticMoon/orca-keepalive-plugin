@@ -18,6 +18,7 @@ import {
   formatRemaining,
   reasonText,
   toViewModel,
+  worktreeToggleLabel,
   buildAction,
   parseTokenFromHash,
 } from '../ui/app.mjs';
@@ -254,6 +255,72 @@ test('toViewModel: tolerates an empty/garbage snapshot without throwing', () => 
 });
 
 /* ------------------------------------------------------------------ */
+/* worktree 상속(null) 표시                                            */
+/* ------------------------------------------------------------------ */
+
+function makeWorktreeSnapshot(enabled, defaultWorktreeEnabled) {
+  const snap = makeSnapshot();
+  snap.config = { ...snap.config, defaultWorktreeEnabled };
+  snap.worktrees = [{ ...snap.worktrees[0], enabled }];
+  return snap;
+}
+
+test('toViewModel: worktree override null is preserved as inherited', () => {
+  const vm = toViewModel(makeWorktreeSnapshot(null, true), 0);
+  const wt = vm.worktrees[0];
+  assert.equal(wt.enabled, null);
+  assert.equal(wt.inherited, true);
+  assert.equal(wt.scopeOn, true);
+});
+
+test('toViewModel: inherited worktree follows defaultWorktreeEnabled false', () => {
+  const vm = toViewModel(makeWorktreeSnapshot(null, false), 0);
+  const wt = vm.worktrees[0];
+  assert.equal(wt.enabled, null);
+  assert.equal(wt.inherited, true);
+  assert.equal(wt.scopeOn, false);
+});
+
+test('toViewModel: explicit worktree override wins over the default', () => {
+  const on = toViewModel(makeWorktreeSnapshot(true, false), 0).worktrees[0];
+  assert.equal(on.enabled, true);
+  assert.equal(on.inherited, false);
+  assert.equal(on.scopeOn, true);
+
+  const off = toViewModel(makeWorktreeSnapshot(false, true), 0).worktrees[0];
+  assert.equal(off.enabled, false);
+  assert.equal(off.inherited, false);
+  assert.equal(off.scopeOn, false);
+});
+
+test('toViewModel: missing defaultWorktreeEnabled does not assume on', () => {
+  const snap = makeSnapshot();
+  snap.config = { paused: false };
+  snap.worktrees = [{ ...snap.worktrees[0], enabled: null }];
+  const wt = toViewModel(snap, 0).worktrees[0];
+  assert.equal(wt.inherited, true);
+  assert.equal(wt.scopeOn, false);
+});
+
+test('toViewModel: inherited + default on toggles to explicit off', () => {
+  const vm = toViewModel(makeWorktreeSnapshot(null, true), 0);
+  const wt = vm.worktrees[0];
+  // render가 만드는 액션과 동일한 계산: enabled = !scopeOn.
+  assert.deepEqual(
+    buildAction('worktree', { targetId: wt.id, enabled: !wt.scopeOn }, vm.revision),
+    { type: 'worktree', targetId: 'wt-1', enabled: false, expectedRevision: 7 },
+  );
+});
+
+test('worktreeToggleLabel: explicit on/off vs inherited labels', () => {
+  assert.equal(worktreeToggleLabel({ inherited: false, scopeOn: true }), '● 켜짐');
+  assert.equal(worktreeToggleLabel({ inherited: false, scopeOn: false }), '○ 꺼짐');
+  assert.equal(worktreeToggleLabel({ inherited: true, scopeOn: true }), '● 켜짐 (기본)');
+  assert.equal(worktreeToggleLabel({ inherited: true, scopeOn: false }), '○ 꺼짐 (기본)');
+  assert.equal(worktreeToggleLabel({}), '○ 꺼짐');
+});
+
+/* ------------------------------------------------------------------ */
 /* buildAction                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -303,6 +370,22 @@ test('buildAction: every action type carries expectedRevision', () => {
 
 test('buildAction: unknown kind throws', () => {
   assert.throws(() => buildAction('nope', {}, 1), /unknown action kind/);
+});
+
+test('buildAction worktree: null은 상속(null)으로 보존한다', () => {
+  assert.deepEqual(buildAction('worktree', { targetId: 'w', enabled: null }, 3), {
+    type: 'worktree',
+    targetId: 'w',
+    enabled: null,
+    expectedRevision: 3,
+  });
+});
+
+test('buildAction worktree: true/false는 그대로, undefined는 false로 뭉갠다', () => {
+  assert.equal(buildAction('worktree', { targetId: 'w', enabled: true }, 3).enabled, true);
+  assert.equal(buildAction('worktree', { targetId: 'w', enabled: false }, 3).enabled, false);
+  assert.equal(buildAction('worktree', { targetId: 'w' }, 3).enabled, false);
+  assert.equal(buildAction('worktree', { targetId: 'w', enabled: undefined }, 3).enabled, false);
 });
 
 /* ------------------------------------------------------------------ */

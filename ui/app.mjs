@@ -174,6 +174,21 @@ function connectionText(state) {
 }
 
 /**
+ * 워크트리 토글 버튼 라벨. 명시 on/off와 상속(기본값)을 구분해 표시한다
+ * (DESIGN §7.3: scope 설정과 실제 적용 상태를 따로 표시).
+ * @param {{inherited: boolean, scopeOn: boolean}} worktree
+ * @returns {string}
+ */
+export function worktreeToggleLabel(worktree) {
+  const wt = worktree && typeof worktree === 'object' ? worktree : {};
+  const on = wt.scopeOn === true;
+  if (wt.inherited === true) {
+    return on ? '● 켜짐 (기본)' : '○ 꺼짐 (기본)';
+  }
+  return on ? '● 켜짐' : '○ 꺼짐';
+}
+
+/**
  * @param {unknown} value
  * @returns {number|null}
  */
@@ -203,6 +218,8 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
 
   const rawConfig = snap.config && typeof snap.config === 'object' ? snap.config : {};
   const paused = rawConfig.paused === true;
+  // 상속(null) 워크트리의 실제 적용 기본값. 알 수 없으면 켜짐으로 단정하지 않는다.
+  const defaultWorktreeEnabled = rawConfig.defaultWorktreeEnabled === true;
 
   const rawTimer = snap.appTimer && typeof snap.appTimer === 'object' ? snap.appTimer : {};
   const timer = {
@@ -259,10 +276,15 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
   const worktrees = Array.isArray(snap.worktrees)
     ? snap.worktrees.map((worktree) => {
         const wt = worktree && typeof worktree === 'object' ? worktree : {};
+        const enabled =
+          wt.enabled === true ? true : wt.enabled === false ? false : null;
+        const scopeOn = enabled === null ? defaultWorktreeEnabled : enabled;
         return {
           id: typeof wt.id === 'string' ? wt.id : '',
           label: typeof wt.label === 'string' ? wt.label : '',
-          enabled: wt.enabled === true,
+          enabled,
+          inherited: enabled === null,
+          scopeOn,
           effectiveEnabled: wt.effectiveEnabled === true,
           reason: typeof wt.reason === 'string' ? wt.reason : null,
           reasonText: typeof wt.reason === 'string' ? reasonText(wt.reason) : '',
@@ -337,7 +359,9 @@ export function buildAction(kind, args = {}, revision) {
       return {
         type: 'worktree',
         targetId: input.targetId,
-        enabled: input.enabled === true,
+        // null means "revert to inherited".
+        enabled:
+          input.enabled === null ? null : input.enabled === true,
         expectedRevision,
       };
     case 'terminal':
@@ -663,18 +687,30 @@ function boot() {
       const toggle = el(
         'button',
         'btn',
-        (worktree.enabled ? '● 켜짐' : '○ 꺼짐'),
+        worktreeToggleLabel(worktree),
       );
       toggle.type = 'button';
-      toggle.setAttribute('aria-pressed', String(worktree.enabled));
+      toggle.setAttribute('aria-pressed', String(worktree.scopeOn));
       toggle.setAttribute('aria-label', `워크트리 keepalive 토글: ${worktree.label || worktree.id}`);
       toggle.disabled = !connected;
       toggle.addEventListener('click', () => {
         postAction(
-          buildAction('worktree', { targetId: worktree.id, enabled: !worktree.enabled }, snapshot.revision),
+          buildAction('worktree', { targetId: worktree.id, enabled: !worktree.scopeOn }, snapshot.revision),
         );
       });
       head.appendChild(toggle);
+      if (!worktree.inherited) {
+        const inherit = el('button', 'btn', '기본값으로');
+        inherit.type = 'button';
+        inherit.setAttribute('aria-label', `워크트리 keepalive를 기본값으로: ${worktree.label || worktree.id}`);
+        inherit.disabled = !connected;
+        inherit.addEventListener('click', () => {
+          postAction(
+            buildAction('worktree', { targetId: worktree.id, enabled: null }, snapshot.revision),
+          );
+        });
+        head.appendChild(inherit);
+      }
       section.appendChild(head);
 
       const effective = el(

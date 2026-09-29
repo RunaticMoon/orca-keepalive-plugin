@@ -34,6 +34,8 @@ const DESKTOP_CLIENT_TYPE = 'desktop'
 /** paste framing. §4.3. */
 const PASTE_START = '\u001b[200~'
 const PASTE_END = '\u001b[201~'
+/** terminal.send RPC 전체 deadline(ms). §4.2. rpc-client 기본값(10s)을 덮어쓴다. */
+const SEND_RPC_TIMEOUT_MS = 5000
 
 /** paste/Enter 응답 유실·형식 이상 시 공통 reason. */
 const PARTIAL = REASON_CODES.PARTIAL_OR_UNKNOWN_SEND
@@ -292,6 +294,8 @@ export async function sendKeepalive({
   }
 
   const callOptions = signal ? { signal } : {}
+  // terminal.send(mutation)만 5초 전체 deadline을 건다. read/show 등은 기본값 유지.
+  const sendCallOptions = { ...callOptions, timeoutMs: SEND_RPC_TIMEOUT_MS }
 
   // 1) abort 및 정책 사전검사(예약 전).
   if (signal?.aborted) {
@@ -368,7 +372,7 @@ export async function sendKeepalive({
   let pasteResult
   try {
     framesSent = 1
-    pasteResult = await rpc.call('terminal.send', pasteParams, callOptions)
+    pasteResult = await rpc.call('terminal.send', pasteParams, sendCallOptions)
   } catch (error) {
     if (isAbortError(error) || signal?.aborted) {
       await safeReview(attemptId, PARTIAL)
@@ -501,7 +505,7 @@ export async function sendKeepalive({
   let enterResult
   try {
     framesSent = 2
-    enterResult = await rpc.call('terminal.send', enterParams, callOptions)
+    enterResult = await rpc.call('terminal.send', enterParams, sendCallOptions)
   } catch {
     await safeReview(attemptId, PARTIAL)
     return makeResult('uncertain', PARTIAL, attemptId, framesSent)

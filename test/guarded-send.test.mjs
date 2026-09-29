@@ -255,6 +255,38 @@ test('정상 경로: paste 1 + Enter 1, 프레임 정확히 2, submitted', async
   )
 })
 
+test('send deadline: terminal.send만 timeoutMs 5000, inspect는 기본값', async () => {
+  const inspector = createInspector([
+    baseObservation(),
+    baseObservation({ draft: MESSAGE }),
+    baseObservation({ draft: MESSAGE }),
+  ])
+  const { result, rpc } = await run({ inspector })
+
+  assert.equal(result.kind, 'submitted')
+  const sends = rpc.sendCalls()
+  assert.equal(sends.length, 2)
+  for (const call of sends) {
+    assert.equal(call.options.timeoutMs, 5000)
+  }
+  // read/show(inspect) 호출에는 send deadline을 걸지 않는다.
+  assert.equal(inspector.calls.length, 3)
+  for (const call of inspector.calls) {
+    assert.equal(call.options.timeoutMs, undefined)
+  }
+})
+
+test('send deadline: abort signal은 terminal.send 옵션에 유지된다', async () => {
+  const controller = new AbortController()
+  const { result, rpc } = await run({ signal: controller.signal })
+
+  assert.equal(result.kind, 'submitted')
+  for (const call of rpc.sendCalls()) {
+    assert.equal(call.options.signal, controller.signal)
+    assert.equal(call.options.timeoutMs, 5000)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // preflight
 // ---------------------------------------------------------------------------
