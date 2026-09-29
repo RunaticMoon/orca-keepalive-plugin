@@ -63,8 +63,8 @@ function createFakeController(overrides = {}) {
     async setPaused(paused) {
       calls.setPaused.push({ paused })
     },
-    async statusSummary() {
-      calls.statusSummary.push({})
+    async statusSummary(options) {
+      calls.statusSummary.push({ options })
       return { text: '상태 요약' }
     },
     ...overrides,
@@ -490,6 +490,33 @@ test('status handler notifies the summary text', async () => {
   assert.equal(calls.statusSummary.length, 1)
   assert.equal(notifyCalls[0].title, 'Cache Keepalive')
   assert.equal(notifyCalls[0].body, '대상 2개 / 예약 1개 / 차단 0개')
+})
+
+test('status handler passes the current worktree id to statusSummary', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      calls.currentWorktreeId.push({})
+      return 'wt-1'
+    },
+  })
+  await handlerFor(COMMAND_IDS.status)()
+
+  assert.equal(calls.currentWorktreeId.length, 1)
+  assert.deepEqual(calls.statusSummary, [{ options: { currentWorktreeId: 'wt-1' } }])
+  assert.equal(notifyCalls[0].body, '상태 요약')
+})
+
+test('status handler notifies with a null id when currentWorktreeId fails', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      throw new Error('runtime gone')
+    },
+  })
+
+  await assert.doesNotReject(() => handlerFor(COMMAND_IDS.status)())
+  assert.deepEqual(calls.statusSummary, [{ options: { currentWorktreeId: null } }])
+  assert.equal(notifyCalls.length, 1)
+  assert.equal(notifyCalls[0].body, '상태 요약')
 })
 
 // ---------------------------------------------------------------------------

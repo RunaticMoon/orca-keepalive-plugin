@@ -367,6 +367,22 @@ input[type="checkbox"] {
   font-size: 0.95rem;
 }
 
+.field-check-described {
+  align-items: start;
+}
+
+.field-check-described input {
+  margin-top: 0.25rem;
+}
+
+.field-description {
+  grid-column: 2;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
 .form-actions {
   display: flex;
   align-items: center;

@@ -27,6 +27,7 @@ import { promises as fs } from 'node:fs'
  * @property {string|null} ptyId
  * @property {string|null} incarnationId
  * @property {string|null} title
+ * @property {string|null} customTitle terminal.rename으로 설정된 사용자 제목(null=해제).
  * @property {string|null} branch
  * @property {string} agentIdentity
  * @property {string} executionHostId
@@ -142,7 +143,14 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
       const params = isObject(request.params) ? request.params : {}
       frames.push({ method, params })
       const fault = typeof method === 'string' ? takeFault(method) : null
-      const result = dispatch(method, params)
+      let result
+      try {
+        result = dispatch(method, params)
+      } catch (error) {
+        const code = isObject(error) && typeof error.code === 'string' ? error.code : 'internal_error'
+        respondError(id, code, 'rpc handler failed')
+        return
+      }
 
       if (fault === 'drop') {
         socket.destroy()
@@ -179,6 +187,10 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
           return { agentStatus: agentStatusOf(params) }
         case 'terminal.read':
           return { terminal: readTerminal(params) }
+        case 'terminal.rename':
+          return renameTerminal(params)
+        case 'session.tabs.list':
+          return sessionTabsList(params)
         case 'terminal.send':
           return { send: handleSend(params) }
         case 'browser.tabCreate':
@@ -200,7 +212,7 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
         leafId: terminal.leafId,
         ptyId: terminal.ptyId,
         incarnationId: terminal.incarnationId,
-        title: terminal.title,
+        title: terminal.customTitle ?? terminal.title,
         branch: terminal.branch,
         connected: terminal.connected,
         writable: terminal.writable,
@@ -245,7 +257,7 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
         leafId: terminal.leafId,
         ptyId: terminal.ptyId,
         incarnationId: terminal.incarnationId,
-        title: terminal.title,
+        title: terminal.customTitle ?? terminal.title,
         branch: terminal.branch,
         agentIdentity: terminal.agentIdentity,
         executionHostId: terminal.executionHostId,
@@ -284,6 +296,44 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
         tail: terminal.draft ?? '',
         draft: terminal.draft ?? '',
       }
+    }
+
+    const renameTerminal = (params) => {
+      const terminal = lookup(params)
+      if (terminal === null) {
+        // 실제 Orca는 알려지지 않은 terminal 핸들을 거부한다. tabs.list id 같은
+        // 잘못된 핸들 사용이 테스트에서 드러나도록 오류로 응답한다.
+        const error = new Error('terminal not found')
+        error.code = 'not_found'
+        throw error
+      }
+      const raw = isObject(params) ? params.title : undefined
+      terminal.customTitle = typeof raw === 'string' && raw.length > 0 ? raw : null
+      return { handle: terminal.handle, title: terminal.customTitle }
+    }
+
+    /**
+     * title-indicator가 쓰는 session.tabs.list. 실제 Orca처럼 terminal 항목의
+     * `id`는 `${tabId}::${leafId}` 합성 키이고 terminal 핸들이 아니다.
+     */
+    const sessionTabsList = (params) => {
+      const worktree = isObject(params) && typeof params.worktree === 'string' ? params.worktree : null
+      const worktreeId = worktree !== null && worktree.startsWith('id:') ? worktree.slice(3) : null
+      const tabs = []
+      for (const terminal of terminals.values()) {
+        if (worktreeId !== null && terminal.worktreeId !== worktreeId) {
+          continue
+        }
+        tabs.push({
+          type: 'terminal',
+          id: `${terminal.tabId}::${terminal.leafId}`,
+          title: terminal.customTitle ?? terminal.title,
+          parentTabId: terminal.tabId,
+          leafId: terminal.leafId,
+          worktreeId: terminal.worktreeId,
+        })
+      }
+      return { tabs }
     }
 
     const handleSend = (params) => {
@@ -379,6 +429,7 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
       ptyId: input.ptyId ?? `pty-${input.handle}`,
       incarnationId: input.incarnationId ?? `inc-${input.handle}`,
       title: input.title ?? null,
+      customTitle: input.customTitle ?? null,
       branch: input.branch ?? null,
       agentIdentity: input.agentIdentity ?? 'claude',
       executionHostId: input.executionHostId ?? 'local',

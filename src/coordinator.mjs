@@ -24,6 +24,8 @@ const MAX_EVENT_QUEUE = 1000
 const STATE_KEY = 'state-v1'
 /** stop이 in-flight 전송을 기다리는 최대 시간. */
 const STOP_TIMEOUT_MS = 10000
+/** stop 시 탭 제목 복원(restoreAll)을 기다리는 최대 시간. */
+const TITLE_RESTORE_TIMEOUT_MS = 5000
 /** bootstrap 재연결 backoff(ms). §4.2. 마지막 값을 상한으로 반복한다. */
 const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 15000, 30000]
 /** 전송 결과 불확실을 나타내는 reason. */
@@ -150,6 +152,7 @@ function scopeOf(target) {
  * @param {(options:object) => Promise<object>} options.sendKeepalive
  * @param {{initialTargetState:Function, reduceTarget:Function, decide:Function}} options.scheduler
  * @param {{record:Function}} options.diagnostics
+ * @param {(options:{rpc:object, hostCall:Function, clock:object, diagnostics:object}) => object} [options.createTitleIndicator] 탭 제목 ⚡ 표시기 팩토리(선택). rpc 준비 후 1회 생성한다.
  * @param {() => Promise<boolean>} [options.cwarmDisabled]
  * @param {string} options.clientId
  * @param {Object} [options.clock]
@@ -167,6 +170,7 @@ export function createCoordinator({
   sendKeepalive,
   scheduler,
   diagnostics,
+  createTitleIndicator = null,
   cwarmDisabled = async () => false,
   clientId,
   clock = { now: Date.now, monoNow: () => performance.now(), setTimeout, clearTimeout, sleep },
@@ -196,6 +200,11 @@ export function createCoordinator({
   let rpc = null
   /** @type {object|null} */
   let observer = null
+  /** @type {object|null} 탭 제목 표시기(실험 옵션). rpc 준비 후 1회 생성한다. */
+  let titleIndicator = null
+  let titleIndicatorCreated = false
+  /** updateTitleIndicator 호출 순번. 늦게 끝난 이전 호출의 reconcile을 버린다. */
+  let titleIndicatorSeq = 0
   /** @type {object|null} */
   let latestCatalog = null
   /** 마지막 catalog가 complete가 아니면 true. true인 동안 새 전송을 시작하지 않는다. */
@@ -217,6 +226,8 @@ export function createCoordinator({
   const targets = new Map()
   /** key → 다음 시도 허용 시각(skipped 후 최소 tickMs 대기). @type {Map<string, number>} */
   const skipUntil = new Map()
+  /** 실제(사람/기타) 턴의 working을 관측한 target key. 그 done에서 탭 제목을 새로 고친다. @type {Set<string>} */
+  const pendingRealTurn = new Set()
 
   /** @type {unknown[]} */
   const eventQueue = []
@@ -353,6 +364,194 @@ export function createCoordinator({
   }
 
   // -------------------------------------------------------------------------
+  // 탭 제목 표시기(실험 옵션)
+  // -------------------------------------------------------------------------
+
+  /**
+   * promise를 await하지 않고 rejection만 삼킨다(tick/이벤트를 막지 않게).
+   * @param {unknown} promise
+   */
+  function fireAndForget(promise) {
+    try {
+      if (promise && typeof promise.catch === 'function') {
+        promise.catch(() => {})
+      }
+    } catch {
+      // 무시한다.
+    }
+  }
+
+  /**
+   * 탭 제목 표시기에 넘길 rpc 어댑터. 재연결로 `rpc`가 바뀌어도 매 호출 시 최신
+   * 인스턴스를 쓰므로 표시기를 다시 만들 필요가 없다.
+   * @param {string} method
+   * @param {unknown} params
+   * @param {object} [options]
+   * @returns {Promise<unknown>}
+   */
+  function titleRpcCall(method, params, options) {
+    const current = rpc
+    if (current === null || typeof current.call !== 'function') {
+      return Promise.reject(new Error('rpc unavailable'))
+    }
+    return current.call(method, params, options)
+  }
+
+  /**
+   * 탭 제목 표시기를 rpc 준비 후 1회 생성하고 기록을 복원(load)한다. 생성/load
+   * 실패는 삼킨다.
+   * @returns {Promise<void>}
+   */
+  async function ensureTitleIndicator() {
+    if (titleIndicatorCreated || typeof createTitleIndicator !== 'function') {
+      return
+    }
+    titleIndicatorCreated = true
+    try {
+      const created = createTitleIndicator({
+        rpc: { call: titleRpcCall },
+        hostCall,
+        clock,
+        diagnostics,
+      })
+      if (created === null || typeof created !== 'object') {
+        return
+      }
+      titleIndicator = created
+      if (typeof created.load === 'function') {
+        try {
+          await created.load()
+        } catch {
+          // load 실패는 무시한다(기록은 다음 reconcile이 복구한다).
+        }
+      }
+    } catch {
+      titleIndicator = null
+    }
+  }
+
+  /**
+   * 이번 tick의 desired를 만들어 표시기에 비동기로 반영한다(tick을 막지 않는다).
+   * - 옵션이 꺼져 있으면 빈 목록으로 모든 기록을 제거한다.
+   * - catalog가 불완전하거나 읽기에 실패한 tick에는 호출하지 않는다(불완전 목록으로
+   *   ⚡를 지우지 않기 위함). 단 옵션 off는 목록과 무관하므로 항상 반영한다.
+   * - 실제 전송 게이트(runSend의 assertAllowed)와 같은 cwarm 확인을 반영한다.
+   *   확인이 비동기이므로 tick을 막지 않게 내부 async 함수로 감싼다.
+   * @param {object} config
+   * @param {boolean} catalogFailed
+   */
+  function updateTitleIndicator(config, catalogFailed) {
+    if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
+      return
+    }
+    // 이전 tick의 cwarm 확인이 늦게 끝나 이번 tick 결과를 덮지 않게 순번을 올린다.
+    const seq = ++titleIndicatorSeq
+    if (config.tabTitleIndicator !== true) {
+      fireAndForget(titleIndicator.reconcile([]))
+      return
+    }
+    if (catalogIncomplete || catalogFailed) {
+      return
+    }
+    fireAndForget(reconcileTitleIndicator(config, seq))
+  }
+
+  /**
+   * 실제 전송 게이트와 같은 cwarm 조건을 반영해 desired를 만든다. cwarmDisabled()
+   * 예외는 false로 취급한다(assertAllowed와 동일). respectCwarmDisabled=true이고
+   * cwarm.disabled가 있으면 모든 target을 on=false로 보낸다. ⚡는 phase(ARMED)와
+   * 무관하게 "이 탭이 keepalive 대상으로 켜져 있음"을 뜻한다.
+   * @param {object} config
+   * @param {number} seq updateTitleIndicator가 부여한 순번. 더 새 호출이 있으면 버린다.
+   * @returns {Promise<void>}
+   */
+  async function reconcileTitleIndicator(config, seq) {
+    let cwarmBlocked = false
+    if (config.respectCwarmDisabled === true) {
+      try {
+        cwarmBlocked = (await cwarmDisabled()) === true
+      } catch {
+        cwarmBlocked = false
+      }
+    }
+    if (seq !== titleIndicatorSeq) {
+      return
+    }
+    if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
+      return
+    }
+    const settingsKnown = isObject(lastSettings) && lastSettings.known === true
+    const settingsEnabled = settingsKnown && lastSettings.enabled === true
+    const connectionOk = connection.state === 'connected'
+    const paused = config.paused === true
+    /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean}>} */
+    const desired = []
+    for (const entry of targets.values()) {
+      if (entry.meta.supported !== true) {
+        continue
+      }
+      const target = entry.state.target
+      const tabId = typeof entry.meta.tabId === 'string' ? entry.meta.tabId : null
+      if (tabId === null) {
+        continue
+      }
+      const leafId = typeof entry.meta.leafId === 'string' ? entry.meta.leafId : null
+      const on =
+        !cwarmBlocked &&
+        !paused &&
+        settingsKnown &&
+        settingsEnabled &&
+        connectionOk &&
+        safePolicy(target).allowed === true
+      desired.push({
+        worktreeId: target.worktreeId,
+        tabId,
+        leafId,
+        handle: target.handle,
+        on,
+      })
+    }
+    fireAndForget(titleIndicator.reconcile(desired))
+  }
+
+  /**
+   * stop 시 표시기의 기록을 복원한다. 최대 TITLE_RESTORE_TIMEOUT_MS까지만 기다린다.
+   * @returns {Promise<void>}
+   */
+  async function restoreTitleIndicator() {
+    if (titleIndicator === null || typeof titleIndicator.restoreAll !== 'function') {
+      return
+    }
+    let restorePromise
+    try {
+      restorePromise = Promise.resolve(titleIndicator.restoreAll())
+    } catch {
+      return
+    }
+    /** @type {unknown} */
+    let guard = null
+    const timeout = new Promise((resolve) => {
+      guard = clock.setTimeout(resolve, TITLE_RESTORE_TIMEOUT_MS)
+      if (guard && typeof guard.unref === 'function') {
+        guard.unref()
+      }
+    })
+    try {
+      await Promise.race([restorePromise, timeout])
+    } catch {
+      // 실패는 무시한다.
+    } finally {
+      if (guard !== null) {
+        try {
+          clock.clearTimeout(guard)
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // bootstrap / 연결
   // -------------------------------------------------------------------------
 
@@ -417,6 +616,7 @@ export function createCoordinator({
       diagnostics.record({ event: 'runtime_connected' })
       rpc = createRpc({ getBinding })
       observer = createObserver({ rpc, hostCall })
+      await ensureTitleIndicator()
 
       try {
         lastSettings = await readSettings({ userDataPath: binding.userDataPath })
@@ -476,6 +676,7 @@ export function createCoordinator({
     binding = next
     targets.clear()
     skipUntil.clear()
+    pendingRealTurn.clear()
     currentProfileId = null
     settingsInitialized = false
     connection = { state: 'starting', reason: null }
@@ -569,11 +770,14 @@ export function createCoordinator({
     applySettings(settings)
 
     // c. catalog 재구성.
+    let catalogReadFailed = false
     try {
       latestCatalog = await observer.list()
       reconcileCatalog(latestCatalog)
     } catch {
-      // 읽기 실패: 기존 catalog/target을 유지한다.
+      // 읽기 실패: 기존 catalog/target을 유지한다. 제목 표시기도 이번 tick에는
+      // 손대지 않는다(불완전 목록으로 ⚡를 지우지 않게).
+      catalogReadFailed = true
     }
 
     // d. 대기 중 이벤트 drain.
@@ -631,6 +835,9 @@ export function createCoordinator({
 
     // f. 동시 1개 전송.
     maybeSend(candidates)
+
+    // g. 탭 제목 ⚡ 표시(실험 옵션). await하지 않아 tick을 막지 않는다.
+    updateTitleIndicator(tickConfig, catalogReadFailed)
   }
 
   /**
@@ -700,6 +907,7 @@ export function createCoordinator({
       // reconcileCatalog가 올바른 profileId로 재생성한다.
       targets.clear()
       skipUntil.clear()
+      pendingRealTurn.clear()
       currentProfileId = profileId
       changed = true
     }
@@ -766,6 +974,8 @@ export function createCoordinator({
         label: typeof row.branch === 'string' ? row.branch : null,
         supported: row.supported === true,
         unsupportedReason: typeof row.unsupportedReason === 'string' ? row.unsupportedReason : null,
+        tabId: typeof row.tabId === 'string' ? row.tabId : null,
+        leafId: typeof row.leafId === 'string' ? row.leafId : null,
       }
       const entry = targets.get(key)
       if (!entry) {
@@ -786,6 +996,7 @@ export function createCoordinator({
       for (const key of [...targets.keys()]) {
         if (!seen.has(key)) {
           targets.delete(key)
+          pendingRealTurn.delete(key)
         }
       }
     }
@@ -1065,6 +1276,30 @@ export function createCoordinator({
     if (before.phase !== 'ARMED' && after.phase === 'ARMED') {
       diagnostics.record({ event: 'epoch_armed', targetId: key })
     }
+
+    // 탭 제목 ⚡ 표시: 자체 keepalive 턴이 아닌 실제 턴이 done이 되면 1회 새로 고친다.
+    const hookState = isObject(payload) && typeof payload.state === 'string' ? payload.state : null
+    if (hookState === 'working') {
+      if (after.selfTurnSeq > before.selfTurnSeq) {
+        // 자체 keepalive 턴은 실제 턴 완료로 보지 않는다.
+        pendingRealTurn.delete(key)
+      } else if (after.budgetResetSeq > before.budgetResetSeq) {
+        // 실제(사람/기타) 턴 시작: 이 target의 다음 done에서 제목을 새로 고친다.
+        pendingRealTurn.add(key)
+      }
+    } else if (hookState === 'done' && pendingRealTurn.has(key)) {
+      pendingRealTurn.delete(key)
+      const tabId = typeof entry.meta.tabId === 'string' ? entry.meta.tabId : null
+      const worktreeId = typeof after.target.worktreeId === 'string' ? after.target.worktreeId : null
+      if (
+        tabId !== null &&
+        worktreeId !== null &&
+        titleIndicator !== null &&
+        typeof titleIndicator.onTurnCompleted === 'function'
+      ) {
+        fireAndForget(titleIndicator.onTurnCompleted(`${worktreeId}:${tabId}`))
+      }
+    }
   }
 
   /**
@@ -1119,6 +1354,7 @@ export function createCoordinator({
       const entry = targets.get(key)
       if (entry && entry.state.target.worktreeId === worktreeId) {
         targets.delete(key)
+        pendingRealTurn.delete(key)
       }
     }
   }
@@ -1281,6 +1517,9 @@ export function createCoordinator({
           clearTimeout(guard)
         }
       }
+      // rpc를 닫기 전에 탭 제목 기록을 복원한다(최대 5초, 실패 무시). 옵션이 꺼져
+      // 있어도 남은 기록이 있으면 되돌린다.
+      await restoreTitleIndicator()
       if (rpc !== null && typeof rpc.close === 'function') {
         try {
           rpc.close()

@@ -240,10 +240,14 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
         )
       }),
 
-    /** 상태 요약 알림. 토큰/원시 화면 없음. */
+    /** 상태 요약 알림. 토큰/원시 화면 없음. 현재 워크트리 특정 실패는 무시한다. */
     [COMMAND_IDS.status]: () =>
       withGuard(async () => {
-        const { text } = await controller.statusSummary()
+        // 현재 워크트리를 못 찾거나 조회가 실패해도 목록은 그대로 알린다.
+        const currentWorktreeId = await Promise.resolve()
+          .then(() => controller.currentWorktreeId())
+          .catch(() => null)
+        const { text } = await controller.statusSummary({ currentWorktreeId: currentWorktreeId ?? null })
         await notifySafe(NOTIFICATION_TITLE, text)
       }),
   }

@@ -33,10 +33,12 @@ import { readTimerSettings } from './src/orca-settings.mjs'
 import { sendKeepalive } from './src/guarded-send.mjs'
 import { initialTargetState, reduceTarget, decide } from './src/scheduler.mjs'
 import { createDiagnostics } from './src/diagnostics.mjs'
+import { createTitleIndicator } from './src/title-indicator.mjs'
 import { createCoordinator } from './src/coordinator.mjs'
 import { createDashboardModel } from './src/dashboard-model.mjs'
 import { startDashboard } from './src/dashboard-server.mjs'
 import { registerCommands, openInOrcaBrowser } from './src/commands.mjs'
+import { describeActionChange } from './src/change-notice.mjs'
 import {
   writeControlFile,
   removeControlFile,
@@ -48,6 +50,9 @@ const DASHBOARD_START_TIMEOUT_MS = 5000
 
 /** 알림 본문 최대 길이(문자). host 계약을 넘지 않도록 자른다. */
 const NOTIFICATION_BODY_MAX_CHARS = 1000
+
+/** 대시보드/CLI 변경 알림 제목(고정). commands.mjs와 같은 값. */
+const CHANGE_NOTIFICATION_TITLE = 'Cache Keepalive'
 
 /** manifest가 선언한 terminal:send capability 종류. 없으면 sender를 시작하지 않는다. */
 const TERMINAL_SEND_CAPABILITY = 'terminal:send'
@@ -80,8 +85,10 @@ export function createPlugin(orca, deps = {}) {
     createDiagnostics: makeDiagnostics = createDiagnostics,
     createStateStore: makeStateStore = createStateStore,
     createCoordinator: makeCoordinator = createCoordinator,
+    createTitleIndicator: makeTitleIndicator = createTitleIndicator,
     createDashboardModel: makeDashboardModel = createDashboardModel,
     startDashboard: startDashboardImpl = startDashboard,
+    describeActionChange: describeActionChangeImpl = describeActionChange,
     registerCommands: registerCommandsImpl = registerCommands,
     openInOrcaBrowser: openInOrcaBrowserImpl = openInOrcaBrowser,
     resolveBinding: resolveBindingImpl = resolveBinding,
@@ -141,6 +148,54 @@ export function createPlugin(orca, deps = {}) {
   }
 
   /**
+   * 호스트 알림을 보낸다. 실패는 삼킨다(알림 오류가 흐름을 깨지 않게).
+   *
+   * @param {string} title
+   * @param {string} [body]
+   * @returns {Promise<void>}
+   */
+  async function notify(title, body) {
+    try {
+      await orca.host.call(
+        'notifications.show',
+        body ? { title, body: String(body).slice(0, NOTIFICATION_BODY_MAX_CHARS) } : { title },
+      )
+    } catch {
+      // 알림 실패는 명령을 실패로 만들지 않는다.
+    }
+  }
+
+  /**
+   * dispatch 성공 결과를 사람이 읽을 변경 알림으로 바꿔 fire-and-forget으로 보낸다.
+   * await하지 않으므로 dispatch 응답이 늦어지지 않는다. 알릴 내용이 없거나 문구 생성/
+   * 알림 전송이 실패하면 조용히 넘어간다(dispatch 결과에는 영향이 없다).
+   *
+   * @param {unknown} action
+   * @param {unknown} snapshot
+   * @returns {void}
+   */
+  function notifyChange(action, snapshot) {
+    let body
+    try {
+      body = describeActionChangeImpl(action, snapshot)
+    } catch {
+      return
+    }
+    if (typeof body !== 'string' || body.length === 0) {
+      return
+    }
+    try {
+      const pending = notify(CHANGE_NOTIFICATION_TITLE, body)
+      // notify는 내부에서 실패를 삼키지만, 비동기 rejection이 unhandled가 되지 않게 한다.
+      if (pending && typeof pending.catch === 'function') {
+        pending.catch(() => {})
+      }
+    } catch {
+      // 알림 실패는 dispatch 결과에 영향을 주지 않는다.
+    }
+  }
+
+  /**
    * 대시보드 서버를 지연 시작한다. 처음 호출에서만 시작하고 동시 호출은 같은
    * promise를 공유한다. 5초 안에 준비되지 않으면 code='dashboard_unavailable'.
    *
@@ -153,7 +208,12 @@ export function createPlugin(orca, deps = {}) {
     const starting = Promise.resolve().then(() =>
       startDashboardImpl({
         getSnapshot: () => model.snapshot(),
-        dispatch: (action) => model.dispatch(action),
+        dispatch: async (action) => {
+          // 모델 결과는 그대로 돌려주고, 변경 알림은 응답 뒤 fire-and-forget으로 보낸다.
+          const snapshot = await model.dispatch(action)
+          notifyChange(action, snapshot)
+          return snapshot
+        },
         assetsDir: fileURLToPath(new URLCtor('./ui/', import.meta.url)),
       }),
     )
@@ -264,6 +324,7 @@ export function createPlugin(orca, deps = {}) {
         decide: decideImpl,
       },
       diagnostics,
+      createTitleIndicator: makeTitleIndicator,
       cwarmDisabled,
       clientId,
     })
@@ -299,18 +360,7 @@ export function createPlugin(orca, deps = {}) {
       setWorktree: (id, enabled) => model.setWorktreeById(id, enabled),
       setPaused: (paused) => model.setPaused(paused),
       togglePaused: () => model.togglePaused(),
-      statusSummary: async () => model.statusSummary(),
-    }
-
-    const notify = async (title, body) => {
-      try {
-        await orca.host.call(
-          'notifications.show',
-          body ? { title, body: String(body).slice(0, NOTIFICATION_BODY_MAX_CHARS) } : { title },
-        )
-      } catch {
-        // 알림 실패는 명령을 실패로 만들지 않는다.
-      }
+      statusSummary: async (opts) => model.statusSummary(opts),
     }
 
     registerCommandsImpl({ orca, controller, notify })

@@ -214,6 +214,45 @@ function createObserverFake({ rows = [makeRow()] } = {}) {
   }
 }
 
+/**
+ * 호출을 기록만 하는 가짜 탭 제목 표시기. 각 메서드는 override로 동작을 바꿀 수 있다.
+ * @param {{onLoad?:Function, onReconcile?:Function, onTurnCompleted?:Function, onRestoreAll?:Function}} [overrides]
+ */
+function createFakeTitleIndicator(overrides = {}) {
+  const calls = { load: 0, reconcile: [], onTurnCompleted: [], restoreAll: 0 }
+  return {
+    calls,
+    async load() {
+      calls.load += 1
+      if (typeof overrides.onLoad === 'function') {
+        await overrides.onLoad()
+      }
+    },
+    reconcile(desired) {
+      calls.reconcile.push(desired)
+      if (typeof overrides.onReconcile === 'function') {
+        return overrides.onReconcile(desired)
+      }
+      return undefined
+    },
+    async onTurnCompleted(tabKey) {
+      calls.onTurnCompleted.push(tabKey)
+      if (typeof overrides.onTurnCompleted === 'function') {
+        await overrides.onTurnCompleted(tabKey)
+      }
+    },
+    async restoreAll() {
+      calls.restoreAll += 1
+      if (typeof overrides.onRestoreAll === 'function') {
+        await overrides.onRestoreAll()
+      }
+    },
+    snapshot() {
+      return { tabs: 0, disabledTabs: 0 }
+    },
+  }
+}
+
 function createHarness(options = {}) {
   const clock = options.clock ?? createFakeClock()
   const hostCall = options.hostCall ?? createHostCall()
@@ -290,6 +329,16 @@ function createHarness(options = {}) {
 
   const observer = options.observer ?? createObserverFake({ rows: options.terminals ?? [makeRow()] })
 
+  /** @type {object[]} */
+  const titleIndicators = []
+  const createTitleIndicatorFactory =
+    options.createTitleIndicator ??
+    (() => {
+      const indicator = options.titleIndicator ?? createFakeTitleIndicator()
+      titleIndicators.push(indicator)
+      return indicator
+    })
+
   const readSettingsCalls = []
   async function readSettings({ userDataPath }) {
     readSettingsCalls.push(userDataPath)
@@ -353,6 +402,7 @@ function createHarness(options = {}) {
     sendKeepalive: options.sendKeepalive ?? sendKeepalive,
     scheduler,
     diagnostics,
+    createTitleIndicator: createTitleIndicatorFactory,
     cwarmDisabled,
     clientId: 'cache-keepalive:test',
     clock,
@@ -378,6 +428,7 @@ function createHarness(options = {}) {
     bindingErrorBox,
     settingsBox,
     coordinator,
+    titleIndicators,
     get getBinding() {
       return getBindingRef
     },
@@ -1339,4 +1390,308 @@ test('turn-start 미관측: store.markReview 실패도 tick을 막지 않고 진
     (entry) => entry.event === 'safety_skipped' && entry.code === 'review_mark_failed',
   )
   assert.equal(failed.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 19. 탭 제목 ⚡ 표시기(실험 옵션) 연결
+// ---------------------------------------------------------------------------
+
+test('title indicator: 옵션 off면 매 tick reconcile([])를 호출한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const indicator = h.titleIndicators[0]
+  assert.ok(indicator, 'rpc 준비 후 표시기를 생성해야 한다')
+  assert.equal(indicator.calls.load, 1, 'load를 1회 호출한다')
+
+  await h.clock.advance(h.tickMs)
+  assert.ok(indicator.calls.reconcile.length >= 1)
+  assert.deepEqual(indicator.calls.reconcile.at(-1), [])
+})
+
+test('title indicator: 옵션 on이면 supported target만 on=true로 원한다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', paneKey: 'tab:leaf', supported: true }),
+    makeRow({
+      handle: 'h2',
+      tabId: 'tab2',
+      leafId: 'leaf2',
+      paneKey: 'tab2:leaf2',
+      ptyId: 'pty2',
+      incarnationId: 'inc2',
+      supported: false,
+      unsupportedReason: 'UNSUPPORTED_AGENT',
+    }),
+  ]
+  const h = createHarness({ terminals: rows })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await h.clock.advance(h.tickMs)
+
+  const desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.deepEqual(desired, [
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: true },
+  ])
+})
+
+test('title indicator: paused이거나 앱 타이머가 off면 on=false', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+
+  await h.store.setPaused(true)
+  await h.clock.advance(h.tickMs)
+  let desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.deepEqual(desired, [
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false },
+  ])
+
+  await h.store.setPaused(false)
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: false,
+    ttlMs: TTL_5M,
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+  desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.equal(desired.length, 1)
+  assert.equal(desired[0].on, false)
+})
+
+test('title indicator: catalog 불완전/읽기 실패 tick에는 reconcile을 호출하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await h.clock.advance(h.tickMs)
+  const indicator = h.titleIndicators[0]
+  const before = indicator.calls.reconcile.length
+  assert.ok(before >= 1, '정상 tick에서는 reconcile을 호출한다')
+  assert.equal(indicator.calls.reconcile.at(-1)[0].on, true)
+
+  // catalog가 불완전하면 호출하지 않는다.
+  h.observer.state.complete = false
+  await h.clock.advance(h.tickMs)
+  assert.equal(indicator.calls.reconcile.length, before)
+
+  // catalog 읽기 자체가 실패해도 호출하지 않는다.
+  h.observer.state.onList = () => {
+    throw new Error('catalog down')
+  }
+  await h.clock.advance(h.tickMs)
+  assert.equal(indicator.calls.reconcile.length, before)
+})
+
+test('title indicator: 실제 턴 완료에 1회 호출, 자체 keepalive 턴에는 호출하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  const indicator = h.titleIndicators[0]
+
+  // 실제(사람) 턴 완료 → tabKey 1회.
+  await arm(h, h.clock.now())
+  assert.deepEqual(indicator.calls.onTurnCompleted, ['w1:tab'])
+
+  // 자체 keepalive 턴 완료 → 호출하지 않는다.
+  await advanceToDue(h)
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+  const before = indicator.calls.onTurnCompleted.length
+  const turnAt = h.clock.now() + 100
+  worktreeEvent(h, 'w1', 'working', turnAt)
+  await h.clock.settle()
+  worktreeEvent(h, 'w1', 'done', turnAt + 100)
+  await h.clock.settle()
+  assert.equal(indicator.calls.onTurnCompleted.length, before, '자체 턴 완료는 무시한다')
+})
+
+test('title indicator: stop은 rpc close 전에 restoreAll을 기다린다', async () => {
+  let resolveRestore
+  const restorePromise = new Promise((resolve) => {
+    resolveRestore = resolve
+  })
+  const indicator = createFakeTitleIndicator({ onRestoreAll: () => restorePromise })
+  const h = createHarness({ titleIndicator: indicator })
+  await startHarness(h)
+
+  const stopping = h.coordinator.stop()
+  await h.clock.settle()
+  assert.equal(indicator.calls.restoreAll, 1)
+  assert.equal(h.rpcClosed, false, 'restoreAll 완료 전에는 rpc를 닫지 않는다')
+
+  resolveRestore()
+  await stopping
+  assert.equal(h.rpcClosed, true, 'restore 뒤 rpc를 닫는다')
+})
+
+test('title indicator: restoreAll이 끝나지 않아도 5초 뒤 rpc를 닫는다', async () => {
+  const indicator = createFakeTitleIndicator({ onRestoreAll: () => new Promise(() => {}) })
+  const h = createHarness({ titleIndicator: indicator })
+  await startHarness(h)
+
+  const stopping = h.coordinator.stop()
+  await h.clock.settle()
+  assert.equal(h.rpcClosed, false)
+
+  await h.clock.advance(5000)
+  await stopping
+  assert.equal(h.rpcClosed, true, '5초 상한 뒤에는 닫는다')
+})
+
+test('title indicator: rpc가 준비되지 않으면(연결 실패) 생성하지 않는다', async () => {
+  let created = 0
+  const h = createHarness({
+    bindingError: Object.assign(new Error('metadata missing'), { code: 'metadata_missing' }),
+    createTitleIndicator: () => {
+      created += 1
+      return createFakeTitleIndicator()
+    },
+  })
+  h.coordinator.start()
+  await h.clock.settle(3)
+
+  assert.equal(created, 0, 'rpc 없이는 팩토리를 호출하지 않는다')
+  assert.equal(h.coordinator.getRuntimeView().connection.state, 'unavailable')
+  await h.coordinator.stop()
+})
+
+// ---------------------------------------------------------------------------
+// 20. 탭 제목 ⚡ 표시: cwarm 전송 게이트 반영
+// ---------------------------------------------------------------------------
+
+test('title indicator: cwarm 게이트를 반영하고 확인 예외는 차단하지 않는다', async () => {
+  let disabled = true
+  let throwOnCheck = false
+  const h = createHarness({
+    cwarmDisabled: () => {
+      if (throwOnCheck) {
+        throw new Error('cwarm read failed')
+      }
+      return disabled
+    },
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+
+  // cwarm.disabled가 있으면 이번 tick desired는 전부 on=false.
+  await h.clock.advance(h.tickMs)
+  assert.deepEqual(h.titleIndicators[0].calls.reconcile.at(-1), [
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false },
+  ])
+  assert.ok(h.cwarmCalls.length >= 1, 'respectCwarmDisabled=true면 cwarm을 확인한다')
+
+  // 해제되면 기존 조건대로 on=true.
+  disabled = false
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.titleIndicators[0].calls.reconcile.at(-1)[0].on, true)
+
+  // 확인이 throw하면 차단하지 않는다(false 취급, assertAllowed와 동일).
+  throwOnCheck = true
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.titleIndicators[0].calls.reconcile.at(-1)[0].on, true)
+})
+
+test('title indicator: respectCwarmDisabled=false면 cwarm을 확인하지 않고 on=true', async () => {
+  const h = createHarness({ cwarmDisabled: true })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true, respectCwarmDisabled: false })
+  const before = h.cwarmCalls.length
+
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.titleIndicators[0].calls.reconcile.at(-1)[0].on, true)
+  assert.equal(h.cwarmCalls.length, before, '꺼져 있으면 cwarm을 읽지 않는다')
+})
+
+test('title indicator: 늦게 끝난 이전 tick의 cwarm 확인은 새 tick 결과를 덮지 않는다', async () => {
+  /** @type {{promise: Promise<boolean>}|null} */
+  let gate = null
+  const h = createHarness({ cwarmDisabled: () => (gate === null ? false : gate.promise) })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+
+  // tick N: cwarm 확인이 끝나지 않은 채 남는다.
+  let release = () => {}
+  gate = { promise: new Promise((resolve) => (release = resolve)) }
+  await h.clock.advance(h.tickMs)
+  gate = null
+
+  // tick N+1: 옵션 off → reconcile([]).
+  await h.store.updateConfig({ tabTitleIndicator: false })
+  await h.clock.advance(h.tickMs)
+  const calls = h.titleIndicators[0].calls.reconcile
+  assert.deepEqual(calls.at(-1), [])
+  const count = calls.length
+
+  // tick N의 확인이 뒤늦게 끝나도 on=true desired를 다시 보내지 않는다.
+  release(false)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls.length, count)
+  assert.deepEqual(calls.at(-1), [])
+})
+
+// ---------------------------------------------------------------------------
+// 21. pendingRealTurn 누수: target 삭제 경로에서 정리
+// ---------------------------------------------------------------------------
+
+test('pendingRealTurn: onWorktreeRemoved로 target이 삭제되면 정리된다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  const indicator = h.titleIndicators[0]
+
+  const t0 = h.clock.now()
+  // 실제(사람) 턴 시작만 관측하고 done은 아직 없다 → pendingRealTurn 등록 상태.
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+
+  // target 제거(worktree 삭제) 후 같은 key가 catalog로 다시 생성된다.
+  h.coordinator.onWorktreeRemoved({ worktreeId: 'w1' })
+  await h.clock.settle()
+  assert.equal(h.coordinator.getRuntimeView().worktrees.length, 0)
+
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).worktreeId, 'w1')
+
+  // 누수된 pending이 없으면 done만으로는 onTurnCompleted가 호출되지 않는다.
+  const before = indicator.calls.onTurnCompleted.length
+  worktreeEvent(h, 'w1', 'done', t0 + 1000)
+  await h.clock.settle()
+  assert.equal(
+    indicator.calls.onTurnCompleted.length,
+    before,
+    '삭제된 target의 pending이 남아 done만으로 새로 고치면 안 된다',
+  )
+
+  // 대조: 재생성된 target의 실제 working→done은 여전히 1회 호출한다.
+  worktreeEvent(h, 'w1', 'working', t0 + 2000)
+  await h.clock.settle()
+  worktreeEvent(h, 'w1', 'done', t0 + 3000)
+  await h.clock.settle()
+  assert.equal(indicator.calls.onTurnCompleted.length, before + 1)
+})
+
+test('pendingRealTurn: catalog 재구성으로 target이 삭제되면 정리된다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  const indicator = h.titleIndicators[0]
+
+  const t0 = h.clock.now()
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+
+  // catalog에서 사라지면 complete tick에서 target이 삭제된다.
+  h.observer.state.rows = []
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.coordinator.getRuntimeView().worktrees.length, 0)
+
+  // 같은 key가 다시 나타나 재생성된다.
+  h.observer.state.rows = [makeRow()]
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).worktreeId, 'w1')
+
+  const before = indicator.calls.onTurnCompleted.length
+  worktreeEvent(h, 'w1', 'done', t0 + 1000)
+  await h.clock.settle()
+  assert.equal(indicator.calls.onTurnCompleted.length, before)
 })

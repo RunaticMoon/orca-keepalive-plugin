@@ -62,6 +62,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxConsecutiveKeepalives: 3,
   respectCwarmDisabled: true,
   logLevel: 'info',
+  tabTitleIndicator: false,
 });
 
 /**
@@ -81,6 +82,7 @@ const FIELD_ORDER = [
   'maxConsecutiveKeepalives',
   'respectCwarmDisabled',
   'logLevel',
+  'tabTitleIndicator',
 ];
 
 /**
@@ -236,6 +238,7 @@ const FIELD_VALIDATORS = {
   maxConsecutiveKeepalives: (value) => expectInteger(value, 'maxConsecutiveKeepalives', 0, 1000),
   respectCwarmDisabled: (value) => expectBoolean(value, 'respectCwarmDisabled'),
   logLevel: (value) => expectLogLevel(value, 'logLevel'),
+  tabTitleIndicator: (value) => expectBoolean(value, 'tabTitleIndicator'),
 };
 
 /**

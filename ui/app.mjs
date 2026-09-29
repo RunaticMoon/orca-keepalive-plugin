@@ -450,6 +450,7 @@ function boot() {
       maxConsecutive: byId('cfg-max-consecutive'),
       defaultWorktree: byId('cfg-default-worktree'),
       respectCwarm: byId('cfg-respect-cwarm'),
+      tabTitleIndicator: byId('cfg-tab-title-indicator'),
       runtimePath: byId('cfg-runtime-path'),
     },
   };
@@ -875,6 +876,7 @@ function boot() {
     setValue(nodes.cfg.maxConsecutive, config.maxConsecutiveKeepalives ?? '');
     setChecked(nodes.cfg.defaultWorktree, config.defaultWorktreeEnabled);
     setChecked(nodes.cfg.respectCwarm, config.respectCwarmDisabled);
+    setChecked(nodes.cfg.tabTitleIndicator, config.tabTitleIndicator);
     setValue(nodes.cfg.runtimePath, config.runtimeUserDataPath ?? '');
   }
 
@@ -928,6 +930,7 @@ function boot() {
       maxConsecutiveKeepalives,
       defaultWorktreeEnabled: nodes.cfg.defaultWorktree ? nodes.cfg.defaultWorktree.checked : false,
       respectCwarmDisabled: nodes.cfg.respectCwarm ? nodes.cfg.respectCwarm.checked : false,
+      tabTitleIndicator: nodes.cfg.tabTitleIndicator ? nodes.cfg.tabTitleIndicator.checked : false,
       runtimeUserDataPath: runtimeRaw.length === 0 ? null : runtimeRaw,
     };
   }

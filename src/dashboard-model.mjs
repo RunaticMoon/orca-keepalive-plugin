@@ -124,6 +124,89 @@ function worktreeHashOf(worktreeId) {
 }
 
 /**
+ * 서버 시각 기준 남은 시간을 `N분 M초 후`/`N시간 M분 후`로 표현한다. 이미 지난
+ * 시각은 `곧`으로 표시한다.
+ * @param {number} remainingMs
+ * @returns {string}
+ */
+function relativeFutureText(remainingMs) {
+  if (remainingMs <= 0) {
+    return '곧';
+  }
+  const totalSeconds = Math.ceil(remainingMs / 1000);
+  if (totalSeconds >= 3600) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    return `${hours}시간 ${minutes}분 후`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}분 ${seconds}초 후`;
+}
+
+/**
+ * 상태 알림의 워크트리 한 줄. 현재 워크트리는 `▶ `, 실제 켜짐은 `⚡ `를 앞에
+ * 붙이고 다음 전송/확인 필요를 덧붙인다. 원시 worktreeId·경로는 넣지 않는다.
+ *
+ * @param {object} worktree 스냅숏 worktree(`label`, `enabled`, `effectiveEnabled`, `terminals`).
+ * @param {{current: boolean, paused: boolean, defaultWorktreeEnabled: boolean, serverNow: number}} context
+ * @returns {string}
+ */
+function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled, serverNow }) {
+  const wt = isPlainObject(worktree) ? worktree : {};
+  const label = nonEmptyStringOrNull(wt.label) ?? '(이름 없음)';
+  const override = typeof wt.enabled === 'boolean' ? wt.enabled : null;
+  const scopeOn = override === null ? defaultWorktreeEnabled : override;
+  const effective = wt.effectiveEnabled === true;
+  // 일시정지 중에는 effectiveEnabled가 모두 false가 되므로 사용자가 켜둔 상태(scope)를
+  // 드러내 `켜짐(일시정지 중)`으로 표시한다.
+  const displayOn = paused ? scopeOn : effective;
+
+  /** @type {string[]} */
+  const parts = [];
+  let head = '';
+  if (current) {
+    head += '▶ ';
+  }
+  if (displayOn) {
+    head += '⚡ ';
+  }
+  head += label;
+  if (displayOn && paused) {
+    head += ' 켜짐(일시정지 중)';
+  } else {
+    head += displayOn ? ' 켜짐' : ' 꺼짐';
+    head += override === null ? '(기본값)' : '(직접 설정)';
+  }
+  parts.push(head);
+
+  const terminals = Array.isArray(wt.terminals) ? wt.terminals : [];
+  let nextDueAt = null;
+  let reviewCount = 0;
+  for (const terminal of terminals) {
+    if (!isPlainObject(terminal)) {
+      continue;
+    }
+    // 실제로 보내지 않을 터미널(워크트리/터미널 꺼짐, 일시정지)의 dueAt은 표시하지 않는다.
+    const dueAt = !paused && terminal.effectiveEnabled === true ? finiteOrNull(terminal.dueAt) : null;
+    if (dueAt !== null && (nextDueAt === null || dueAt < nextDueAt)) {
+      nextDueAt = dueAt;
+    }
+    if (terminal.needsReview === true) {
+      reviewCount += 1;
+    }
+  }
+  if (nextDueAt !== null) {
+    parts.push(`다음 전송 ${relativeFutureText(nextDueAt - serverNow)}`);
+  }
+  if (reviewCount > 0) {
+    parts.push(`확인 필요 ${reviewCount}`);
+  }
+
+  return parts.join(' · ');
+}
+
+/**
  * 런타임 뷰 + 저장소 정책을 결합한 대시보드 모델을 만든다.
  *
  * @param {object} options
@@ -141,7 +224,7 @@ function worktreeHashOf(worktreeId) {
  *   setWorktreeById: (worktreeId: string, enabled: boolean|null, options?: {expectedRevision?: number}) => Promise<{enabled: boolean, override: boolean|null, label: string|null}>,
  *   setPaused: (paused: boolean) => Promise<void>,
  *   togglePaused: () => Promise<{paused: boolean}>,
- *   statusSummary: () => {text: string},
+ *   statusSummary: (options?: {currentWorktreeId?: string|null}) => {text: string},
  * }}
  */
 export function createDashboardModel({
@@ -484,6 +567,7 @@ export function createDashboardModel({
         respectCwarmDisabled: config.respectCwarmDisabled === true,
         logLevel: typeof config.logLevel === 'string' ? config.logLevel : 'info',
         runtimeUserDataPath: typeof config.runtimeUserDataPath === 'string' ? config.runtimeUserDataPath : null,
+        tabTitleIndicator: config.tabTitleIndicator === true,
       },
       worktrees,
       diagnostics: mapDiagnostics(getDiagnostics()),
@@ -786,35 +870,75 @@ export function createDashboardModel({
     throw new ActionError(409, 'revision_conflict');
   }
 
+  /** 상태 알림 본문 상한(문자). main.mjs의 알림 본문 상한 1000자보다 짧게 잡는다. */
+  const STATUS_MAX_CHARS = 900;
+
   /**
-   * 커맨드/알림용 한국어 한 줄 요약(비밀·경로 없음, 200자 이하).
+   * 커맨드/알림용 한국어 요약(비밀·경로·원시 worktreeId 없음, 900자 이하).
+   *
+   * 1행은 전역 상태(켜짐/꺼짐(일시정지) · 타이머 · 연결)를, 이후에는 워크트리별
+   * 켜짐/꺼짐 목록을 한 줄씩 보여준다. `options.currentWorktreeId`(원시 Orca
+   * worktreeId)를 해시해 현재 워크트리를 찾으면 맨 앞에 `▶ `를 붙인다.
+   *
+   * @param {{currentWorktreeId?: string|null}} [options]
    * @returns {{text: string}}
    */
-  function statusSummary() {
+  function statusSummary(options) {
+    const opts = isPlainObject(options) ? options : {};
     const snap = snapshot();
-    const worktreeCount = snap.worktrees.length;
-    const terminals = snap.worktrees.flatMap((worktree) =>
-      Array.isArray(worktree.terminals) ? worktree.terminals : [],
-    );
-    const total = terminals.length;
-    const active = terminals.filter((t) => t.effectiveEnabled === true).length;
-    const scheduled = terminals.filter((t) => t.dueAt !== null).length;
-    const review = terminals.filter((t) => t.needsReview === true).length;
+    const paused = snap.config.paused === true;
+    const defaultWorktreeEnabled = snap.config.defaultWorktreeEnabled === true;
+    const serverNow = finiteOrNull(snap.serverNow) ?? 0;
+    const worktrees = Array.isArray(snap.worktrees) ? snap.worktrees : [];
 
-    // 맨 앞에 전역 상태를 항상 표시한다.
-    const parts = [snap.config.paused ? '꺼짐(일시정지)' : '켜짐'];
+    // 전역 상태 1행.
+    const headerParts = [paused ? '꺼짐(일시정지)' : '켜짐'];
     if (!snap.appTimer.known) {
-      parts.push('앱 타이머 설정 알 수 없음');
+      headerParts.push('앱 타이머 설정 알 수 없음');
     } else if (snap.appTimer.enabled) {
-      parts.push(`타이머 켜짐(${TTL_TEXT[snap.appTimer.ttlMs] ?? '알 수 없음'})`);
+      headerParts.push(`타이머 켜짐(${TTL_TEXT[snap.appTimer.ttlMs] ?? '알 수 없음'})`);
     } else {
-      parts.push('Orca 프롬프트 캐시 타이머 꺼짐');
+      headerParts.push('Orca 프롬프트 캐시 타이머 꺼짐');
     }
-    parts.push(CONNECTION_TEXT[snap.connection.state] ?? snap.connection.state);
-    parts.push(`워크트리 ${worktreeCount}개`);
-    parts.push(`대상 ${total}개 중 활성 ${active} · 예약 ${scheduled} · 확인 필요 ${review}`);
+    headerParts.push(CONNECTION_TEXT[snap.connection.state] ?? snap.connection.state);
+    headerParts.push(`워크트리 ${worktrees.length}개`);
+    const header = headerParts.join(' · ');
 
-    return { text: parts.join(' · ') };
+    if (worktrees.length === 0) {
+      return { text: `${header}\n대상 워크트리 없음` };
+    }
+
+    // 현재 워크트리(해시 일치)를 맨 앞으로, 나머지는 스냅숏 순서 유지.
+    const currentRaw = nonEmptyStringOrNull(opts.currentWorktreeId);
+    const currentHash = currentRaw === null ? null : worktreeHashOf(currentRaw);
+    const current =
+      currentHash === null ? null : worktrees.find((worktree) => worktree.worktreeHash === currentHash) ?? null;
+    const ordered = current === null ? worktrees : [current, ...worktrees.filter((worktree) => worktree !== current)];
+
+    const lines = ordered.map((worktree) =>
+      statusWorktreeLine(worktree, {
+        current: worktree === current,
+        paused,
+        defaultWorktreeEnabled,
+        serverNow,
+      }),
+    );
+
+    const fullText = [header, ...lines].join('\n');
+    if (fullText.length <= STATUS_MAX_CHARS) {
+      return { text: fullText };
+    }
+
+    // 900자를 넘으면 뒤쪽 워크트리를 잘라 `… 외 N개`로 끝낸다.
+    let kept = 0;
+    for (let k = lines.length - 1; k >= 0; k -= 1) {
+      const candidate = [header, ...lines.slice(0, k), `… 외 ${lines.length - k}개`].join('\n');
+      if (candidate.length <= STATUS_MAX_CHARS) {
+        kept = k;
+        break;
+      }
+    }
+    return { text: [header, ...lines.slice(0, kept), `… 외 ${lines.length - kept}개`].join('\n') };
   }
 
   return { snapshot, dispatch, toggleWorktreeById, setWorktreeById, setPaused, togglePaused, statusSummary };

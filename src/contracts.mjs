@@ -22,6 +22,7 @@
  * @property {number} maxConsecutiveKeepalives 연속 keepalive 상한(0=무제한).
  * @property {boolean} respectCwarmDisabled ~/.claude/cwarm.disabled 존재 시 전송 차단.
  * @property {'debug'|'info'|'warn'|'error'} logLevel
+ * @property {boolean} tabTitleIndicator 실험 옵션. keepalive 적용 Claude 터미널 탭 이름 앞에 ⚡ 표시.
  */
 
 /**
@@ -324,6 +325,7 @@ export const DIAGNOSTIC_EVENTS = deepFreeze([
   'send_uncertain',
   'policy_changed',
   'shutdown',
+  'title_indicator',
 ]);
 
 /**

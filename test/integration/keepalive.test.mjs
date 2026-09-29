@@ -700,3 +700,82 @@ test('scenario 11: 5분 이상 가상 시간 동안 host.call(storage.get) heart
     await h.cleanup()
   }
 })
+
+// ---------------------------------------------------------------------------
+// 시나리오 12. 탭 제목 ⚡ 표시(실험 옵션) on → rename, off → rename(null)
+// ---------------------------------------------------------------------------
+
+test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래대로 되돌린다', async () => {
+  const PREFIX = '⚡ '
+  const h = await createHarness({ enabled: true })
+  try {
+    await h.start()
+    const dashboard = await h.openDashboard()
+    assert.equal(dashboard.status, 200)
+    assert.equal(dashboard.state.config.tabTitleIndicator, false)
+
+    const on = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { tabTitleIndicator: true },
+        expectedRevision: dashboard.state.revision,
+      },
+    })
+    assert.equal(on.status, 200, '옵션 on POST 성공')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await waitFor(
+      () =>
+        h.runtime.frames.some(
+          (frame) =>
+            frame.method === 'terminal.rename' &&
+            frame.params &&
+            frame.params.title === PREFIX + 'W1 terminal',
+        ),
+      { clock: h.clock },
+    )
+    assert.equal(h.runtime.getTerminal('h1').customTitle, PREFIX + 'W1 terminal')
+
+    // rename은 session.tabs.list 항목 id(tab1::leaf1)가 아니라 terminal handle(h1)로 호출된다.
+    const renames = h.runtime.frames.filter((frame) => frame.method === 'terminal.rename')
+    assert.ok(renames.length > 0, 'rename frame이 있어야 한다')
+    assert.ok(
+      renames.every((frame) => frame.params && frame.params.terminal === 'h1'),
+      'rename은 terminal handle로만 호출된다',
+    )
+
+    const off = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { tabTitleIndicator: false },
+        expectedRevision: on.body.revision,
+      },
+    })
+    assert.equal(off.status, 200, '옵션 off POST 성공')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await waitFor(
+      () =>
+        h.runtime.frames.some(
+          (frame) =>
+            frame.method === 'terminal.rename' &&
+            frame.params &&
+            (frame.params.title === null || frame.params.title === ''),
+        ),
+      { clock: h.clock },
+    )
+    assert.equal(h.runtime.getTerminal('h1').customTitle, null, 'off면 원래대로 되돌린다')
+  } finally {
+    await h.cleanup()
+  }
+})

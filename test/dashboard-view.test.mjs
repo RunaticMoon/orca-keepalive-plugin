@@ -430,6 +430,107 @@ test('index.html: no inline event handler (on*) attributes', () => {
   assert.doesNotMatch(indexHtml, /\son[a-z]+\s*=/i);
 });
 
+test('index.html: tab title indicator has a checkbox, visible label, and linked description', () => {
+  const input = indexHtml.match(/<input\b[^>]*\bid="cfg-tab-title-indicator"[^>]*>/)?.[0];
+  assert.ok(input);
+  assert.match(input, /\bname="tabTitleIndicator"/);
+  assert.match(input, /\btype="checkbox"/);
+  assert.match(input, /\baria-describedby="cfg-tab-title-indicator-description"/);
+  assert.match(
+    indexHtml,
+    /<label\s+for="cfg-tab-title-indicator">탭 이름에 ⚡ 표시 \(실험\)<\/label>/,
+  );
+  const description = indexHtml.match(
+    /<p\s+id="cfg-tab-title-indicator-description"[^>]*>([\s\S]*?)<\/p>/,
+  )?.[1].trim();
+  assert.equal(
+    description,
+    'keepalive가 적용되는 Claude 터미널의 탭 이름 앞에 ⚡를 붙여 칸반·워크트리 카드에서 보이게 합니다. Orca에는 사용자가 직접 바꾼 탭 이름으로 저장되므로, 켜져 있는 동안 자동 탭 이름 갱신이 멈추고(작업이 끝날 때 다시 맞춤), 끄면 자동 이름으로 돌아갑니다. 직접 붙인 탭 이름은 유지되지 않을 수 있습니다.',
+  );
+});
+
+test('config form: missing, true, and false snapshots render; Save sends changed checkbox value', async () => {
+  const globals = Object.fromEntries(
+    ['document', 'window', 'sessionStorage', 'fetch'].map((key) => [key, globalThis[key]]),
+  );
+  const nodes = new Map();
+  const intervals = [];
+  const actions = [];
+  let state = makeSnapshot({ worktrees: [], diagnostics: [] });
+
+  function makeNode() {
+    return {
+      checked: false,
+      value: '',
+      disabled: false,
+      textContent: '',
+      children: [],
+      listeners: new Map(),
+      classList: { add() {}, remove() {}, toggle() {} },
+      setAttribute() {},
+      addEventListener(type, listener) { this.listeners.set(type, listener); },
+      appendChild(child) { this.children.push(child); return child; },
+    };
+  }
+
+  try {
+    globalThis.document = {
+      getElementById(id) {
+        if (!nodes.has(id)) nodes.set(id, makeNode());
+        return nodes.get(id);
+      },
+      createElement: makeNode,
+    };
+    globalThis.window = {
+      location: { hash: '', pathname: '/', search: '' },
+      setInterval(callback) { intervals.push(callback); },
+    };
+    globalThis.sessionStorage = { getItem: () => 'test-token' };
+    globalThis.fetch = async (url, options = {}) => {
+      if (url === '/api/action') {
+        const action = JSON.parse(options.body);
+        actions.push(action);
+        state = { ...state, config: { ...state.config, ...action.patch } };
+      }
+      return { ok: true, status: 200, json: async () => state };
+    };
+
+    await import('../ui/app.mjs?tab-title-indicator-dom-test');
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    await settle();
+
+    const checkbox = nodes.get('cfg-tab-title-indicator');
+    const form = nodes.get('config-form');
+    assert.equal(checkbox.checked, false, 'missing field defaults to off');
+
+    state = { ...state, config: { ...state.config, tabTitleIndicator: true } };
+    intervals[0]();
+    await settle();
+    assert.equal(checkbox.checked, true);
+
+    state = { ...state, config: { ...state.config, tabTitleIndicator: false } };
+    intervals[0]();
+    await settle();
+    assert.equal(checkbox.checked, false);
+
+    checkbox.checked = true;
+    form.listeners.get('change')();
+    let prevented = false;
+    form.listeners.get('submit')({ preventDefault() { prevented = true; } });
+    await settle();
+    assert.equal(prevented, true);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].type, 'config');
+    assert.equal(actions[0].expectedRevision, 7);
+    assert.equal(actions[0].patch.tabTitleIndicator, true);
+  } finally {
+    for (const [key, value] of Object.entries(globals)) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
+  }
+});
+
 test('app.mjs: never uses innerHTML', () => {
   assert.doesNotMatch(appSource, /innerHTML/);
 });

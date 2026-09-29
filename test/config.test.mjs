@@ -111,7 +111,7 @@ test('runtimeUserDataPath: 상대경로/비문자열/NUL/과길이 거절', () =
 // boolean 필드
 // ---------------------------------------------------------------------------
 
-for (const field of ['paused', 'defaultWorktreeEnabled', 'respectCwarmDisabled']) {
+for (const field of ['paused', 'defaultWorktreeEnabled', 'respectCwarmDisabled', 'tabTitleIndicator']) {
   test(`${field}: boolean만 허용`, () => {
     assert.equal(parseConfig({ [field]: true })[field], true);
     assert.equal(parseConfig({ [field]: false })[field], false);
@@ -119,6 +119,21 @@ for (const field of ['paused', 'defaultWorktreeEnabled', 'respectCwarmDisabled']
     assertValidation(() => parseConfig({ [field]: 1 }), 'invalid_type', field);
   });
 }
+
+test('tabTitleIndicator: 기본값은 false(실험 옵션)', () => {
+  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, false);
+  assert.equal(parseConfig({}).tabTitleIndicator, false);
+  assert.equal(parseConfig({ tabTitleIndicator: true }).tabTitleIndicator, true);
+  assert.equal(parseConfig({ tabTitleIndicator: false }).tabTitleIndicator, false);
+});
+
+test('patch: tabTitleIndicator를 patch할 수 있다', () => {
+  const merged = parseConfigPatch({ tabTitleIndicator: true }, DEFAULT_CONFIG);
+  assert.equal(merged.tabTitleIndicator, true);
+  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, false, 'patch는 원본을 변경하지 않는다');
+  assertValidation(() => parseConfigPatch({ tabTitleIndicator: 'yes' }, DEFAULT_CONFIG), 'invalid_type', 'tabTitleIndicator');
+  assertValidation(() => parseConfigPatch({ tabTitleIndicator: 1 }, DEFAULT_CONFIG), 'invalid_type', 'tabTitleIndicator');
+});
 
 // ---------------------------------------------------------------------------
 // 정수 경계값
@@ -375,6 +390,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     'send_uncertain',
     'policy_changed',
     'shutdown',
+    'title_indicator',
   ]);
   assert.deepEqual(contracts.PUBLIC_SNAPSHOT_FORBIDDEN_KEYS, [
     'authToken',

@@ -178,9 +178,27 @@ They only change the current worktree when the plugin workspace context resolves
 to exactly one worktree; otherwise they tell you to use the dashboard. Plugins do
 not intercept the app's own Cmd/Ctrl-J command UI.
 
-**Cache Keepalive: Show Status** posts a one-line notification that starts with
-`켜짐` (on) or `꺼짐(일시정지)` (off/paused) and includes `워크트리 N개`, plus the
-app-timer/connection state and per-target active/scheduled/needs-review counts.
+**Cache Keepalive: Show Status** posts a multi-line notification. The first line is
+the global state: `켜짐` or `꺼짐(일시정지)`, the Orca prompt-cache timer state
+(`타이머 켜짐(5분)` / `타이머 켜짐(1시간)` / `Orca 프롬프트 캐시 타이머 꺼짐` /
+`앱 타이머 설정 알 수 없음`), the runtime connection state, and `워크트리 N개`.
+Each following line is one worktree:
+
+- `▶ ` marks the worktree of the terminal that invoked the command, when the
+  current worktree can be resolved (it is shown first).
+- `⚡ ` marks a worktree that is actually on. The suffix `(기본값)` or `(직접 설정)`
+  distinguishes an inherited default from an explicit override.
+- While the global pause is active, a worktree that is switched on shows
+  `켜짐(일시정지 중)` instead of `켜짐`.
+- `다음 전송 … 후` shows the next scheduled send for that worktree as a relative
+  time (for example `다음 전송 3분 12초 후`), and `확인 필요 N` counts terminals
+  whose send result needs review. Both are omitted when nothing applies.
+- If the text would exceed 900 characters, trailing worktrees are dropped and the
+  message ends with `… 외 N개`.
+
+The notification shows the worktree display name and terminal title from the
+snapshot; the plugin does not add raw worktree ids, paths, or tokens (a terminal title
+you set yourself is shown as-is).
 
 ## Where to find the controls
 
@@ -315,9 +333,91 @@ These are the `DEFAULT_CONFIG` fields. The dashboard form edits a subset of them
 | `observedInputQuietMs` | `30000` | Wait after an observed draft change before sending (10000–300000 ms). Not in the form. |
 | `maxConsecutiveKeepalives` | `3` | Consecutive keepalive cap; `0` = unlimited (0–1000). Editable in the form. |
 | `respectCwarmDisabled` | `true` | Honor `~/.claude/cwarm.disabled`. Editable in the form. |
+| `tabTitleIndicator` | `false` | Experimental: prefix `⚡ ` to the Orca tab title of Claude terminals where keepalive applies. Editable in the form. See [Tab title ⚡ indicator (experimental)](#tab-title--indicator-experimental). |
 | `logLevel` | `info` | Diagnostic level. Not in the form. |
 
 Time and counter fields are validated on the server; a rejected value is not applied.
+
+### Change notifications
+
+Changing state from the **dashboard** (browser) or the **terminal CLI**
+(`keepalive ...`) posts an Orca notification describing what changed. Both paths go
+through the same `POST /api/action` dispatch, so the wording is identical, and it
+shows only the worktree display name and terminal title from the snapshot — never a
+raw worktree id, path, or token. Examples:
+
+- `main: keepalive 켜짐` / `main: keepalive 꺼짐` for a worktree, and
+  `main: 기본값 사용 (현재 켜짐)` when reverting to the default.
+- `main / claude #1: keepalive 켜짐` / `main / claude #1: 상속(현재 꺼짐)` for a
+  terminal.
+- `모든 keepalive를 껐습니다(일시정지).` / `모든 keepalive를 켰습니다.` for the
+  global pause.
+- Turning a scope on while the global pause is active appends
+  ` (전체 일시정지 중)`, because the on state is stored but not yet effective.
+
+Notifications are best-effort: if showing one fails, the change itself still
+succeeds. The palette commands (`keepalive-toggle-pause`,
+`keepalive-toggle-worktree`, and so on) post their own messages and do not use this
+path. `config`, `reset-budget`, and `clear-review` actions do not notify.
+
+### Tab title ⚡ indicator (experimental)
+
+The setting **탭 이름에 ⚡ 표시 (실험)** (`tabTitleIndicator`, default off) prefixes
+`⚡ ` to the Orca tab title of every Claude terminal that is **switched on as a
+keepalive target**. It marks that the tab is on, not that a send is scheduled right
+now: a tab can show ⚡ before its next send is due. The tab title is what Kanban
+(workspace board) cards show on the agent rows, so the ⚡ marker is visible there
+too.
+
+A tab shows ⚡ only while all of these hold at the tick:
+
+- the plugin is not globally paused;
+- the Orca prompt-cache timer is on and readable;
+- the runtime is connected; and
+- the worktree and terminal policy for that tab is on — this includes the
+  consecutive-keepalive cap, so reaching the cap (or a pending review / storage
+  failure) can drop ⚡ temporarily.
+
+When `respectCwarmDisabled` is on, an existing `~/.claude/cwarm.disabled` also turns
+⚡ off.
+
+How to enable it:
+
+- Dashboard → **설정** form → check **탭 이름에 ⚡ 표시 (실험)** → **저장 (Save)**.
+  This sends a `{ "type": "config", "patch": { "tabTitleIndicator": true } }` action,
+  and the value is stored in the plugin config alongside the other settings.
+- Or set `tabTitleIndicator` in the stored plugin config directly. There is no CLI
+  command that edits config.
+
+When the option is on, the plugin sets the tab's `customTitle` through the Orca
+`terminal.rename` RPC. It removes the prefix again when the option is turned off,
+when one of the conditions above no longer holds, or when the plugin shuts down,
+returning the tab to Orca's automatic name. A failed rename is retried on the next
+tick; after three consecutive failures a tab is skipped for the rest of that run.
+
+Known limitations (read before enabling):
+
+- A custom tab name you set **before** ⚡ was applied is not restored. ⚡ is written
+  as `⚡ <your name>`, the post-turn refresh rebuilds it from Orca's automatic title,
+  and turning ⚡ off clears the custom title, so the tab ends up with Orca's
+  automatic name. Rename the tab again afterwards if you need that name.
+- A tab you rename **while** ⚡ is applied is left alone. The plugin only removes the
+  exact value it applied; if the current title differs, it just clears its record and
+  does not overwrite or clear your title. (Exception: if the previous rename failed or
+  was interrupted and has not been confirmed yet, the next retry prefixes whatever the
+  tab is called at that moment.)
+- While ⚡ is applied, Orca's automatic tab-title generation stops. After a real user
+  turn completes (at most once per 60 s), the plugin briefly clears the name, waits
+  for the new automatic title, and re-applies ⚡. The tab title can flicker during
+  that refresh.
+- Orca stores the tab title, so an abnormal exit can leave ⚡ behind on a tab. On the
+  next start the plugin removes the leftover ⚡ when the option is off; when the
+  option is on it keeps or re-applies ⚡ only where the conditions above hold.
+- Split panes in the same tab share one tab title. ⚡ is shown when any Claude pane
+  in that tab is on.
+- This is a best-effort integration over Orca internals. Failures are swallowed
+  (reported only as safe diagnostic codes), and a tab is skipped for the rest of the
+  current run after three consecutive failures.
 
 ---
 
@@ -430,6 +530,32 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   `here [on|off|default]`(Orca 터미널 안에서만), `worktree <번호|label> <on|off|default>`,
   `url`, `help`. 종료 코드 0/1/2/3(3=플러그인 미실행).
   예: `node ~/.orca-cache-keepalive/keepalive.mjs status`.
+- **상태 요약(Show Status 명령):** 첫 줄에 전역 상태(켜짐/꺼짐(일시정지) · 타이머 ·
+  연결 · 워크트리 N개), 이후 워크트리별 한 줄(현재 `▶`, 실제 켜짐 `⚡`,
+  `(기본값)`/`(직접 설정)`, 일시정지 중 `켜짐(일시정지 중)`, `다음 전송 … 후`,
+  `확인 필요 N`)을 보여줍니다. 900자를 넘으면 `… 외 N개`로 줄입니다. 원시
+  worktreeId·경로·토큰은 넣지 않습니다.
+- **변경 알림:** 대시보드나 터미널 CLI로 상태를 바꾸면(예: `main: keepalive 켜짐`,
+  `main / claude #1: keepalive 꺼짐`, `모든 keepalive를 껐습니다(일시정지).`) Orca
+  알림이 표시됩니다. 문구에는 스냅숏의 워크트리 표시 이름과 터미널 제목만 쓰고 원시
+  worktreeId·경로·토큰은 넣지 않습니다. 전역 일시정지 중 켜기는 `(전체 일시정지 중)`이
+  붙고, config·예산 초기화·확인 필요 해제는 알리지 않습니다. 팔레트 명령은 자체 문구를
+  씁니다.
+- **⚡ 탭 표시(실험):** 설정 `tabTitleIndicator`(기본 꺼짐)를 켜면 keepalive 대상으로
+  켜진 Claude 탭 이름 앞에 `⚡ `가 붙어 칸반(워크스페이스) 보드 카드에서도 보입니다.
+  (실제로 전송할 탭이 아니라 켜진 탭 표시입니다.) ⚡는 전체 일시정지 아님 + Orca 앱
+  타이머 켜짐 + 런타임 연결됨 + 해당 워크트리/터미널 정책 켜짐(연속 전송 상한 도달 등으로
+  일시 해제될 수 있음) + (`respectCwarmDisabled`일 때) `cwarm.disabled` 없음일 때만
+  붙습니다. 대시보드 설정에서 **탭 이름에 ⚡ 표시 (실험)** 체크 후 저장하거나 저장된
+  config 값으로 켭니다(CLI의 config 명령은 없음). rename 실패는 다음 주기에 재시도하고,
+  연속 실패가 상한(3회)에 달하면 그 탭은 이번 실행 동안 건너뜁니다. 조건이 안 맞거나
+  끄면, 플러그인 종료 시 Orca 자동 이름으로 되돌립니다. 비정상 종료 뒤 남은 ⚡는 다음
+  시작 시 옵션이 꺼져 있으면 제거되고, 켜져 있으면 조건에 맞게 유지·재적용됩니다. ⚡가
+  붙어 있는 동안 직접 이름을 바꾼 탭(⚡ 적용 값과 달라진 경우)은 플러그인이 덮어쓰거나
+  지우지 않습니다. 반대로 ⚡가 붙기 **전에** 직접 지정한 탭 이름은 복원되지 않고 끄면
+  Orca 자동 이름이 됩니다. 한계:
+  ⚡가 붙은 동안 Orca 자동 제목 갱신이 멈추며(턴 완료 후 최소 60초 간격으로 해제→재적용,
+  깜빡임 가능), 같은 탭 분할 창은 이름을 공유합니다.
 - **대시보드:** Orca 내장 브라우저로 열리며 127.0.0.1 루프백 + URL fragment 토큰으로
   인증합니다. 워크트리/터미널 on/off/기본값, 전역 일시정지/재개, 예산 초기화,
   "확인 필요" 해제, 설정 편집(저장 버튼)을 제공합니다. 서버는 Open Dashboard와

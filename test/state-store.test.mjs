@@ -113,6 +113,41 @@ test('load: 유효한 저장 상태를 round-trip한다', async () => {
   assert.equal(budget.needsReview, true, '미완료 attempt는 재시작 시 review로 승격');
 });
 
+test('load: tabTitleIndicator 필드가 없는 기존 상태는 기본값 false로 채운다', async () => {
+  const legacy = {
+    schemaVersion: 1,
+    revision: 3,
+    config: { paused: false, defaultWorktreeEnabled: true, message: 'legacy', maxConsecutiveKeepalives: 2 },
+    profiles: [],
+  };
+  const host = createFakeHost({ initial: legacy });
+  const store = createStateStore({ hostCall: host.hostCall });
+  const snap = await store.load();
+
+  assert.equal(snap.memoryPaused, false);
+  assert.equal(snap.lastSaveError, null);
+  assert.equal(snap.revision, 3);
+  assert.equal(snap.config.tabTitleIndicator, false);
+  assert.equal(snap.config.message, 'legacy');
+
+  // patch로 켜면 스냅숏/저장소 양쪽에 반영되고 재로드해도 유지된다.
+  await store.updateConfig({ tabTitleIndicator: true });
+  assert.equal(store.snapshot().config.tabTitleIndicator, true);
+  assert.equal(host.read().config.tabTitleIndicator, true);
+
+  const reloaded = createStateStore({ hostCall: host.hostCall });
+  const reloadedSnap = await reloaded.load();
+  assert.equal(reloadedSnap.config.tabTitleIndicator, true);
+});
+
+test('updateConfig: tabTitleIndicator는 boolean만 허용한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await assert.rejects(() => store.updateConfig({ tabTitleIndicator: 'yes' }));
+  await assert.rejects(() => store.updateConfig({ tabTitleIndicator: 1 }));
+  assert.equal(store.snapshot().config.tabTitleIndicator, false);
+});
+
 test('load: schemaVersion 불일치/손상이면 전송 금지 + 저장소 미덮어쓰기', async () => {
   const corrupt = { schemaVersion: 2, revision: 5 };
   const host = createFakeHost({ initial: corrupt });

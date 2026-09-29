@@ -76,6 +76,17 @@ Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 �
 
 2단계 전송도 완전한 입력 경쟁 방지가 아니다. UI 읽기→Enter 사이 사용자 타이핑이나 질문 등장 가능성이 남는다. 이 제약을 숨긴 채 “안전 전송 보장”으로 표현하지 않는다. Esc/Ctrl-U/Ctrl-C/초안 자동 복원은 사용자 입력이나 권한 화면을 바꾸므로 사용하지 않는다.
 
+### 3.2 OKPN-EB52 추가 기능(A·B·D) 설계 요약
+
+§3 표의 OKPN-EB52 메모(정적 패널)에 이어 같은 메인 세션에서 추가한 세 기능의 설계
+결정이다. 상세 계약은 각 모듈 JSDoc과 사용자 문서(README, TESTING.md)를 따른다.
+
+| ID | 기능 | 설계 |
+|---|---|---|
+| A | 상태 요약 개선 | `src/dashboard-model.mjs`의 `statusSummary({currentWorktreeId})`가 첫 줄 전역 상태(`켜짐`/`꺼짐(일시정지)` · 타이머 · 연결 · `워크트리 N개`)과 워크트리별 한 줄을 만든다. 현재 워크트리 `▶`, 실제 켜짐 `⚡`, `(기본값)`/`(직접 설정)`, 일시정지 중 `켜짐(일시정지 중)`, `다음 전송 … 후`, `확인 필요 N`. 900자(`STATUS_MAX_CHARS`)를 넘으면 `… 외 N개`로 자른다. `keepalive-status` 커맨드가 `controller.currentWorktreeId()`(실패 시 null)를 넘겨 호출한다. 원시 worktreeId·경로·토큰은 넣지 않는다. |
+| B | 변경 알림 | `src/change-notice.mjs`의 순수 함수 `describeActionChange(action, snapshot)`가 성공한 dispatch의 Action과 새 snapshot으로 200자 이하 한 줄을 만든다. main.mjs가 대시보드 `POST /api/action` dispatch wrapper(터미널 CLI도 같은 경로)에서 응답 뒤 fire-and-forget으로 Orca 알림을 보낸다. 팔레트 명령은 자체 알림을 쓰므로 이 경로를 타지 않는다. worktree는 label(없으면 `워크트리`), terminal은 label/title만 쓰고, 전역 일시정지 중 켜기에는 ` (전체 일시정지 중)` 꼬리말을 붙이며, `config`/`reset-budget`/`clear-review`는 알리지 않는다. |
+| D | ⚡ 탭 표시(실험) | 설정 `tabTitleIndicator`(기본 false, `src/config.mjs`; 대시보드 설정 폼 `name="tabTitleIndicator"`). `src/title-indicator.mjs`가 Orca RPC `terminal.rename`으로 keepalive 대상으로 켜진 탭(phase와 무관)의 `customTitle` 앞에 `⚡ `를 붙인다. on 조건은 전체 일시정지 아님·앱 타이머 켜짐·런타임 연결·워크트리/터미널 정책 허용(연속 전송 상한 도달 시 일시 false 가능)·(respectCwarmDisabled일 때) `cwarm.disabled` 없음이다. 기록을 storage(`title-indicator-v1`)에 먼저 저장한 뒤 rename하고, 조건이 깨지거나 종료 시 `title:null`로 해제하며 다음 시작의 reconcile이 잔여 prefix를 정리한다(옵션이 꺼져 있으면 제거, 켜져 있으면 조건에 맞게 유지·재적용). rename 실패는 다음 tick에 재시도하고 탭별 연속 실패 3회에서 그 탭을 이번 실행 동안 건너뛴다. 실패는 삼키고 안전 code만 진단에 남긴다. 사용자가 직접 바꾼 제목(적용 값과 다름)은 덮어쓰거나 지우지 않고 기록만 정리한다. 한계: ⚡ 동안 Orca 자동 제목 갱신 정지(턴 완료 후 최소 60초 간격 해제→재적용, 깜빡임), 비정상 종료 시 잔존, 같은 탭 분할 창 이름 공유. |
+
 ## 4. 런타임 및 저장소 계약
 
 ### 4.1 같은 Orca 인스턴스 찾기
@@ -395,7 +406,7 @@ DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readA
 
 ## 8. 로그·진단과 장애 처리
 
-진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
+진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown, title_indicator. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
 
 host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cache-keepalive/logs/events.jsonl`에 plugin 전용 파일 기록(1 MiB×3, chmod 0600·디렉터리 0700 best effort). 앱 프로필/설정 파일에는 쓰지 않는다. Windows ACL은 chmod로 보장되지 않으므로 기존 사용자 data 디렉터리 경계를 따른다. 파일 logger 실패는 ring/host log로 대체하고 전송 상태 저장 실패와 구별한다. 알림은 동일 reason당 5분에 1회, 큰 상태 전환에만 발생; 매 tick 알림 금지.
 

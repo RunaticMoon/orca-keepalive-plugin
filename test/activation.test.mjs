@@ -41,9 +41,9 @@ const noopClock = {
 /**
  * fake orca worker API. host.call은 storage와 notifications만 메모리에 기록한다.
  *
- * @param {{grantedCapabilities?: string[]}} [options]
+ * @param {{grantedCapabilities?: string[], failNotifications?: boolean}} [options]
  */
-function createFakeOrca({ grantedCapabilities = ALL_CAPABILITIES } = {}) {
+function createFakeOrca({ grantedCapabilities = ALL_CAPABILITIES, failNotifications = false } = {}) {
   /** @type {string[]} */
   const registeredCommandOrder = []
   /** @type {Map<string, () => unknown>} */
@@ -80,6 +80,9 @@ function createFakeOrca({ grantedCapabilities = ALL_CAPABILITIES } = {}) {
           return { ok: true }
         }
         if (method === 'notifications.show') {
+          if (failNotifications) {
+            throw Object.assign(new Error('notification failed'), { code: 'notification_failed' })
+          }
           notifications.push(params)
           return { ok: true }
         }
@@ -136,7 +139,7 @@ function createFakeCoordinator() {
  * @param {{port?: number, token?: string, order?: string[]}} [options]
  */
 function createFakeDashboard({ port = 50123, token = 'tok-abc', order } = {}) {
-  const calls = { start: 0, close: 0 }
+  const calls = { start: 0, close: 0, startOptions: [] }
   const server = {
     url: `http://127.0.0.1:${port}/#token=${token}`,
     port,
@@ -149,10 +152,38 @@ function createFakeDashboard({ port = 50123, token = 'tok-abc', order } = {}) {
   return {
     server,
     calls,
-    startDashboard: () => {
+    startDashboard: (options) => {
       calls.start += 1
+      calls.startOptions.push(options)
       return Promise.resolve(server)
     },
+  }
+}
+
+/**
+ * createPlugin이 만드는 대시보드 모델을 대신하는 가짜. dispatch 호출만 기록하고
+ * 고정 스냅숏을 돌려주므로 알림 경로만 따로 검증할 수 있다.
+ *
+ * @param {{snapshot?: object, onDispatch?: (action: unknown) => Promise<object>}} [options]
+ */
+function createFakeModel({ snapshot, onDispatch } = {}) {
+  const dispatched = []
+  const defaultSnapshot = snapshot ?? { revision: 1, config: { paused: false }, worktrees: [] }
+  return {
+    dispatched,
+    async dispatch(action) {
+      dispatched.push(action)
+      if (typeof onDispatch === 'function') {
+        return onDispatch(action)
+      }
+      return defaultSnapshot
+    },
+    snapshot: () => defaultSnapshot,
+    toggleWorktreeById: async () => ({ enabled: true, label: null }),
+    setWorktreeById: async () => ({ enabled: true, override: true, label: null }),
+    setPaused: async () => {},
+    togglePaused: async () => ({ paused: true }),
+    statusSummary: async () => ({ text: 'ok' }),
   }
 }
 
@@ -300,6 +331,36 @@ test('terminal:send가 허용되면 coordinator.start를 정확히 한 번 호�
   assert.equal(calls.stop, 1)
 })
 
+test('createPlugin은 coordinator에 hostCall과 실제 title indicator 팩토리를 주입한다', async () => {
+  const { coordinator } = createFakeCoordinator()
+  const { orca } = createFakeOrca()
+  let captured = null
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ orchestrator: coordinator }),
+    createCoordinator: (options) => {
+      captured = options
+      return coordinator
+    },
+  })
+  plugin.activate()
+
+  assert.ok(captured, 'coordinator 옵션이 전달된다')
+  assert.equal(typeof captured.hostCall, 'function')
+  assert.equal(typeof captured.createTitleIndicator, 'function')
+
+  // 실제 팩토리가 주입됐는지 계약대로 가볍게 확인한다(부작용 없음).
+  const indicator = captured.createTitleIndicator({
+    rpc: { call: async () => ({ tabs: [] }) },
+    hostCall: async () => ({ value: undefined }),
+    clock: noopClock,
+    diagnostics: { record() {} },
+  })
+  assert.equal(typeof indicator.reconcile, 'function')
+  assert.equal(typeof indicator.restoreAll, 'function')
+
+  await plugin.deactivate()
+})
+
 test('keepalive-status는 런타임 없음 상태 문구를 알림으로 보낸다', async () => {
   const { coordinator } = createFakeCoordinator()
   const { orca, commands, notifications } = createFakeOrca()
@@ -396,6 +457,104 @@ test('activate 후 open 명령을 실행해도 대시보드를 다시 시작하�
   await commands.get('keepalive-open')()
 
   assert.equal(dash.calls.start, 1, 'open 명령도 같은 서버를 재사용한다')
+  await plugin.deactivate()
+})
+
+test('대시보드 dispatch는 model 결과를 그대로 돌려주고 변경 알림을 1회 보낸다', async () => {
+  const { orca, notifications } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const snap = { revision: 2, config: { paused: true }, worktrees: [] }
+  const model = createFakeModel({ snapshot: snap })
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ startDashboard: dash.startDashboard, control }),
+    createDashboardModel: () => model,
+  })
+  plugin.activate()
+
+  await waitFor(() => dash.calls.start === 1)
+
+  const { dispatch } = dash.calls.startOptions[0]
+  assert.equal(typeof dispatch, 'function', 'startDashboard가 dispatch를 받는다')
+  const action = { type: 'pause', paused: true, expectedRevision: 1 }
+  const result = await dispatch(action)
+
+  assert.equal(result, snap, 'model.dispatch 결과가 그대로 반환된다')
+  assert.deepEqual(model.dispatched, [action], 'model.dispatch로 action이 전달된다')
+  assert.equal(notifications.length, 1, '변경 알림은 정확히 1회')
+  assert.equal(notifications[0].title, 'Cache Keepalive')
+  assert.equal(notifications[0].body, '모든 keepalive를 껐습니다(일시정지).')
+
+  await plugin.deactivate()
+})
+
+test('config action은 대시보드 경로에서 변경 알림을 보내지 않는다', async () => {
+  const { orca, notifications } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const snap = { revision: 2, config: { paused: false }, worktrees: [] }
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ startDashboard: dash.startDashboard, control }),
+    createDashboardModel: () => createFakeModel({ snapshot: snap }),
+  })
+  plugin.activate()
+
+  await waitFor(() => dash.calls.start === 1)
+  const { dispatch } = dash.calls.startOptions[0]
+  const result = await dispatch({ type: 'config', patch: { paused: true }, expectedRevision: 1 })
+
+  assert.equal(result, snap)
+  assert.equal(notifications.length, 0, '설정 변경은 알림을 보내지 않는다')
+
+  await plugin.deactivate()
+})
+
+test('model.dispatch가 던지면 변경 알림 없이 예외가 그대로 전파된다', async () => {
+  const { orca, notifications } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const boom = Object.assign(new Error('conflict'), { code: 'revision_conflict' })
+  const model = createFakeModel({
+    onDispatch: async () => {
+      throw boom
+    },
+  })
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ startDashboard: dash.startDashboard, control }),
+    createDashboardModel: () => model,
+  })
+  plugin.activate()
+
+  await waitFor(() => dash.calls.start === 1)
+  const { dispatch } = dash.calls.startOptions[0]
+
+  await assert.rejects(
+    dispatch({ type: 'pause', paused: true, expectedRevision: 1 }),
+    (error) => error === boom,
+  )
+  assert.equal(notifications.length, 0, '실패한 dispatch는 알림을 보내지 않는다')
+
+  await plugin.deactivate()
+})
+
+test('알림 전송이 실패해도 dispatch 결과는 정상 반환된다', async () => {
+  const { orca, notifications } = createFakeOrca({ failNotifications: true })
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const snap = { revision: 2, config: { paused: false }, worktrees: [] }
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ startDashboard: dash.startDashboard, control }),
+    createDashboardModel: () => createFakeModel({ snapshot: snap }),
+  })
+  plugin.activate()
+
+  await waitFor(() => dash.calls.start === 1)
+  const { dispatch } = dash.calls.startOptions[0]
+  const result = await dispatch({ type: 'pause', paused: false, expectedRevision: 1 })
+
+  assert.equal(result, snap, '알림 실패가 dispatch 결과를 바꾸지 않는다')
+  assert.equal(notifications.length, 0)
+
   await plugin.deactivate()
 })
 
