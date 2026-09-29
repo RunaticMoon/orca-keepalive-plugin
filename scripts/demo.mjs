@@ -21,11 +21,22 @@ import { join } from 'node:path'
 
 import { createPlugin } from '../main.mjs'
 import { createCoordinator } from '../src/coordinator.mjs'
+import { createDashboardModel } from '../src/dashboard-model.mjs'
+import { DEFAULT_CONFIG } from '../src/config.mjs'
 import { startFakeRuntime } from '../test/fixtures/fake-runtime.mjs'
 import { createOrcaUserData } from '../test/fixtures/orca-userdata.mjs'
 import { createFakeHost } from '../test/fixtures/fake-host.mjs'
 
 const DEFAULT_SPEED = 60
+
+/** 데모 userdata fixture에 설정하는 앱 타이머 TTL(ms). 5분. */
+const DEMO_TTL_MS = 300000
+
+/**
+ * 주기 가짜 turn이 epoch를 리셋해 due에 도달하기 전에 예약을 지우지 않도록 하는
+ * 가속 시간 기준 여유(ms). 터미널당 turn 간격을 `TTL + 여유`보다 길게 만든다.
+ */
+const PERIODIC_TURN_SAFETY_MS = 30000
 
 /**
  * 인자를 파싱한다.
@@ -110,7 +121,7 @@ async function main() {
     socketPath,
     profileId: 'demo-profile',
     enabled: true,
-    ttlMs: 300000,
+    ttlMs: DEMO_TTL_MS,
   })
   const runtime = await startFakeRuntime({
     socketPath,
@@ -158,6 +169,10 @@ async function main() {
     },
     createCoordinator: (coordinatorOptions) =>
       createCoordinator({ ...coordinatorOptions, clock }),
+    // 대시보드 스냅숏의 serverNow도 가속 clock 기준으로 맞춘다. dueAt/expiresAt이
+    // 가속 시계라 기본 Date.now()를 쓰면 카운트다운이 어긋난다(제품 코드는 불변).
+    createDashboardModel: (modelOptions) =>
+      createDashboardModel({ ...modelOptions, now: () => clock.now() }),
   })
   plugin.activate()
 
@@ -223,10 +238,23 @@ async function main() {
     ? /(http:\/\/127\.0\.0\.1:\d+\/#token=[A-Za-z0-9_-]+)/.exec(notification.body)
     : null
 
+  // 데모가 실제로 쓰는 TTL과 플러그인 기본 margin으로 예상 TTL/due를 표시한다.
+  const margin5mMs = DEFAULT_CONFIG.margin5mMs
+  const ttlSec = DEMO_TTL_MS / 1000
+  const dueSec = (DEMO_TTL_MS - margin5mMs) / 1000
+
+  // 주기 turn 간격 계산. 터미널당 가속 시간 기준 간격이 `TTL + 여유`보다 길어야
+  // due(done + TTL - margin)에 도달하기 전에 epoch가 리셋되지 않는다. 전체 주기는
+  // 3개 터미널을 순환하므로 터미널당 간격을 터미널 수로 나눈 값이다.
+  const perTerminalAcceleratedMs = DEMO_TTL_MS + PERIODIC_TURN_SAFETY_MS
+  const perTerminalRealMs = Math.ceil(perTerminalAcceleratedMs / options.speed)
+  const periodicRealMs = Math.max(500, Math.ceil(perTerminalRealMs / terminals.length))
+
   process.stdout.write(
     [
       'Cache Keepalive demo',
-      `  speed: ${options.speed}x (5분 TTL ≈ ${Math.round(300 / options.speed)}s, due ≈ ${Math.round(240 / options.speed)}s)`,
+      `  speed: ${options.speed}x (5분 TTL ≈ ${Math.round(ttlSec / options.speed)}s, due ≈ ${Math.round(dueSec / options.speed)}s)`,
+      `  periodic turn ≈ ${periodicRealMs}ms/terminal회전 (터미널당 가속 ${Math.round(perTerminalRealMs * options.speed / 1000)}s)`,
       `  worktrees: wt-alpha(h1,h2 split) / wt-beta(h3)`,
       `  ORCA_USER_DATA_PATH override: ${userData.userDataPath}`,
       urlMatch ? `  Dashboard: ${urlMatch[1]}` : '  Dashboard: (URL not found in notification)',
@@ -240,16 +268,14 @@ async function main() {
     for (const terminal of terminals) emitTurn(terminal)
   }, Math.max(50, Math.round(500 / options.speed)))
 
-  // 주기적으로 실제 작업 turn을 흉내낸다(비자체 turn).
+  // 주기적으로 실제 작업 turn을 흉내낸다(비자체 turn). 간격은 위에서 TTL/margin에
+  // 맞춰 계산한 periodicRealMs를 쓴다(due 전에 epoch가 리셋되지 않게 함).
   let rotate = 0
-  const periodic = setInterval(
-    () => {
-      const terminal = terminals[rotate % terminals.length]
-      rotate += 1
-      emitTurn(terminal)
-    },
-    Math.max(500, Math.round(8000 / options.speed)),
-  )
+  const periodic = setInterval(() => {
+    const terminal = terminals[rotate % terminals.length]
+    rotate += 1
+    emitTurn(terminal)
+  }, periodicRealMs)
   timers.push(periodic)
 
   // Enter(submission) 수신 시 자체 turn(working→done)을 흉내낸다.
