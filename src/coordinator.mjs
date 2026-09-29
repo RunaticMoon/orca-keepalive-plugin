@@ -589,7 +589,13 @@ export function createCoordinator({
         }
         continue
       }
-      applyReduce(key, { type: 'TICK', now: clock.now() })
+      const prevPhase = entry.state.phase
+      const ticked = applyReduce(key, { type: 'TICK', now: clock.now() })
+      if (prevPhase !== 'NEEDS_REVIEW' && ticked !== null && ticked.phase === 'NEEDS_REVIEW') {
+        // turn-start 확인 창이 지나 NEEDS_REVIEW로 전환됐다. store에도 기록해야
+        // 대시보드 해제 버튼이 뜬다(§5.4/§7.3). 전환 시 1회만 호출된다.
+        markReviewFromTick(ticked, key)
+      }
       const decision = entry.decision
       if (decision && decision.kind === 'expire') {
         const state = targets.get(key)?.state
@@ -616,6 +622,32 @@ export function createCoordinator({
 
     // f. 동시 1개 전송.
     maybeSend(candidates)
+  }
+
+  /**
+   * TICK에서 NEEDS_REVIEW로 전환했을 때 store에 확인 필요를 기록한다. guarded-send의
+   * uncertain 경로는 이미 journal.markReview를 호출하지만, 이 경로(turn-start 미관측)는
+   * store를 갱신하지 않아 대시보드 "다음 작업부터 재개" 버튼이 뜨지 않고 해당 터미널이
+   * 영구히 멈추는 결함을 막는다(§5.4/§7.3). markReview는 idempotent(이미 true면 no-op)라
+   * 중복 호출해도 안전하다. 비동기 실패가 tick을 막지 않게 catch하고 진단만 남긴다.
+   * @param {any} state 전환 직후 scheduler state.
+   * @param {string} key target key(진단용).
+   */
+  function markReviewFromTick(state, key) {
+    const attempt = state.attempt
+    const attemptId =
+      attempt && typeof attempt.id === 'string' && attempt.id.length > 0 ? attempt.id : null
+    // attemptId로 budget을 찾지 못하는 경우를 대비해 없으면 scope로 호출한다.
+    const arg = attemptId !== null ? attemptId : scopeOf(state.target)
+    const onFailure = () => {
+      diagnostics.record({ event: 'safety_skipped', code: 'review_mark_failed', targetId: key })
+    }
+    try {
+      Promise.resolve(store.markReview(arg, UNKNOWN_SEND_REASON)).catch(onFailure)
+    } catch {
+      onFailure()
+    }
+    diagnostics.record({ event: 'send_uncertain', code: UNKNOWN_SEND_REASON, targetId: key })
   }
 
   /**

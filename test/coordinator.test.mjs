@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { createCoordinator } from '../src/coordinator.mjs'
 import { createStateStore } from '../src/state-store.mjs'
 import { sendKeepalive } from '../src/guarded-send.mjs'
+import { createDashboardModel } from '../src/dashboard-model.mjs'
+import { TIMING } from '../src/contracts.mjs'
 import * as scheduler from '../src/scheduler.mjs'
 
 const DEFAULT_MESSAGE =
@@ -1178,4 +1180,89 @@ test('U3: 앱 타이머 unknown 전환도 epoch를 폐기한다', async () => {
 
   await h.clock.advance(TTL_5M)
   assert.equal(h.sendCalls.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 18. turn-start 미관측 → NEEDS_REVIEW store 기록 + 대시보드 해제 후 재개
+// ---------------------------------------------------------------------------
+
+test('turn-start 미관측 → store needsReview 기록, 대시보드 해제 후 다음 turn에서 재개', async () => {
+  const h = createRealSendHarness()
+  await startHarness(h)
+
+  // 1) 정상 전송(submitted)까지 진행해 AWAITING_TURN 상태를 만든다.
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendAttempts.length, 1)
+  assert.equal(h.sendAttempts[0].kind, 'submitted')
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+  assert.equal(h.store.getBudget(SCOPE).needsReview, false)
+
+  const attemptId = h.store.getBudget(SCOPE).lastAttempt.attemptId
+  assert.equal(typeof attemptId, 'string')
+
+  // 2) working hook 없이 turn-start 확인 창(15초)을 넘기면 TICK이 NEEDS_REVIEW로 만든다.
+  await h.clock.advance(TIMING.turnStartConfirmMs + h.tickMs * 2 + 100)
+
+  // store budget에 needsReview가 기록돼 대시보드 해제 버튼이 뜬다.
+  assert.equal(h.store.getBudget(SCOPE).needsReview, true)
+  assert.ok(h.spy.markReview.includes(attemptId))
+  // scheduler/view에도 NEEDS_REVIEW가 노출된다.
+  assert.equal(viewTerminal(h).phase, 'NEEDS_REVIEW')
+  assert.equal(viewTerminal(h).reason, 'PARTIAL_OR_UNKNOWN_SEND')
+
+  // 전환 진단은 1회만 남는다.
+  const uncertainDiag = h.diagEvents.filter(
+    (entry) => entry.event === 'send_uncertain' && entry.code === 'PARTIAL_OR_UNKNOWN_SEND',
+  )
+  assert.equal(uncertainDiag.length, 1)
+
+  // 대시보드용 view에도 needsReview가 노출된다.
+  const model = createDashboardModel({
+    store: h.store,
+    getRuntimeView: () => h.coordinator.getRuntimeView(),
+    onReviewCleared: (info) => h.coordinator.onReviewCleared(info),
+  })
+  let snap = model.snapshot()
+  const term = snap.worktrees[0].terminals[0]
+  assert.equal(term.phase, 'NEEDS_REVIEW')
+  assert.equal(term.needsReview, true)
+
+  // 3) 대시보드 "다음 작업부터 재개": clear-review → store.clearReview + onReviewCleared.
+  snap = await model.dispatch({
+    type: 'clear-review',
+    targetId: term.id,
+    expectedRevision: snap.revision,
+  })
+  assert.equal(h.store.getBudget(SCOPE).needsReview, false)
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.equal(snap.worktrees[0].terminals[0].needsReview, false)
+
+  // 4) 다음 fresh working→done→due에서 다시 전송할 수 있다.
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendAttempts.length, 2)
+  assert.equal(h.sendAttempts[1].kind, 'submitted')
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+})
+
+test('turn-start 미관측: store.markReview 실패도 tick을 막지 않고 진단만 남긴다', async () => {
+  const h = createRealSendHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+
+  // markReview가 reject해도 tick은 NEEDS_REVIEW로 진행되고 실패 진단만 남는다.
+  h.store.markReview = async () => {
+    throw new Error('mark_failed')
+  }
+  await h.clock.advance(TIMING.turnStartConfirmMs + h.tickMs * 2 + 100)
+
+  assert.equal(viewTerminal(h).phase, 'NEEDS_REVIEW')
+  assert.equal(h.store.getBudget(SCOPE).needsReview, false)
+  const failed = h.diagEvents.filter(
+    (entry) => entry.event === 'safety_skipped' && entry.code === 'review_mark_failed',
+  )
+  assert.equal(failed.length, 1)
 })
