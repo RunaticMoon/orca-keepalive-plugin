@@ -547,7 +547,7 @@ host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cach
 - 단일 목표: 모듈들을 로드 가능한 plugin으로 묶기.
 - 입력: §7.2 manifest, S02,S03, M/N/K의 완료 계약.
 - 소유: `main.mjs`, `orca-plugin.json`, `package.json`, `.gitignore`, `test/activation.test.mjs`. 제외: src/ui·배포·npm dependencies.
-- 방향: package type=module, engines node>=24, scripts test=`node --test`, default activate와 named deactivate, 기능 probe와 capability 확인, activate는 등록 뒤 즉시 반환. 무한 loop await 금지.
+- 방향: package type=module, engines node>=22.5(node:sqlite 필요, 개발·테스트는 Node 24), scripts test=`node --test`, default activate와 named deactivate, 기능 probe와 capability 확인, activate는 등록 뒤 즉시 반환. 무한 loop await 금지.
 - 선행: K,L,M,N. 완료: fake orca에서 10초 내(목표 1초) 준비, 명령/이벤트 1회 등록, deactivate 2회 안전, unknown SQLite/없는 runtime에도 status 명령 유지. main import만으로 부작용 없음.
 - 검증: `node --test test/activation.test.mjs`; `node --check main.mjs`; `npm test`. 보고: R, manifest 전체와 activation 시간.
 
