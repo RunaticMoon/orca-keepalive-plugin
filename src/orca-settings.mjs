@@ -12,9 +12,10 @@
  * 2. `profiles/<id>/profile-state.db`가 있으면 SQLite(권위 저장소)를 읽는다.
  *    - `PRAGMA user_version === 3`, meta `profile_id` 일치, settings 문서 1행,
  *      `domain_version === 1`, revision 양의 안전정수, SHA-256(payload)=content_hash.
- *    - DB가 있으면 JSON으로 fallback하지 않는다.
- * 3. DB가 없을 때만 `profiles/<id>/orca-data.json`(≤32 MiB)의 `.settings`를 읽는다.
- *    루트 legacy `orca-data.json`이나 `.bak`는 자동 채택하지 않는다.
+ *    - DB가 있으면 JSON으로 fallback하지 않는다. main 파일이 없어도 같은 경로의
+ *      `-wal`/`-shm`/`-journal` 형제 파일이 하나라도 있으면 `db_error`로 접는다.
+ * 3. DB family 파일이 전혀 없을 때만 `profiles/<id>/orca-data.json`(≤32 MiB)의
+ *    `.settings`를 읽는다. 루트 legacy `orca-data.json`이나 `.bak`는 자동 채택하지 않는다.
  * 4. 읽기 전후 index를 다시 읽어 activeProfileId가 바뀌면 `profile_changed`로 폐기한다.
  * 5. `promptCacheTimerEnabled`는 boolean만 수락(키 없음→false),
  *    `promptCacheTtlMs`는 키 없음→300000, 300000/3600000 외 값은 `payload_invalid`.
@@ -40,6 +41,11 @@ const PROFILES_DIRECTORY_NAME = 'profiles';
 const PROFILE_STATE_DATABASE_FILE_NAME = 'profile-state.db';
 /** 프로필 legacy JSON 파일 이름. `profile-state-storage-paths.ts:11`. */
 const PROFILE_DATA_FILE_NAME = 'orca-data.json';
+/**
+ * DB family 접미사. 원본 `profile-state-storage-classification.ts:7`과 동일.
+ * main 파일이 없어도 형제 파일이 남아 있으면 DB 권위 상태로 본다(fail-closed).
+ */
+const DATABASE_FAMILY_SUFFIXES = ['-wal', '-shm', '-journal'];
 
 /** index 최대 크기(1 MiB). §4.4 */
 const MAX_INDEX_BYTES = 1024 * 1024;
@@ -145,6 +151,27 @@ async function readText(readFile, path, maxBytes) {
     return { ok: false, reason: 'invalid' };
   }
   return { ok: true, text };
+}
+
+/**
+ * main DB 파일이 없을 때 같은 경로의 `-wal`/`-shm`/`-journal` 형제 파일 존재를 확인한다.
+ * 형제 파일이 하나라도 있거나 stat 판정 자체가 불가하면 true(fail-closed)를 돌려준다.
+ * @param {(path: string) => Promise<unknown>} stat
+ * @param {string} databasePath
+ * @returns {Promise<boolean>}
+ */
+async function hasDatabaseFamilyFile(stat, databasePath) {
+  for (const suffix of DATABASE_FAMILY_SUFFIXES) {
+    try {
+      await stat(`${databasePath}${suffix}`);
+      return true;
+    } catch (error) {
+      if (!isEnoent(error)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -390,6 +417,10 @@ export async function readTimerSettings({
       databaseExists = true;
     } catch (error) {
       if (!isEnoent(error)) {
+        return fail('db_error');
+      }
+      // main 파일이 없어도 DB family 파일이 남아 있으면 권위 상태이므로 JSON으로 내려가지 않는다.
+      if (await hasDatabaseFamilyFile(stat, databasePath)) {
         return fail('db_error');
       }
     }

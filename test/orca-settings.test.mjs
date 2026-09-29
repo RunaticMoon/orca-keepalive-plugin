@@ -295,6 +295,31 @@ test('DB와 JSON이 모두 있으면 DB가 우선한다', async () => {
   }
 });
 
+test('main DB가 없어도 -wal/-shm/-journal이 남아 있으면 db_error(JSON 미사용)', async () => {
+  const dir = await makeUserData();
+  try {
+    await writeIndex(dir, PROFILE_ID);
+    // JSON이 있으므로 fallback했다면 성공했을 것이다.
+    await writeProfileJson(dir, PROFILE_ID, { promptCacheTimerEnabled: true });
+
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      const profileDir = join(dir, 'profiles', PROFILE_ID);
+      await fs.mkdir(profileDir, { recursive: true });
+      const familyPath = join(profileDir, `${DB_FILE}${suffix}`);
+      await fs.writeFile(familyPath, '');
+      try {
+        const snapshot = await readTimerSettings({ userDataPath: dir });
+        assert.equal(snapshot.known, false, `${suffix}: JSON으로 fallback하면 안 된다`);
+        assert.equal(snapshot.reason, 'db_error', `${suffix}: db_error로 접어야 한다`);
+      } finally {
+        await fs.rm(familyPath, { force: true });
+      }
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // index 검증
 // ---------------------------------------------------------------------------
