@@ -513,6 +513,75 @@ test('isAllowedByPolicy 우선순위 전 케이스', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// override 상속(null=삭제) / getOverrides
+// ---------------------------------------------------------------------------
+
+test('setWorktree(null)은 override를 삭제해 defaultWorktreeEnabled를 상속한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await store.updateConfig({ defaultWorktreeEnabled: false });
+  await store.setWorktree(W(), true);
+  assert.equal(store.getOverrides(W()).worktree, true);
+  assert.equal(store.isAllowedByPolicy(W()).allowed, true);
+
+  await store.setWorktree(W(), null);
+  assert.equal(store.getOverrides(W()).worktree, null);
+  assert.equal(store.isAllowedByPolicy(W()).reason, 'SCOPE_DISABLED');
+  assert.equal(host.read().profiles[0].worktrees.length, 0, '삭제가 저장소에 반영된다');
+
+  const reloaded = createStateStore({ hostCall: host.hostCall });
+  await reloaded.load();
+  assert.equal(reloaded.getOverrides(W()).worktree, null);
+  assert.equal(reloaded.isAllowedByPolicy(W()).reason, 'SCOPE_DISABLED');
+});
+
+test('setTerminal(null)은 override를 삭제해 워크트리 설정을 상속한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await store.setWorktree(W(), true);
+  await store.setTerminal(T(), false);
+  assert.equal(store.getOverrides(T()).terminal, false);
+  assert.equal(store.isAllowedByPolicy(T()).reason, 'SCOPE_DISABLED');
+
+  await store.setTerminal(T(), null);
+  assert.equal(store.getOverrides(T()).terminal, null);
+  assert.equal(store.isAllowedByPolicy(T()).allowed, true, '워크트리 on을 상속한다');
+  assert.equal(host.read().profiles[0].terminals.length, 0);
+
+  await store.setWorktree(W(), false);
+  assert.equal(store.isAllowedByPolicy(T()).reason, 'SCOPE_DISABLED');
+});
+
+test('존재하지 않는 override 삭제는 no-op이며 revision을 올리지 않는다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  const revision = store.snapshot().revision;
+  await store.setWorktree(W({ worktreeId: 'nope' }), null);
+  assert.equal(store.snapshot().revision, revision);
+  await store.setTerminal(T({ worktreeId: 'nope', paneKey: 'x:y' }), null);
+  assert.equal(store.snapshot().revision, revision);
+  assert.deepEqual(store.snapshot().profiles, []);
+});
+
+test('setTerminal(null)도 paneKey가 필요하다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await assert.rejects(store.setTerminal(W(), null), (error) => error.code === 'invalid_scope');
+});
+
+test('getOverrides는 override 값을 복사해 반환한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  assert.deepEqual(store.getOverrides(W()), { worktree: null, terminal: null });
+  assert.deepEqual(store.getOverrides(T()), { worktree: null, terminal: null });
+
+  await store.setWorktree(W(), false);
+  await store.setTerminal(T(), true);
+  assert.deepEqual(store.getOverrides(W()), { worktree: false, terminal: null });
+  assert.deepEqual(store.getOverrides(T()), { worktree: false, terminal: true });
+});
+
+// ---------------------------------------------------------------------------
 // prototype pollution / 불변성 / subscribe
 // ---------------------------------------------------------------------------
 

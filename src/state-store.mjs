@@ -735,13 +735,29 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
 
   /**
    * 워크트리 scope override. `paneKey`는 무시한다(워크트리 단위).
+   * `enabled === null`이면 override 행을 삭제해 defaultWorktreeEnabled를 상속한다.
    * @param {object} scope
-   * @param {boolean} enabled
+   * @param {boolean|null} enabled
    * @param {{expectedRevision?: number}} [options]
    * @returns {Promise<Snapshot>}
    */
   async function setWorktree(scope, enabled, options = {}) {
     const norm = normalizeScope(scope);
+    if (enabled === null) {
+      return applyPersisted((/** @type {Record<string, unknown>} */ draft) => {
+        const profile = findProfile(draft, norm);
+        if (profile === null) {
+          return false;
+        }
+        const worktrees = /** @type {Array<Record<string, unknown>>} */ (profile.worktrees);
+        const index = worktrees.findIndex((w) => w.worktreeId === norm.worktreeId);
+        if (index === -1) {
+          return false;
+        }
+        worktrees.splice(index, 1);
+        return true;
+      }, options.expectedRevision);
+    }
     const on = enabled === true;
     const transform = (/** @type {Record<string, unknown>} */ draft) => {
       const profile = ensureProfile(draft, norm);
@@ -757,8 +773,9 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
 
   /**
    * 터미널 scope override. `paneKey`가 필요하다.
+   * `enabled === null`이면 override 행을 삭제해 워크트리 설정을 상속한다.
    * @param {object} scope
-   * @param {boolean} enabled
+   * @param {boolean|null} enabled
    * @param {{expectedRevision?: number}} [options]
    * @returns {Promise<Snapshot>}
    */
@@ -766,6 +783,23 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
     const norm = normalizeScope(scope);
     if (norm.paneKey === null) {
       throw new StoreError('invalid_scope', { message: 'setTerminal requires paneKey' });
+    }
+    if (enabled === null) {
+      return applyPersisted((/** @type {Record<string, unknown>} */ draft) => {
+        const profile = findProfile(draft, norm);
+        if (profile === null) {
+          return false;
+        }
+        const terminals = /** @type {Array<Record<string, unknown>>} */ (profile.terminals);
+        const index = terminals.findIndex(
+          (t) => t.worktreeId === norm.worktreeId && t.paneKey === norm.paneKey,
+        );
+        if (index === -1) {
+          return false;
+        }
+        terminals.splice(index, 1);
+        return true;
+      }, options.expectedRevision);
     }
     const on = enabled === true;
     const transform = (/** @type {Record<string, unknown>} */ draft) => {
@@ -969,6 +1003,32 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
   }
 
   /**
+   * scope의 override 값을 복사해 반환한다. 행이 없으면 null(=상속).
+   * `paneKey`가 없으면 terminal은 항상 null이다.
+   * @param {object} scope
+   * @returns {{worktree: boolean|null, terminal: boolean|null}}
+   */
+  function getOverrides(scope) {
+    const norm = normalizeScope(scope);
+    const profile = findProfile(state, norm);
+    let worktree = null;
+    let terminal = null;
+    if (profile !== null) {
+      const worktreeRow = findWorktree(profile, norm.worktreeId);
+      if (worktreeRow !== null) {
+        worktree = worktreeRow.enabled === true;
+      }
+      if (norm.paneKey !== null) {
+        const terminalRow = findTerminal(profile, norm.worktreeId, norm.paneKey);
+        if (terminalRow !== null) {
+          terminal = terminalRow.enabled === true;
+        }
+      }
+    }
+    return { worktree, terminal };
+  }
+
+  /**
    * 순수 동기 정책 판정. §5.3/§6 우선순위를 따른다.
    * @param {object} scope
    * @returns {{allowed: boolean, reason: string|null}}
@@ -1034,6 +1094,7 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
     clearReview,
     resetBudget,
     getBudget,
+    getOverrides,
     isAllowedByPolicy,
     flush,
   };
