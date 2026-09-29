@@ -1,0 +1,922 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import { createCoordinator } from '../src/coordinator.mjs'
+import { createStateStore } from '../src/state-store.mjs'
+import * as scheduler from '../src/scheduler.mjs'
+
+const DEFAULT_MESSAGE =
+  'Cache keepalive. Reply only OK; do not use tools or continue previous work.'
+const TTL_5M = 300000
+const MARGIN_5M = 60000
+
+// ---------------------------------------------------------------------------
+// fakes
+// ---------------------------------------------------------------------------
+
+/**
+ * 수동으로 시간을 진행하는 fake clock. setTimeout/clearTimeout/monoNow/sleep과
+ * advance/jumpWall/jumpMono를 제공한다.
+ * @param {{start?:number}} [options]
+ */
+function createFakeClock({ start = 1_000_000 } = {}) {
+  let wall = start
+  let mono = start
+  let seq = 0
+  const timers = new Map()
+
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+
+  const clock = {
+    now: () => wall,
+    monoNow: () => mono,
+    setTimeout(fn, ms) {
+      const id = ++seq
+      timers.set(id, { at: wall + ms, fn })
+      return id
+    },
+    clearTimeout(id) {
+      timers.delete(id)
+    },
+    async sleep(ms) {
+      wall += ms
+      mono += ms
+    },
+    async settle(times = 1) {
+      for (let i = 0; i < times; i += 1) {
+        await flush()
+      }
+    },
+    jumpWall(ms) {
+      wall += ms
+    },
+    jumpMono(ms) {
+      mono += ms
+    },
+    /**
+     * target 시각까지 timer를 순서대로 실행한다. 각 timer 뒤 microtask를 비운다.
+     * @param {number} ms
+     */
+    async advance(ms) {
+      const target = wall + ms
+      for (;;) {
+        let nextId = null
+        let nextAt = Infinity
+        for (const [id, timer] of timers) {
+          if (timer.at <= target && timer.at < nextAt) {
+            nextAt = timer.at
+            nextId = id
+          }
+        }
+        if (nextId === null) {
+          break
+        }
+        const timer = timers.get(nextId)
+        timers.delete(nextId)
+        if (timer.at > wall) {
+          const delta = timer.at - wall
+          wall += delta
+          mono += delta
+        }
+        timer.fn()
+        await flush()
+      }
+      if (target > wall) {
+        const delta = target - wall
+        wall += delta
+        mono += delta
+      }
+      await flush()
+    },
+    pendingCount: () => timers.size,
+  }
+  return clock
+}
+
+function createHostCall() {
+  const storage = new Map()
+  const calls = []
+  async function hostCall(method, params = {}) {
+    calls.push({ method, params })
+    if (method === 'storage.get') {
+      return { value: storage.has(params.key) ? structuredClone(storage.get(params.key)) : undefined }
+    }
+    if (method === 'storage.set') {
+      storage.set(params.key, structuredClone(params.value))
+      return { ok: true }
+    }
+    if (method === 'workspace.readContext') {
+      return { terminals: [] }
+    }
+    throw new Error(`unhosted ${method}`)
+  }
+  hostCall.calls = calls
+  hostCall.storage = storage
+  hostCall.count = (method) => calls.filter((call) => call.method === method).length
+  return hostCall
+}
+
+function makeBinding(overrides = {}) {
+  return {
+    userDataPath: '/tmp/orca',
+    userDataKey: 'key-p',
+    runtimeId: 'rt1',
+    pid: 123,
+    startedAt: 1,
+    endpoint: '/tmp/sock',
+    transportKind: 'unix',
+    authToken: 'tok',
+    ...overrides,
+  }
+}
+
+function makeRow(overrides = {}) {
+  return {
+    handle: 'h1',
+    worktreeId: 'w1',
+    tabId: 'tab',
+    leafId: 'leaf',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    title: 'Terminal 1',
+    branch: 'main',
+    connected: true,
+    writable: true,
+    lastOutputAt: 0,
+    agentIdentity: 'claude',
+    executionHostId: 'local',
+    supported: true,
+    unsupportedReason: null,
+    ...overrides,
+  }
+}
+
+function createObserverFake({ rows = [makeRow()] } = {}) {
+  const state = { rows: rows.slice(), complete: true, onList: null, currentWorktree: null }
+  const listCalls = []
+  return {
+    state,
+    listCalls,
+    async list() {
+      listCalls.push({ rows: state.rows.slice() })
+      if (typeof state.onList === 'function') {
+        const result = await state.onList(listCalls.length, state)
+        if (result) {
+          return result
+        }
+      }
+      return { complete: state.complete, fetchedAt: 0, terminals: state.rows.slice() }
+    },
+    resolveEvent(event, catalog) {
+      const payload =
+        event && typeof event === 'object' && event.payload ? event.payload : event
+      if (!payload || typeof payload !== 'object') {
+        return null
+      }
+      const matches = (catalog?.terminals ?? []).filter(
+        (row) => row.worktreeId === payload.worktreeId && row.paneKey === payload.paneKey,
+      )
+      if (matches.length !== 1) {
+        return null
+      }
+      const row = matches[0]
+      return {
+        worktreeId: row.worktreeId,
+        paneKey: row.paneKey,
+        handle: row.handle,
+        ptyId: row.ptyId,
+        incarnationId: row.incarnationId,
+      }
+    },
+    async inspect() {
+      return {
+        stale: false,
+        identity: 'claude',
+        executionHostId: 'local',
+        connected: true,
+        writable: true,
+        agentStatus: 'idle',
+        isRunningAgent: true,
+        agentWait: 'none',
+        screen: 'ok',
+        screenTruncated: false,
+        draft: null,
+        lastOutputAt: 0,
+      }
+    },
+    async currentWorktree() {
+      return state.currentWorktree
+    },
+  }
+}
+
+function createHarness(options = {}) {
+  const clock = options.clock ?? createFakeClock()
+  const hostCall = options.hostCall ?? createHostCall()
+  const bindingBox = { value: options.binding ?? makeBinding() }
+  const bindingErrorBox = { value: options.bindingError ?? null }
+  const settingsBox = {
+    value: options.settings ?? {
+      known: true,
+      profileId: 'p1',
+      enabled: true,
+      ttlMs: TTL_5M,
+      revision: 1,
+      source: 'sqlite',
+      readAt: 0,
+    },
+  }
+
+  let attemptCounter = 0
+  const rawStore = options.store
+    ? options.store
+    : createStateStore({
+        hostCall,
+        now: () => clock.now(),
+        randomId: () => `att-${(attemptCounter += 1)}`,
+      })
+
+  const spy = { resetBudget: [], confirmAttempt: [], markReview: [] }
+  const store = Object.assign({}, rawStore, {
+    resetBudget: async (scope, opts) => {
+      spy.resetBudget.push(scope)
+      return rawStore.resetBudget(scope, opts)
+    },
+    confirmAttempt: async (attemptId, opts) => {
+      spy.confirmAttempt.push(attemptId)
+      return rawStore.confirmAttempt(attemptId, opts)
+    },
+    markReview: async (attemptIdOrScope, reason, opts) => {
+      spy.markReview.push(attemptIdOrScope)
+      return rawStore.markReview(attemptIdOrScope, reason, opts)
+    },
+  })
+
+  const resolveCalls = []
+  async function resolveBinding(override) {
+    resolveCalls.push(override)
+    if (bindingErrorBox.value) {
+      throw bindingErrorBox.value
+    }
+    return bindingBox.value
+  }
+
+  let getBindingRef = null
+  let rpcClosed = false
+  const rpc = {
+    async call() {
+      return { terminals: [], truncated: false }
+    },
+    close() {
+      rpcClosed = true
+    },
+  }
+  function createRpc({ getBinding }) {
+    getBindingRef = getBinding
+    return rpc
+  }
+
+  const observer = options.observer ?? createObserverFake({ rows: options.terminals ?? [makeRow()] })
+
+  const readSettingsCalls = []
+  async function readSettings({ userDataPath }) {
+    readSettingsCalls.push(userDataPath)
+    return settingsBox.value
+  }
+
+  const sendCalls = []
+  let sendBehavior = options.sendBehavior ?? null
+  async function defaultSendBehavior(args) {
+    const gate = await args.assertAllowed()
+    if (!gate || gate.allowed !== true) {
+      return {
+        kind: 'skipped',
+        reason: gate?.reason ?? 'SETTINGS_UNKNOWN',
+        attemptId: null,
+        at: clock.now(),
+        framesSent: 0,
+      }
+    }
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, clock.now())
+    args.onPhase?.('reserved', { attemptId, at: clock.now() })
+    await args.journal.recordAttempt(attemptId, 'pasted')
+    args.onPhase?.('pasted', { attemptId })
+    await args.journal.recordAttempt(attemptId, 'submitted')
+    const at = clock.now()
+    args.onPhase?.('submitted', { attemptId, at })
+    return { kind: 'submitted', reason: null, attemptId, at, framesSent: 2 }
+  }
+  async function sendKeepalive(args) {
+    sendCalls.push(args)
+    if (typeof sendBehavior === 'function') {
+      return sendBehavior(args, sendCalls.length - 1)
+    }
+    return defaultSendBehavior(args)
+  }
+
+  const cwarmCalls = []
+  async function cwarmDisabled() {
+    cwarmCalls.push(true)
+    const value = options.cwarmDisabled
+    return typeof value === 'function' ? value() : value === true
+  }
+
+  const diagEvents = []
+  const diagnostics = {
+    record(entry) {
+      diagEvents.push(entry)
+    },
+    snapshot() {
+      return diagEvents.map((entry) => ({ ...entry }))
+    },
+  }
+
+  const coordinator = createCoordinator({
+    hostCall,
+    store,
+    resolveBinding,
+    createRpc,
+    createObserver: () => observer,
+    readSettings,
+    sendKeepalive,
+    scheduler,
+    diagnostics,
+    cwarmDisabled,
+    clientId: 'cache-keepalive:test',
+    clock,
+    tickMs: options.tickMs ?? 2000,
+    heartbeatMs: options.heartbeatMs ?? 60000,
+  })
+
+  return {
+    clock,
+    tickMs: options.tickMs ?? 2000,
+    hostCall,
+    store,
+    rawStore,
+    spy,
+    observer,
+    sendCalls,
+    diagEvents,
+    resolveCalls,
+    readSettingsCalls,
+    cwarmCalls,
+    rpc,
+    bindingBox,
+    bindingErrorBox,
+    settingsBox,
+    coordinator,
+    get getBinding() {
+      return getBindingRef
+    },
+    get rpcClosed() {
+      return rpcClosed
+    },
+    setSendBehavior(fn) {
+      sendBehavior = fn
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+async function startHarness(h) {
+  h.coordinator.start()
+  await h.clock.settle(2)
+}
+
+function sendEvent(h, event) {
+  h.coordinator.onAgentEvent(event)
+}
+
+function worktreeEvent(h, worktreeId, state, receivedAt, extra = {}) {
+  sendEvent(h, {
+    worktreeId,
+    paneKey: 'tab:leaf',
+    state,
+    receivedAt,
+    ...extra,
+  })
+}
+
+async function arm(h, t0, worktreeId = 'w1') {
+  worktreeEvent(h, worktreeId, 'working', t0)
+  await h.clock.settle()
+  worktreeEvent(h, worktreeId, 'done', t0 + 1000)
+  await h.clock.settle()
+}
+
+function viewTerminal(h, worktreeId = 'w1') {
+  const view = h.coordinator.getRuntimeView()
+  const group = view.worktrees.find((w) => w.worktreeId === worktreeId)
+  return group ? group.terminals[0] : null
+}
+
+async function advanceToDue(h, worktreeId = 'w1') {
+  const term = viewTerminal(h, worktreeId)
+  const delta = term.dueAt - h.clock.now()
+  // due를 지난 첫 tick까지 진행한다(tick 격자에 due가 걸쳐 있을 수 있음).
+  await h.clock.advance(delta + h.tickMs + 100)
+}
+
+const SCOPE = { userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1', paneKey: 'tab:leaf' }
+
+// ---------------------------------------------------------------------------
+// 1. epoch lifecycle
+// ---------------------------------------------------------------------------
+
+test('working→done→due에서 정확히 1회 전송, 자체 turn은 budget 유지, 다음 done은 새 epoch', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  let term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, t0 + 1000 + TTL_5M)
+  assert.equal(term.dueAt, t0 + 1000 + TTL_5M - MARGIN_5M)
+
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+  const call = h.sendCalls[0]
+  assert.equal(call.target.worktreeId, 'w1')
+  assert.equal(call.target.paneKey, 'tab:leaf')
+  assert.equal(call.epochId, 1)
+  assert.equal(call.message, DEFAULT_MESSAGE)
+  assert.equal(call.quietOutputMs, 2500)
+  assert.equal(call.clientId, 'cache-keepalive:test')
+
+  // submitted 뒤 AWAITING_TURN.
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
+  const attemptId = h.store.getBudget(SCOPE).lastAttempt.attemptId
+  assert.equal(typeof attemptId, 'string')
+
+  // 자체 working turn: budget 유지 + confirmAttempt.
+  const turnAt = h.clock.now() + 100
+  worktreeEvent(h, 'w1', 'working', turnAt)
+  await h.clock.settle()
+  assert.deepEqual(h.spy.confirmAttempt, [attemptId])
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+  assert.equal(h.store.getBudget(SCOPE).charged, 1)
+  assert.equal(h.store.getBudget(SCOPE).confirmed, 1)
+
+  // 다음 done → 새 epoch(2).
+  worktreeEvent(h, 'w1', 'done', turnAt + 100)
+  await h.clock.settle()
+  term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, turnAt + 100 + TTL_5M)
+  assert.equal(h.store.getBudget(SCOPE).charged, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 2. 비자체 turn
+// ---------------------------------------------------------------------------
+
+test('비자체 fresh working은 store.resetBudget을 호출한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const before = h.spy.resetBudget.length
+
+  worktreeEvent(h, 'w1', 'working', t0 + 2000)
+  await h.clock.settle()
+  assert.equal(h.spy.resetBudget.length, before + 1)
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+})
+
+// ---------------------------------------------------------------------------
+// 3. 설정 disabled / unknown
+// ---------------------------------------------------------------------------
+
+test('설정 disabled면 전송하지 않는다', async () => {
+  const h = createHarness({
+    settings: { known: true, profileId: 'p1', enabled: false, ttlMs: TTL_5M, readAt: 0 },
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  await h.clock.advance(120000)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+test('설정 unknown이면 전송하지 않는다', async () => {
+  const h = createHarness({ settings: { known: false, reason: 'index_missing', readAt: 0 } })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await h.clock.advance(TTL_5M + 1000)
+  assert.equal(h.sendCalls.length, 0)
+  assert.equal(h.coordinator.getRuntimeView().appTimer.known, false)
+})
+
+// ---------------------------------------------------------------------------
+// 4. 정책 off
+// ---------------------------------------------------------------------------
+
+test('워크트리 정책 off면 전송하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.setWorktree({ userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1' }, false)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 0)
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  assert.equal(viewTerminal(h).reason, 'SCOPE_DISABLED')
+})
+
+// ---------------------------------------------------------------------------
+// 5. assertAllowed 반영
+// ---------------------------------------------------------------------------
+
+async function runGateProbe(makeHarness, prepare) {
+  const h = makeHarness()
+  const gates = []
+  h.setSendBehavior(async (args) => {
+    await prepare(h, args)
+    const gate = await args.assertAllowed()
+    gates.push(gate)
+    return {
+      kind: 'skipped',
+      reason: gate?.reason ?? 'GATE',
+      attemptId: null,
+      at: h.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  return { h, gates }
+}
+
+test('assertAllowed: settings 재읽기 결과를 반영한다', async () => {
+  const { gates } = await runGateProbe(
+    () => createHarness(),
+    (h) => {
+      h.settingsBox.value = {
+        known: true,
+        profileId: 'p1',
+        enabled: false,
+        ttlMs: TTL_5M,
+        readAt: 0,
+      }
+    },
+  )
+  assert.equal(gates.length, 1)
+  assert.deepEqual(gates[0], { allowed: false, reason: 'APP_TIMER_OFF' })
+})
+
+test('assertAllowed: 정책 off를 반영한다', async () => {
+  const { gates } = await runGateProbe(
+    () => createHarness(),
+    (h) => h.store.setWorktree({ userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1' }, false),
+  )
+  assert.equal(gates.length, 1)
+  assert.equal(gates[0].allowed, false)
+  assert.equal(gates[0].reason, 'SCOPE_DISABLED')
+})
+
+test('assertAllowed: cwarm disabled 파일을 반영한다', async () => {
+  const { gates } = await runGateProbe(() => createHarness({ cwarmDisabled: true }), () => {})
+  assert.equal(gates.length, 1)
+  assert.deepEqual(gates[0], { allowed: false, reason: 'CWARM_DISABLED' })
+})
+
+test('assertAllowed: target generation 변경을 반영한다', async () => {
+  const { gates } = await runGateProbe(
+    () => createHarness(),
+    (h) => h.coordinator.onWorktreeRemoved({ worktreeId: 'w1' }),
+  )
+  assert.equal(gates.length, 1)
+  assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
+})
+
+// ---------------------------------------------------------------------------
+// 6. 전송 동시성 1
+// ---------------------------------------------------------------------------
+
+test('due 대상 3개여도 in-flight는 항상 1개이고 순차 실행된다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'w1', ptyId: 'pty1', incarnationId: 'inc1' }),
+    makeRow({ handle: 'h2', worktreeId: 'w2', ptyId: 'pty2', incarnationId: 'inc2' }),
+    makeRow({ handle: 'h3', worktreeId: 'w3', ptyId: 'pty3', incarnationId: 'inc3' }),
+  ]
+  const h = createHarness({ terminals: rows })
+  let active = 0
+  let maxActive = 0
+  h.setSendBehavior(async () => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await new Promise((resolve) => h.clock.setTimeout(resolve, 50))
+    active -= 1
+    return {
+      kind: 'skipped',
+      reason: 'PROBE',
+      attemptId: null,
+      at: h.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0, 'w1')
+  await arm(h, t0, 'w2')
+  await arm(h, t0, 'w3')
+
+  const dueAt = viewTerminal(h, 'w1').dueAt
+  await h.clock.advance(dueAt - h.clock.now() + 3 * 2000 + 500)
+  assert.equal(maxActive, 1)
+  assert.equal(h.sendCalls.length, 3)
+})
+
+// ---------------------------------------------------------------------------
+// 7. tick 중첩 없음
+// ---------------------------------------------------------------------------
+
+test('느린 observer.list 중에도 tick이 겹치지 않는다', async () => {
+  const h = createHarness()
+  let active = 0
+  let maxActive = 0
+  const pending = []
+  h.observer.state.onList = () => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    return new Promise((resolve) => {
+      pending.push(() => {
+        active -= 1
+        resolve({ complete: true, fetchedAt: 0, terminals: h.observer.state.rows.slice() })
+      })
+    })
+  }
+
+  h.coordinator.start()
+  await h.clock.settle(2)
+  assert.equal(maxActive, 1)
+  assert.equal(pending.length, 1)
+
+  pending.shift()()
+  await h.clock.settle(3)
+  assert.equal(maxActive, 1)
+
+  await h.clock.advance(2000)
+  assert.equal(maxActive, 1)
+  assert.equal(pending.length, 1)
+
+  pending.shift()()
+  await h.clock.settle(3)
+  await h.clock.advance(2000)
+  assert.equal(maxActive, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 8. 이벤트 resolve 재조회
+// ---------------------------------------------------------------------------
+
+test('이벤트 target이 catalog에 없으면 list를 1회 재조회한다', async () => {
+  const h = createHarness({ terminals: [] })
+  await startHarness(h)
+  const before = h.observer.listCalls.length
+
+  h.observer.state.rows = [makeRow()]
+  worktreeEvent(h, 'w1', 'working', h.clock.now())
+  await h.clock.settle(3)
+
+  assert.equal(h.observer.listCalls.length, before + 1)
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+})
+
+// ---------------------------------------------------------------------------
+// 9. CLOCK_GAP
+// ---------------------------------------------------------------------------
+
+test('CLOCK_GAP: wall 시계 점프 뒤 epoch를 폐기하고 전송하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+
+  h.clock.jumpWall(20000)
+  await h.clock.advance(2000)
+  assert.equal(viewTerminal(h).phase, 'EXPIRED')
+
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 10. binding 변경
+// ---------------------------------------------------------------------------
+
+test('binding 변경 시 target을 초기화한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.equal(h.coordinator.getRuntimeView().worktrees.length, 1)
+
+  h.bindingBox.value = makeBinding({
+    runtimeId: 'rt2',
+    pid: 999,
+    startedAt: 2,
+    endpoint: '/tmp/sock2',
+  })
+  await assert.rejects(
+    () => h.getBinding(),
+    (error) => error && error.code === 'binding_changed',
+  )
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees.length, 0)
+  assert.equal(view.connection.state, 'connected')
+  assert.equal(view.userDataKey, 'key-p')
+})
+
+// ---------------------------------------------------------------------------
+// 11. refused / uncertain
+// ---------------------------------------------------------------------------
+
+test('uncertain → NEEDS_REVIEW, 확인 해제 후 다음 turn에서 재개', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+
+  h.setSendBehavior(async (args) => {
+    const gate = await args.assertAllowed()
+    if (!gate || gate.allowed !== true) {
+      return { kind: 'skipped', reason: gate?.reason ?? 'X', attemptId: null, at: h.clock.now(), framesSent: 0 }
+    }
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    await args.journal.markReview(attemptId, 'PARTIAL_OR_UNKNOWN_SEND')
+    return {
+      kind: 'uncertain',
+      reason: 'PARTIAL_OR_UNKNOWN_SEND',
+      attemptId,
+      at: h.clock.now(),
+      framesSent: 1,
+    }
+  })
+
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+  assert.equal(viewTerminal(h).phase, 'NEEDS_REVIEW')
+
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 1)
+
+  await h.store.clearReview(SCOPE)
+  h.coordinator.onReviewCleared({ worktreeId: 'w1', paneKey: 'tab:leaf' })
+  await h.clock.settle()
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 2)
+})
+
+test('refused → SUSPENDED, 새 done 전에는 다시 전송하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+
+  h.setSendBehavior(async (args) => {
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    await args.journal.refuseAttempt(attemptId)
+    return { kind: 'refused', reason: 'OUTPUT_ACTIVE', attemptId, at: h.clock.now(), framesSent: 0 }
+  })
+
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 1)
+
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 12. heartbeat
+// ---------------------------------------------------------------------------
+
+test('heartbeat는 5분 전에 storage.get을 호출한다', async () => {
+  const h = createHarness({ heartbeatMs: 60000 })
+  await startHarness(h)
+  const before = h.hostCall.count('storage.get')
+
+  await h.clock.advance(59000)
+  assert.equal(h.hostCall.count('storage.get'), before)
+
+  await h.clock.advance(2000)
+  assert.equal(h.hostCall.count('storage.get'), before + 1)
+})
+
+// ---------------------------------------------------------------------------
+// 13. RuntimeView
+// ---------------------------------------------------------------------------
+
+test('getRuntimeView: 계약 shape과 dueAt/expiresAt', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  let view = h.coordinator.getRuntimeView()
+  assert.equal(view.userDataKey, 'key-p')
+  assert.equal(view.profileId, 'p1')
+  assert.deepEqual(view.connection, { state: 'connected', reason: null })
+  assert.deepEqual(view.appTimer, {
+    known: true,
+    enabled: true,
+    ttlMs: TTL_5M,
+    source: 'sqlite',
+    readAt: 0,
+    reason: null,
+  })
+  assert.equal(view.worktrees.length, 1)
+  let term = view.worktrees[0].terminals[0]
+  assert.equal(term.worktreeId, 'w1')
+  assert.equal(term.paneKey, 'tab:leaf')
+  assert.equal(term.title, 'Terminal 1')
+  assert.equal(term.phase, 'UNKNOWN')
+  assert.equal(term.dueAt, null)
+  assert.equal(term.expiresAt, null)
+  assert.equal(term.supported, true)
+
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.dueAt, t0 + 1000 + TTL_5M - MARGIN_5M)
+  assert.equal(term.expiresAt, t0 + 1000 + TTL_5M)
+})
+
+test('getRuntimeView: 지원되지 않는 행도 이유와 함께 포함한다', async () => {
+  const h = createHarness({
+    terminals: [makeRow({ supported: false, unsupportedReason: 'UNSUPPORTED_AGENT', agentIdentity: null })],
+  })
+  await startHarness(h)
+  const term = viewTerminal(h)
+  assert.equal(term.supported, false)
+  assert.equal(term.unsupportedReason, 'UNSUPPORTED_AGENT')
+
+  await arm(h, h.clock.now())
+  await h.clock.advance(TTL_5M)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 14. stop / bootstrap 실패
+// ---------------------------------------------------------------------------
+
+test('stop: timer를 정리하고 2회 안전하며 이후 send/timer가 없다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  assert.ok(h.clock.pendingCount() > 0)
+
+  await h.coordinator.stop()
+  assert.equal(h.clock.pendingCount(), 0)
+  assert.equal(h.rpcClosed, true)
+
+  await h.coordinator.stop()
+  const sentBefore = h.sendCalls.length
+  await h.clock.advance(TTL_5M + 10000)
+  assert.equal(h.sendCalls.length, sentBefore)
+  assert.equal(h.clock.pendingCount(), 0)
+})
+
+test('bootstrap 실패: start는 throw하지 않고 connection을 unavailable로 표시한다', async () => {
+  const h = createHarness({
+    bindingError: Object.assign(new Error('metadata missing'), { code: 'metadata_missing' }),
+  })
+  assert.doesNotThrow(() => h.coordinator.start())
+  await h.clock.settle(3)
+
+  let view = h.coordinator.getRuntimeView()
+  assert.equal(view.connection.state, 'unavailable')
+  assert.equal(view.connection.reason, 'metadata_missing')
+  assert.equal(view.worktrees.length, 0)
+
+  // 재시도(backoff 1s)에서 성공하면 connected로 전환한다.
+  h.bindingErrorBox.value = null
+  await h.clock.advance(1000)
+  await h.clock.settle(2)
+  view = h.coordinator.getRuntimeView()
+  assert.equal(view.connection.state, 'connected')
+  await h.coordinator.stop()
+})
+
+test('bootstrap 실패: wrong_runtime은 wrong_runtime으로 표시한다', async () => {
+  const h = createHarness({
+    bindingError: Object.assign(new Error('wrong runtime'), { code: 'wrong_runtime' }),
+  })
+  h.coordinator.start()
+  await h.clock.settle(3)
+  assert.equal(h.coordinator.getRuntimeView().connection.state, 'wrong_runtime')
+  await h.coordinator.stop()
+})
