@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cache Keepalive</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">본문으로 건너뛰기</a>
+
+    <p id="token-missing" class="banner banner-error hidden" role="alert">
+      Orca에서 Cache Keepalive: Open Dashboard 명령으로 다시 여세요.
+    </p>
+
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1>Cache Keepalive</h1>
+        <p class="disclaimer">
+          메시지는 사용량을 소비하고 대화 기록에 남습니다. 입력 감지는 제한적입니다.
+        </p>
+      </div>
+
+      <div class="status-grid">
+        <div class="status-item">
+          <span class="status-label">앱 타이머</span>
+          <span id="app-timer" class="status-value">—</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">런타임 연결</span>
+          <span id="connection-state" class="status-value">—</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">플러그인 일시정지</span>
+          <span id="pause-state" class="status-value">—</span>
+        </div>
+      </div>
+
+      <div class="topbar-controls">
+        <button id="pause-toggle" type="button" aria-pressed="false" disabled>
+          일시정지
+        </button>
+      </div>
+    </header>
+
+    <p id="disconnect-banner" class="banner banner-warn hidden" role="alert">
+      연결 끊김 — 서버에 다시 연결하는 중입니다.
+    </p>
+    <p id="notice" class="notice hidden" role="status"></p>
+    <p id="error-live" class="error" role="alert" aria-live="assertive"></p>
+
+    <main id="main">
+      <section aria-labelledby="worktrees-heading">
+        <h2 id="worktrees-heading">워크트리</h2>
+        <div id="worktrees" class="worktrees"></div>
+      </section>
+
+      <section aria-labelledby="config-heading">
+        <h2 id="config-heading">설정</h2>
+        <form id="config-form" class="config-form">
+          <div class="field">
+            <label for="cfg-message">keepalive 메시지</label>
+            <input id="cfg-message" name="message" type="text" autocomplete="off" maxlength="512" />
+          </div>
+
+          <div class="field">
+            <label for="cfg-margin5m">5분 TTL 여유 (초)</label>
+            <input id="cfg-margin5m" name="margin5mMs" type="number" min="0" step="1" inputmode="numeric" />
+          </div>
+
+          <div class="field">
+            <label for="cfg-margin1h">1시간 TTL 여유 (초)</label>
+            <input id="cfg-margin1h" name="margin1hMs" type="number" min="0" step="1" inputmode="numeric" />
+          </div>
+
+          <div class="field">
+            <label for="cfg-quiet-output">출력 조용 기준 (ms)</label>
+            <input id="cfg-quiet-output" name="quietOutputMs" type="number" min="0" step="1" inputmode="numeric" />
+          </div>
+
+          <div class="field">
+            <label for="cfg-max-consecutive">연속 keepalive 상한 (0 = 무제한)</label>
+            <input
+              id="cfg-max-consecutive"
+              name="maxConsecutiveKeepalives"
+              type="number"
+              min="0"
+              step="1"
+              inputmode="numeric"
+            />
+          </div>
+
+          <div class="field field-check">
+            <input id="cfg-default-worktree" name="defaultWorktreeEnabled" type="checkbox" />
+            <label for="cfg-default-worktree">워크트리 기본 활성화</label>
+          </div>
+
+          <div class="field field-check">
+            <input id="cfg-respect-cwarm" name="respectCwarmDisabled" type="checkbox" />
+            <label for="cfg-respect-cwarm">~/.claude/cwarm.disabled 를 따름</label>
+          </div>
+
+          <div class="field">
+            <label for="cfg-runtime-path">runtime userData 경로 (빈칸 = 자동)</label>
+            <input id="cfg-runtime-path" name="runtimeUserDataPath" type="text" autocomplete="off" />
+          </div>
+
+          <div class="form-actions">
+            <button id="config-save" type="submit" disabled>저장</button>
+            <span class="form-hint">저장 버튼을 눌러야 반영됩니다.</span>
+          </div>
+        </form>
+      </section>
+
+      <section aria-labelledby="diagnostics-heading">
+        <h2 id="diagnostics-heading">최근 진단</h2>
+        <ul id="diagnostics" class="diagnostics"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="/app.mjs"></script>
+  </body>
+</html>
