@@ -162,6 +162,7 @@
  * 대시보드 worktree 그룹. §7.4.
  * @typedef {Object} DashboardWorktree
  * @property {string} id opaque worktreeId.
+ * @property {string} worktreeHash 원시 worktreeId의 sha256 앞 16 hex(원시 id 미노출).
  * @property {string} label 표시용 label(branch/title에서 생성).
  * @property {boolean} enabled
  * @property {boolean} effectiveEnabled
@@ -209,6 +210,15 @@
  */
 
 /**
+ * 원시 Orca worktreeId로 직접 설정. §7.4.
+ * @typedef {Object} WorktreeOrcaAction
+ * @property {'worktree-orca'} type
+ * @property {string} worktreeId 원시 Orca worktreeId(opaque targetId가 아님).
+ * @property {boolean|null} enabled true/false=override, null=override 제거(기본값 상속).
+ * @property {number} expectedRevision
+ */
+
+/**
  * terminal scope 토글. §7.4.
  * @typedef {Object} TerminalAction
  * @property {'terminal'} type
@@ -243,7 +253,7 @@
 
 /**
  * 인증된 대시보드 POST /api/action의 허용 union. §7.4.
- * @typedef {PauseAction|WorktreeAction|TerminalAction|ConfigAction|ResetBudgetAction|ClearReviewAction} Action
+ * @typedef {PauseAction|WorktreeAction|WorktreeOrcaAction|TerminalAction|ConfigAction|ResetBudgetAction|ClearReviewAction} Action
  */
 
 /**
@@ -370,6 +380,7 @@ export const HOOK_STATES = deepFreeze(['working', 'blocked', 'waiting', 'done'])
 export const ACTION_TYPES = deepFreeze([
   'pause',
   'worktree',
+  'worktree-orca',
   'terminal',
   'config',
   'reset-budget',

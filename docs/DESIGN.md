@@ -62,7 +62,7 @@ Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 �
 | 2 앱 설정 파일 | 수정하여 확정: 활성 프로필 SQLite 우선, DB 없는 legacy 프로필만 JSON | S17–S21. runtime settings.get으로 대체할 수 없다. fs.watch만으로는 WAL 변화를 놓칠 수 있어 읽기 polling. 읽기 오류·미지원 schema는 disabled/unknown 취급. 앱 설정은 절대 쓰지 않는다. |
 | 3 시각·안전·상한 | 수정: 관측 working→done epoch, 4분/58분 목표, 관측당 최대 1회 | renderer timer 복제는 불가능. mainAgent와 combined 상태를 함께 확인. 자체 attempt로 설명되지 않는 fresh working(=실제 작업 turn)이 관측되면 해당 대상 budget을 자동 reset한다(지휘자 결정, §5.3). 기본 3회, 0=무제한, UI의 “횟수 초기화”로도 reset. |
 | 4 메시지 | 확정 | 기본 `Cache keepalive. Reply only OK; do not use tools or continue previous work.`. 단일 행, UTF-8 1–512 bytes, 제어문자 금지, trim 후 비어있으면 오류. LLM이 문구를 반드시 따를 보장은 없다. |
-| 5 UI | 수정: 대시보드 + 커맨드, panel 제외, “포커스 터미널 토글” 제외 | 패널은 worker 통신 채널이 없다(지휘자 확인 사항). 현재 워크트리는 plugin context terminal handles를 RPC 목록과 join해 고유 ID를 얻는다. 터미널 선택은 대시보드에서 명시적으로 한다. resolveActive로 포커스를 추측하지 않는다(S04,S24). |
+| 5 UI | 수정: 대시보드 + 커맨드, panel 제외, “포커스 터미널 토글” 제외 | 패널은 worker 통신 채널이 없다(지휘자 확인 사항). 현재 워크트리는 plugin context terminal handles를 RPC 목록과 join해 고유 ID를 얻는다. 터미널 선택은 대시보드에서 명시적으로 한다. resolveActive로 포커스를 추측하지 않는다(S04,S24). **추가(OKPN-EB52)**: Orca 1.4.214 패널은 postMessage 브리지로 `workspace.readContext`·`terminal.sendText`·`notifications.show`만 호출할 수 있고 storage·명령 실행·worker 통신·네트워크(connect-src none)·navigation이 막혀 있어, 정적 안내 패널(`panel/index.html`)만 추가했다. 상태 확인·on/off는 팔레트 명령과 터미널 CLI(`bin/keepalive.mjs`, 제어 파일 `~/.orca-cache-keepalive/control.json`)로 제공하며, 이를 위해 대시보드 서버는 activate 시 즉시 시작한다. |
 | 6 JS/테스트 | 확정 | Node built-ins net/http/crypto/fs/sqlite만 사용. node:sqlite feature probe 실패 시 SQLite 프로필에서는 전송 불가. 순수 machine과 부작용 조정기를 분리. |
 
 ### 3.1 전송 대안 비교와 선택

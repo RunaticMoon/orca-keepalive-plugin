@@ -23,7 +23,7 @@ import { StoreError } from './state-store.mjs';
 import { ValidationError } from './config.mjs';
 
 /** 허용 Action type. §7.4. */
-const ACTION_TYPES = new Set(['pause', 'worktree', 'terminal', 'config', 'reset-budget', 'clear-review']);
+const ACTION_TYPES = new Set(['pause', 'worktree', 'terminal', 'config', 'reset-budget', 'clear-review', 'worktree-orca']);
 
 /** 허용 connection.state. */
 const CONNECTION_STATES = new Set(['connected', 'unavailable', 'wrong_runtime', 'starting']);
@@ -114,6 +114,16 @@ function terminalKey(worktreeId, paneKey) {
 }
 
 /**
+ * 원시 worktreeId의 스냅숏 식별용 해시(sha256 앞 16 hex). 터미널 CLI가
+ * `ORCA_WORKTREE_ID`를 같은 방식으로 해시해 "현재 워크트리"를 찾는다.
+ * @param {string} worktreeId
+ * @returns {string}
+ */
+function worktreeHashOf(worktreeId) {
+  return crypto.createHash('sha256').update(worktreeId, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
  * 런타임 뷰 + 저장소 정책을 결합한 대시보드 모델을 만든다.
  *
  * @param {object} options
@@ -128,7 +138,9 @@ function terminalKey(worktreeId, paneKey) {
  *   snapshot: () => object,
  *   dispatch: (action: unknown) => Promise<object>,
  *   toggleWorktreeById: (worktreeId: string) => Promise<{enabled: boolean, label: string|null}>,
+ *   setWorktreeById: (worktreeId: string, enabled: boolean|null, options?: {expectedRevision?: number}) => Promise<{enabled: boolean, override: boolean|null, label: string|null}>,
  *   setPaused: (paused: boolean) => Promise<void>,
+ *   togglePaused: () => Promise<{paused: boolean}>,
  *   statusSummary: () => {text: string},
  * }}
  */
@@ -440,6 +452,7 @@ export function createDashboardModel({
 
         worktrees.push({
           id: wtId,
+          worktreeHash: worktreeHashOf(worktreeId),
           label: nonEmptyStringOrNull(rawWorktree.label) ?? '(이름 없음)',
           enabled,
           effectiveEnabled: gate.effectiveEnabled,
@@ -507,6 +520,17 @@ export function createDashboardModel({
         throw new ActionError(400, 'invalid_action');
       }
       return { type, targetId: action.targetId, enabled, expectedRevision };
+    }
+    if (type === 'worktree-orca') {
+      // worktreeId의 존재 여부/빈 문자열은 resolve 단계에서 404로 처리한다.
+      if (typeof action.worktreeId !== 'string') {
+        throw new ActionError(400, 'invalid_action');
+      }
+      const enabled = action.enabled;
+      if (enabled !== true && enabled !== false && enabled !== null) {
+        throw new ActionError(400, 'invalid_action');
+      }
+      return { type, worktreeId: action.worktreeId, enabled, expectedRevision };
     }
     if (type === 'config') {
       // patch 검증은 store/config가 수행한다.
@@ -594,6 +618,10 @@ export function createDashboardModel({
           await store.setWorktree(entry.scope, /** @type {boolean|null} */ (validated.enabled), { expectedRevision });
           break;
         }
+        case 'worktree-orca': {
+          await applyWorktreeById(validated.worktreeId, validated.enabled, { expectedRevision });
+          break;
+        }
         case 'terminal': {
           const entry = resolveTarget(validated.targetId, 'terminal');
           await store.setTerminal(entry.scope, /** @type {boolean|null} */ (validated.enabled), { expectedRevision });
@@ -623,6 +651,65 @@ export function createDashboardModel({
 
     onPolicyChanged();
     return snapshot();
+  }
+
+  /**
+   * 원시 worktreeId로 worktree override를 적용한다. `onPolicyChanged`는 호출하지
+   * 않는다(호출자가 1회만 부른다).
+   * @param {unknown} worktreeId
+   * @param {unknown} enabled
+   * @param {{expectedRevision?: number}} [options]
+   * @returns {Promise<{enabled: boolean, override: boolean|null, label: string|null}>}
+   */
+  async function applyWorktreeById(worktreeId, enabled, options) {
+    if (enabled !== true && enabled !== false && enabled !== null) {
+      throw new ActionError(400, 'invalid_action');
+    }
+    const view = readRuntimeView();
+    const { userDataKey, profileId } = identityOf(view);
+    if (userDataKey === null || profileId === null) {
+      throw new ActionError(503, 'not_ready');
+    }
+    const id = nonEmptyStringOrNull(worktreeId);
+    if (id === null) {
+      throw new ActionError(404, 'unknown_target');
+    }
+    const rawWorktrees = Array.isArray(view.worktrees) ? view.worktrees : [];
+    const match = rawWorktrees.find((w) => isPlainObject(w) && w.worktreeId === id);
+    if (match === undefined) {
+      throw new ActionError(404, 'unknown_target');
+    }
+    const scope = { userDataKey, profileId, worktreeId: id };
+    await store.setWorktree(scope, /** @type {boolean|null} */ (enabled), options);
+
+    const override = store.getOverrides(scope);
+    const currentOverride =
+      isPlainObject(override) && (override.worktree === true || override.worktree === false) ? override.worktree : null;
+    const stored = store.snapshot();
+    const defaultEnabled =
+      isPlainObject(stored) && isPlainObject(stored.config) ? stored.config.defaultWorktreeEnabled === true : false;
+    const applied = currentOverride === null ? defaultEnabled : currentOverride;
+    const label = isPlainObject(match) ? nonEmptyStringOrNull(match.label) : null;
+    return { enabled: applied, override: enabled ?? null, label };
+  }
+
+  /**
+   * 원시 Orca worktreeId로 워크트리 on/off/기본값을 직접 설정한다. 존재하지 않는
+   * id는 저장하지 않는다(404 unknown_target).
+   * @param {string} worktreeId
+   * @param {boolean|null} enabled true/false=override, null=override 제거(기본값 상속).
+   * @param {{expectedRevision?: number}} [options]
+   * @returns {Promise<{enabled: boolean, override: boolean|null, label: string|null}>}
+   */
+  async function setWorktreeById(worktreeId, enabled, options) {
+    let result;
+    try {
+      result = await applyWorktreeById(worktreeId, enabled, options);
+    } catch (error) {
+      throw mapError(error);
+    }
+    onPolicyChanged();
+    return result;
   }
 
   /**
@@ -672,11 +759,40 @@ export function createDashboardModel({
   }
 
   /**
+   * 전역 일시정지 상태를 최신 revision 기준으로 반전한다. revision_conflict면
+   * 새 snapshot으로 1회만 재시도하고, 두 번째도 충돌이면 409 ActionError로
+   * 매핑해 던진다. 성공 시에만 onPolicyChanged를 1회 호출한다.
+   * @returns {Promise<{paused: boolean}>} 반영된 새 paused 값.
+   */
+  async function togglePaused() {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const stored = store.snapshot();
+      const revision = isPlainObject(stored) && Number.isSafeInteger(stored.revision) ? stored.revision : 0;
+      const paused = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config.paused === true : false;
+      const next = !paused;
+      try {
+        await store.setPaused(next, { expectedRevision: revision });
+      } catch (error) {
+        // 경쟁으로 revision이 바뀌었으면 최신 snapshot으로 한 번만 재시도한다.
+        if (attempt === 0 && error instanceof StoreError && error.code === 'revision_conflict') {
+          continue;
+        }
+        throw mapError(error);
+      }
+      onPolicyChanged();
+      return { paused: next };
+    }
+    // 루프는 항상 위에서 return하거나 throw하므로 도달하지 않는다.
+    throw new ActionError(409, 'revision_conflict');
+  }
+
+  /**
    * 커맨드/알림용 한국어 한 줄 요약(비밀·경로 없음, 200자 이하).
    * @returns {{text: string}}
    */
   function statusSummary() {
     const snap = snapshot();
+    const worktreeCount = snap.worktrees.length;
     const terminals = snap.worktrees.flatMap((worktree) =>
       Array.isArray(worktree.terminals) ? worktree.terminals : [],
     );
@@ -685,10 +801,8 @@ export function createDashboardModel({
     const scheduled = terminals.filter((t) => t.dueAt !== null).length;
     const review = terminals.filter((t) => t.needsReview === true).length;
 
-    const parts = [];
-    if (snap.config.paused) {
-      parts.push('일시정지됨');
-    }
+    // 맨 앞에 전역 상태를 항상 표시한다.
+    const parts = [snap.config.paused ? '꺼짐(일시정지)' : '켜짐'];
     if (!snap.appTimer.known) {
       parts.push('앱 타이머 설정 알 수 없음');
     } else if (snap.appTimer.enabled) {
@@ -697,12 +811,13 @@ export function createDashboardModel({
       parts.push('Orca 프롬프트 캐시 타이머 꺼짐');
     }
     parts.push(CONNECTION_TEXT[snap.connection.state] ?? snap.connection.state);
+    parts.push(`워크트리 ${worktreeCount}개`);
     parts.push(`대상 ${total}개 중 활성 ${active} · 예약 ${scheduled} · 확인 필요 ${review}`);
 
     return { text: parts.join(' · ') };
   }
 
-  return { snapshot, dispatch, toggleWorktreeById, setPaused, statusSummary };
+  return { snapshot, dispatch, toggleWorktreeById, setWorktreeById, setPaused, togglePaused, statusSummary };
 }
 
 /** @typedef {import('./contracts.mjs').DashboardSnapshot} DashboardSnapshot */

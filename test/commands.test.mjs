@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 
 import { COMMAND_IDS, openInOrcaBrowser, registerCommands } from '../src/commands.mjs'
+
+const MANIFEST_URL = new URL('../orca-plugin.json', import.meta.url)
 
 // ---------------------------------------------------------------------------
 // fakes
@@ -27,6 +30,8 @@ function createFakeController(overrides = {}) {
     openDashboard: [],
     currentWorktreeId: [],
     toggleWorktree: [],
+    setWorktree: [],
+    togglePaused: [],
     setPaused: [],
     statusSummary: [],
   }
@@ -46,6 +51,14 @@ function createFakeController(overrides = {}) {
     async toggleWorktree(worktreeId) {
       calls.toggleWorktree.push({ worktreeId })
       return { enabled: true, label: 'main' }
+    },
+    async setWorktree(worktreeId, enabled) {
+      calls.setWorktree.push({ worktreeId, enabled })
+      return { enabled, override: enabled, label: 'main' }
+    },
+    async togglePaused() {
+      calls.togglePaused.push({})
+      return { paused: true }
     },
     async setPaused(paused) {
       calls.setPaused.push({ paused })
@@ -98,16 +111,19 @@ function setup(overrides = {}, registerOptions = {}) {
 // registration
 // ---------------------------------------------------------------------------
 
-test('registers exactly the five command ids once each', () => {
+test('registers exactly the eight command ids once each', () => {
   const { registrations } = setup()
   const ids = registrations.map((registration) => registration.id)
-  assert.equal(ids.length, 5)
-  assert.deepEqual(new Set(ids).size, 5)
+  assert.equal(ids.length, 8)
+  assert.deepEqual(new Set(ids).size, 8)
   assert.deepEqual(ids, [
     COMMAND_IDS.open,
-    COMMAND_IDS.toggleWorktree,
+    COMMAND_IDS.togglePause,
     COMMAND_IDS.pause,
     COMMAND_IDS.resume,
+    COMMAND_IDS.toggleWorktree,
+    COMMAND_IDS.worktreeOn,
+    COMMAND_IDS.worktreeOff,
     COMMAND_IDS.status,
   ])
   for (const registration of registrations) {
@@ -118,12 +134,26 @@ test('registers exactly the five command ids once each', () => {
 test('COMMAND_IDS are the frozen manifest ids', () => {
   assert.deepEqual(COMMAND_IDS, {
     open: 'keepalive-open',
-    toggleWorktree: 'keepalive-toggle-worktree',
+    togglePause: 'keepalive-toggle-pause',
     pause: 'keepalive-pause',
     resume: 'keepalive-resume',
+    toggleWorktree: 'keepalive-toggle-worktree',
+    worktreeOn: 'keepalive-worktree-on',
+    worktreeOff: 'keepalive-worktree-off',
     status: 'keepalive-status',
   })
   assert.ok(Object.isFrozen(COMMAND_IDS))
+})
+
+test('manifest command ids equal COMMAND_IDS exactly, without duplicates', async () => {
+  const manifest = JSON.parse(await readFile(MANIFEST_URL, 'utf8'))
+  const manifestIds = manifest.contributes.commands.map((command) => command.id)
+
+  assert.deepEqual([...manifestIds].sort(), Object.values(COMMAND_IDS).sort())
+  assert.equal(new Set(manifestIds).size, manifestIds.length, '중복 command id가 없다')
+  for (const command of manifest.contributes.commands) {
+    assert.ok(['global', 'worktree'].includes(command.context), `${command.id}는 유효한 context를 가진다`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -266,6 +296,162 @@ test('toggle handler falls back to a generic label and reports off', async () =>
   await handlerFor(COMMAND_IDS.toggleWorktree)()
 
   assert.equal(notifyCalls[0].body, '현재 워크트리: keepalive 꺼짐')
+})
+
+// ---------------------------------------------------------------------------
+// togglePause handler
+// ---------------------------------------------------------------------------
+
+test('togglePause calls controller.togglePaused and notifies when resumed', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async togglePaused() {
+      calls.togglePaused.push({})
+      return { paused: false }
+    },
+  })
+  await handlerFor(COMMAND_IDS.togglePause)()
+
+  assert.equal(calls.togglePaused.length, 1)
+  assert.equal(calls.setPaused.length, 0, 'isPaused/setPaused 대신 togglePaused를 쓴다')
+  assert.equal(notifyCalls.length, 1)
+  assert.equal(notifyCalls[0].title, 'Cache Keepalive')
+  assert.equal(
+    notifyCalls[0].body,
+    '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+  )
+})
+
+test('togglePause notifies paused when the controller returns paused true', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async togglePaused() {
+      calls.togglePaused.push({})
+      return { paused: true }
+    },
+  })
+  await handlerFor(COMMAND_IDS.togglePause)()
+
+  assert.equal(calls.togglePaused.length, 1)
+  assert.equal(calls.setPaused.length, 0)
+  assert.equal(notifyCalls[0].body, '모든 keepalive를 껐습니다(일시정지).')
+})
+
+test('togglePause toggles in both directions on consecutive calls', async () => {
+  let paused = false
+  const { notifyCalls, handlerFor, calls } = setup({
+    async togglePaused() {
+      calls.togglePaused.push({})
+      paused = !paused
+      return { paused }
+    },
+  })
+
+  await handlerFor(COMMAND_IDS.togglePause)()
+  await handlerFor(COMMAND_IDS.togglePause)()
+
+  assert.deepEqual(calls.togglePaused, [{}, {}])
+  assert.deepEqual(
+    notifyCalls.map((call) => call.body),
+    [
+      '모든 keepalive를 껐습니다(일시정지).',
+      '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+    ],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// worktreeOn / worktreeOff handlers
+// ---------------------------------------------------------------------------
+
+test('worktreeOn enables the current worktree and reports the label', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      return 'wt-1'
+    },
+    async setWorktree(worktreeId, enabled) {
+      calls.setWorktree.push({ worktreeId, enabled })
+      return { enabled: true, override: true, label: 'feature/x' }
+    },
+  })
+  await handlerFor(COMMAND_IDS.worktreeOn)()
+
+  assert.deepEqual(calls.setWorktree, [{ worktreeId: 'wt-1', enabled: true }])
+  assert.equal(calls.toggleWorktree.length, 0)
+  assert.equal(notifyCalls[0].body, 'feature/x: keepalive 켜짐')
+})
+
+test('worktreeOff disables the current worktree and falls back to a generic label', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      return 'wt-1'
+    },
+    async setWorktree(worktreeId, enabled) {
+      calls.setWorktree.push({ worktreeId, enabled })
+      return { enabled: false, override: false, label: null }
+    },
+  })
+  await handlerFor(COMMAND_IDS.worktreeOff)()
+
+  assert.deepEqual(calls.setWorktree, [{ worktreeId: 'wt-1', enabled: false }])
+  assert.equal(notifyCalls[0].body, '현재 워크트리: keepalive 꺼짐')
+})
+
+test('worktreeOn reports success state even when the store returns a disabled override', async () => {
+  const { notifyCalls, handlerFor } = setup({
+    async currentWorktreeId() {
+      return 'wt-2'
+    },
+    async setWorktree() {
+      return { enabled: false, override: false, label: 'main' }
+    },
+  })
+  await handlerFor(COMMAND_IDS.worktreeOn)()
+
+  assert.equal(notifyCalls[0].body, 'main: keepalive 꺼짐')
+})
+
+test('worktreeOn with unknown worktree notifies and does not call setWorktree', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      return null
+    },
+  })
+  await handlerFor(COMMAND_IDS.worktreeOn)()
+
+  assert.equal(calls.setWorktree.length, 0)
+  assert.equal(notifyCalls.length, 1)
+  assert.equal(notifyCalls[0].body, '현재 워크트리를 특정할 수 없습니다. 대시보드에서 선택하세요.')
+})
+
+test('worktreeOff with unknown worktree notifies and does not call setWorktree', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async currentWorktreeId() {
+      return undefined
+    },
+  })
+  await handlerFor(COMMAND_IDS.worktreeOff)()
+
+  assert.equal(calls.setWorktree.length, 0)
+  assert.equal(notifyCalls.length, 1)
+  assert.equal(notifyCalls[0].body, '현재 워크트리를 특정할 수 없습니다. 대시보드에서 선택하세요.')
+})
+
+test('worktreeOn/Off controller errors become a safe code notification', async () => {
+  const { notifyCalls, handlerFor } = setup({
+    async currentWorktreeId() {
+      return 'wt-1'
+    },
+    async setWorktree() {
+      const error = new Error('storage exploded')
+      error.code = 'storage_failed'
+      throw error
+    },
+  })
+
+  await assert.doesNotReject(() => handlerFor(COMMAND_IDS.worktreeOn)())
+  assert.equal(notifyCalls[0].body, '명령 실패: storage_failed')
+
+  await assert.doesNotReject(() => handlerFor(COMMAND_IDS.worktreeOff)())
+  assert.equal(notifyCalls[1].body, '명령 실패: storage_failed')
 })
 
 // ---------------------------------------------------------------------------

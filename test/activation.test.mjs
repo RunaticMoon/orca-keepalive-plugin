@@ -9,8 +9,10 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import activateDefault, { createPlugin, deactivate } from '../main.mjs'
 import { LocationError } from '../src/runtime-location.mjs'
@@ -129,17 +131,93 @@ function createFakeCoordinator() {
 }
 
 /**
- * 실제 사용자 경로에 접근하지 않도록 resolveBinding 실패를 주입한 deps.
+ * startDashboard 호출/close 순서를 기록하는 가짜 대시보드.
  *
- * @param {{orchestrator?: object}} [options]
+ * @param {{port?: number, token?: string, order?: string[]}} [options]
  */
-function baseDeps({ orchestrator } = {}) {
+function createFakeDashboard({ port = 50123, token = 'tok-abc', order } = {}) {
+  const calls = { start: 0, close: 0 }
+  const server = {
+    url: `http://127.0.0.1:${port}/#token=${token}`,
+    port,
+    token,
+    async close() {
+      calls.close += 1
+      if (order) order.push('close')
+    },
+  }
+  return {
+    server,
+    calls,
+    startDashboard: () => {
+      calls.start += 1
+      return Promise.resolve(server)
+    },
+  }
+}
+
+/**
+ * 실제 사용자 홈에 쓰지 않도록 제어 파일 함수를 가짜로 만든다.
+ *
+ * @param {{order?: string[], failWrite?: Error}} [options]
+ */
+function createFakeControlFile({ order, failWrite } = {}) {
+  const calls = { write: [], remove: [], install: [] }
+  return {
+    calls,
+    writeControlFile: async (options) => {
+      calls.write.push(options)
+      if (order) order.push('write')
+      if (failWrite) throw failWrite
+      return { dir: '', file: '', cli: '' }
+    },
+    removeControlFile: async (options) => {
+      calls.remove.push(options)
+      if (order) order.push('remove')
+      return true
+    },
+    installCli: async (options) => {
+      calls.install.push(options)
+      if (order) order.push('install')
+      return ''
+    },
+  }
+}
+
+/**
+ * 조건이 참이 될 때까지 실제 시간으로 폴링한다(background activate 작업 대기).
+ *
+ * @param {() => boolean} predicate
+ * @param {{timeoutMs?: number}} [options]
+ */
+async function waitFor(predicate, { timeoutMs = 2000 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error('waitFor timeout')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+}
+
+/**
+ * 실제 사용자 경로에 접근하지 않도록 resolveBinding 실패와 무해한 제어 파일
+ * 함수를 기본 주입한 deps.
+ *
+ * @param {{orchestrator?: object, startDashboard?: () => Promise<object>, control?: object}} [options]
+ */
+function baseDeps({ orchestrator, startDashboard, control } = {}) {
   const { coordinator } = createFakeCoordinator()
+  const controlFile = control ?? createFakeControlFile()
   return {
     resolveBinding: async () => {
       throw new LocationError('metadata_missing', 'test injection')
     },
     createCoordinator: () => orchestrator ?? coordinator,
+    startDashboard,
+    writeControlFile: controlFile.writeControlFile,
+    removeControlFile: controlFile.removeControlFile,
+    installCli: controlFile.installCli,
   }
 }
 
@@ -148,7 +226,7 @@ async function readManifest() {
   return JSON.parse(await readFile(MANIFEST_URL, 'utf8'))
 }
 
-test('activate는 동기 반환하고 manifest의 명령 5개·이벤트 2개를 정확히 등록한다', async () => {
+test('activate는 동기 반환하고 manifest의 명령 8개·이벤트 2개를 정확히 등록한다', async () => {
   const { orca, commands, registeredCommandOrder, eventRegistrations } = createFakeOrca()
   const plugin = createPlugin(orca, baseDeps())
   const startedAt = Date.now()
@@ -163,8 +241,8 @@ test('activate는 동기 반환하고 manifest의 명령 5개·이벤트 2개를
   const registeredIds = [...commands.keys()].sort()
   assert.deepEqual(registeredIds, manifestCommandIds)
   assert.deepEqual(registeredCommandOrder.slice().sort(), manifestCommandIds)
-  assert.equal(registeredCommandOrder.length, 5, '명령은 정확히 5개 등록된다')
-  assert.equal(new Set(registeredCommandOrder).size, 5, '중복 등록이 없다')
+  assert.equal(registeredCommandOrder.length, 8, '명령은 정확히 8개 등록된다')
+  assert.equal(new Set(registeredCommandOrder).size, 8, '중복 등록이 없다')
 
   const manifestEventNames = manifest.contributes.events.map((event) => event.on).sort()
   assert.deepEqual(
@@ -273,37 +351,209 @@ test('deactivate는 두 번 호출해도 안전하다', async () => {
   await plugin.deactivate()
 })
 
+test('activate는 대시보드를 즉시 시작하고 제어 파일·CLI를 설치한다', async () => {
+  const { orca } = createFakeOrca()
+  const dash = createFakeDashboard({ port: 50123, token: 'tok-abc' })
+  const control = createFakeControlFile()
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: dash.startDashboard, control }),
+  )
+  plugin.activate()
+
+  await waitFor(() => control.calls.install.length === 1)
+
+  assert.equal(dash.calls.start, 1, '대시보드는 한 번 시작한다')
+  assert.equal(control.calls.write.length, 1, '제어 파일을 한 번 쓴다')
+  const written = control.calls.write[0]
+  assert.equal(written.pid, process.pid)
+  assert.equal(written.port, 50123)
+  assert.equal(written.token, 'tok-abc')
+
+  assert.equal(control.calls.install.length, 1, 'CLI를 한 번 복사한다')
+  const sourcePath = control.calls.install[0].sourcePath
+  assert.ok(
+    sourcePath.endsWith(join('bin', 'keepalive.mjs')),
+    `installCli sourcePath가 bin/keepalive.mjs여야 한다: ${sourcePath}`,
+  )
+
+  await plugin.deactivate()
+})
+
+test('activate 후 open 명령을 실행해도 대시보드를 다시 시작하지 않는다', async () => {
+  const { orca, commands } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: dash.startDashboard, control }),
+  )
+  plugin.activate()
+
+  await waitFor(() => dash.calls.start === 1)
+  await waitFor(() => control.calls.install.length === 1)
+
+  await commands.get('keepalive-open')()
+
+  assert.equal(dash.calls.start, 1, 'open 명령도 같은 서버를 재사용한다')
+  await plugin.deactivate()
+})
+
+test('제어 파일 기록 실패는 activate/명령을 막지 않고 토큰을 로그에 남기지 않는다', async () => {
+  const token = 'super-secret-token-value'
+  const { orca, commands, logs } = createFakeOrca()
+  const dash = createFakeDashboard({ token })
+  const control = createFakeControlFile({
+    failWrite: Object.assign(new Error('denied'), { code: 'EACCES' }),
+  })
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: dash.startDashboard, control }),
+  )
+  plugin.activate()
+
+  await waitFor(() => logs.some((line) => line.includes('control file unavailable')))
+
+  // 명령은 정상 동작한다.
+  const handler = commands.get('keepalive-status')
+  assert.equal(typeof handler, 'function')
+  await handler()
+
+  assert.ok(
+    logs.some((line) => line.includes('control file unavailable (EACCES)')),
+    `실패 코드를 로그로 남긴다: ${logs.join(' | ')}`,
+  )
+  assert.ok(!logs.some((line) => line.includes(token)), '토큰이 로그에 남으면 안 된다')
+  assert.equal(control.calls.install.length, 0, 'write 실패 뒤 installCli는 호출하지 않는다')
+
+  await plugin.deactivate()
+})
+
+test('deactivate는 서버를 닫기 전에 같은 pid로 제어 파일을 지우고 두 번 호출해도 안전하다', async () => {
+  const order = []
+  const { orca } = createFakeOrca()
+  const dash = createFakeDashboard({ order })
+  const control = createFakeControlFile({ order })
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: dash.startDashboard, control }),
+  )
+  plugin.activate()
+
+  await waitFor(() => control.calls.install.length === 1)
+
+  await plugin.deactivate()
+  await plugin.deactivate()
+
+  assert.equal(control.calls.remove.length, 1, '두 번 호출해도 remove는 한 번')
+  assert.equal(control.calls.remove[0].pid, process.pid)
+  assert.ok(
+    order.includes('remove') &&
+      order.includes('close') &&
+      order.indexOf('remove') < order.indexOf('close'),
+    `remove가 server close보다 먼저여야 한다: ${order.join(',')}`,
+  )
+})
+
+test('activate/deactivate는 같은 instanceId로 제어 파일을 쓰고 지운다', async () => {
+  const { orca } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: dash.startDashboard, control }),
+  )
+  plugin.activate()
+
+  await waitFor(() => control.calls.install.length === 1)
+  await plugin.deactivate()
+
+  assert.equal(control.calls.write.length, 1)
+  assert.equal(control.calls.remove.length, 1)
+  const writeId = control.calls.write[0].instanceId
+  const removeId = control.calls.remove[0].instanceId
+  assert.equal(typeof writeId, 'string', 'instanceId는 문자열이어야 한다')
+  assert.ok(writeId.startsWith('cache-keepalive:'), `instanceId 접두어: ${String(writeId)}`)
+  assert.equal(removeId, writeId, 'write와 remove가 같은 instanceId를 써야 한다')
+})
+
+test('서버가 준비되기 전에 deactivate하면 제어 파일을 쓰지 않는다', async () => {
+  const { orca } = createFakeOrca()
+  const control = createFakeControlFile()
+  let resolveServer
+  const deferred = new Promise((resolve) => {
+    resolveServer = resolve
+  })
+  const server = {
+    url: 'http://127.0.0.1:1/#token=late',
+    port: 1,
+    token: 'late',
+    async close() {},
+  }
+  const plugin = createPlugin(
+    orca,
+    baseDeps({ startDashboard: () => deferred, control }),
+  )
+  plugin.activate()
+
+  const deactivating = plugin.deactivate()
+  resolveServer(server)
+  await deactivating
+
+  assert.equal(control.calls.write.length, 0, 'deactivate 뒤에는 제어 파일을 쓰지 않는다')
+})
+
 test('default activate와 named deactivate는 등록을 마치고 두 번 호출해도 안전하다', async () => {
   // terminal:send를 빼서 coordinator.start(=실제 경로 접근)를 막는다.
   const { orca, commands } = createFakeOrca({
     grantedCapabilities: ALL_CAPABILITIES.filter((kind) => kind !== 'terminal:send'),
   })
-  const startedAt = Date.now()
-  const returned = activateDefault(orca)
-  const elapsed = Date.now() - startedAt
+  // default activate는 deps 주입이 없으므로 HOME을 임시 디렉터리로 돌려
+  // 실제 사용자 홈에 제어 파일/CLI를 쓰지 않게 한다.
+  const home = await mkdtemp(join(tmpdir(), 'okap-act-'))
+  const previousHome = process.env.HOME
+  process.env.HOME = home
+  try {
+    const startedAt = Date.now()
+    const returned = activateDefault(orca)
+    const elapsed = Date.now() - startedAt
 
-  assert.equal(returned, undefined)
-  assert.ok(elapsed < 1000, `activate가 ${elapsed}ms 소요`)
-  assert.equal(commands.size, 5)
+    assert.equal(returned, undefined)
+    assert.ok(elapsed < 1000, `activate가 ${elapsed}ms 소요`)
+    assert.equal(commands.size, 8)
 
-  await deactivate()
-  await deactivate()
+    await deactivate()
+    await deactivate()
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME
+    } else {
+      process.env.HOME = previousHome
+    }
+    await rm(home, { recursive: true, force: true })
+  }
 })
 
 test('실제 coordinator를 써도 activate는 즉시 반환하고 binding 실패를 삼킨다', async () => {
   const { orca, commands } = createFakeOrca()
+  const dash = createFakeDashboard()
+  const control = createFakeControlFile()
   const plugin = createPlugin(orca, {
     resolveBinding: async () => {
       throw new LocationError('metadata_missing', 'test injection')
     },
     createCoordinator: (options) => realCreateCoordinator({ ...options, clock: noopClock }),
+    startDashboard: dash.startDashboard,
+    writeControlFile: control.writeControlFile,
+    removeControlFile: control.removeControlFile,
+    installCli: control.installCli,
   })
   const startedAt = Date.now()
   plugin.activate()
   const elapsed = Date.now() - startedAt
 
   assert.ok(elapsed < 1000, `activate가 ${elapsed}ms 소요`)
-  assert.equal(commands.size, 5)
+  assert.equal(commands.size, 8)
 
   await plugin.deactivate()
   await plugin.deactivate()
@@ -329,18 +579,25 @@ test('orca-plugin.json은 스키마 필수 필드와 참조 일관성을 만족�
   assert.match(manifest.publisher, /^[a-z0-9]+(?:-[a-z0-9]+)*$/)
 
   const commandIds = manifest.contributes.commands.map((command) => command.id)
-  assert.equal(commandIds.length, 5)
+  assert.equal(commandIds.length, 8)
   assert.deepEqual(commandIds, [
     'keepalive-open',
-    'keepalive-toggle-worktree',
+    'keepalive-toggle-pause',
     'keepalive-pause',
     'keepalive-resume',
+    'keepalive-toggle-worktree',
+    'keepalive-worktree-on',
+    'keepalive-worktree-off',
     'keepalive-status',
   ])
   for (const command of manifest.contributes.commands) {
     assert.equal(command.action, undefined, '선언형 action을 쓰지 않는다')
     assert.ok(['global', 'worktree'].includes(command.context))
   }
+
+  assert.deepEqual(manifest.contributes.panels, [
+    { id: 'keepalive-panel', title: 'Cache Keepalive', icon: 'zap', entry: 'panel/index.html' },
+  ])
 
   const eventNames = manifest.contributes.events.map((event) => event.on)
   assert.deepEqual(eventNames, ['agent.status.changed', 'worktree.removed'])

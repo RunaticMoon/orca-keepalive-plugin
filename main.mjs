@@ -5,6 +5,10 @@
  * 단일 플러그인으로 묶는 glue만 담당한다. 정책/상태머신/RPC/HTTP 로직은 `src/*.mjs`
  * 모듈에 있고 여기서는 주입만 한다.
  *
+ * 대시보드는 이제 activate 시 즉시 시작된다(터미널 CLI용). 제어 파일
+ * (`~/.orca-cache-keepalive/control.json`)과 CLI 복사본은 activate의 background
+ * 작업이 만들고 deactivate가 지운다.
+ *
  * Orca host 계약 (`src/main/plugins/plugin-host-runtime.ts`):
  * - default export `activate(orca)`를 host가 `await`한다. 여기서는 등록을 동기적으로
  *   마치고 background bootstrap은 coordinator에 위임하므로 무한 loop await가 없다.
@@ -33,6 +37,11 @@ import { createCoordinator } from './src/coordinator.mjs'
 import { createDashboardModel } from './src/dashboard-model.mjs'
 import { startDashboard } from './src/dashboard-server.mjs'
 import { registerCommands, openInOrcaBrowser } from './src/commands.mjs'
+import {
+  writeControlFile,
+  removeControlFile,
+  installCli,
+} from './src/control-file.mjs'
 
 /** 대시보드 서버가 이 시간 안에 준비되지 않으면 dashboard_unavailable로 실패한다(ms). */
 const DASHBOARD_START_TIMEOUT_MS = 5000
@@ -83,16 +92,23 @@ export function createPlugin(orca, deps = {}) {
     initialTargetState: initialTargetStateImpl = initialTargetState,
     reduceTarget: reduceTargetImpl = reduceTarget,
     decide: decideImpl = decide,
+    writeControlFile: writeControlFileImpl = writeControlFile,
+    removeControlFile: removeControlFileImpl = removeControlFile,
+    installCli: installCliImpl = installCli,
   } = deps
 
   let started = false
   /** @type {Promise<void>|null} */
   let stopPromise = null
+  /** @type {Promise<void>|null} activate가 시작하는 background 제어 파일 작업. */
+  let controlPromise = null
   /** @type {Promise<{url: string, close: () => unknown}>|null} */
   let ensureDashboardPromise = null
   /** @type {{url: string, close: () => unknown}|null} */
   let dashboardServer = null
   let deactivated = false
+  /** @type {string|null} 이 인스턴스 고유 id. 제어 파일 소유권 확인에 쓴다. */
+  let clientId = null
 
   /** @type {ReturnType<typeof createCoordinator>|null} */
   let coordinator = null
@@ -195,6 +211,22 @@ export function createPlugin(orca, deps = {}) {
   }
 
   /**
+   * 제어 파일/CLI 준비 실패를 토큰·경로·URL 없이 안전한 코드만 남긴다.
+   *
+   * @param {unknown} error
+   * @returns {void}
+   */
+  function logControlUnavailable(error) {
+    const raw = error && typeof error.code === 'string' ? error.code : ''
+    const code = /^[A-Za-z_]{1,40}$/.test(raw) ? raw : 'internal'
+    try {
+      orca.log(`cache-keepalive: control file unavailable (${code})`)
+    } catch {
+      // 로그 실패는 무시한다.
+    }
+  }
+
+  /**
    * 등록을 동기적으로 마치고 coordinator bootstrap만 background로 시작한다.
    *
    * @returns {void}
@@ -208,7 +240,7 @@ export function createPlugin(orca, deps = {}) {
     const hostCall = (method, params) => orca.host.call(method, params)
     diagnostics = makeDiagnostics({ log: (message) => orca.log(message) })
     const store = makeStateStore({ hostCall })
-    const clientId = 'cache-keepalive:' + randomUUID()
+    clientId = 'cache-keepalive:' + randomUUID()
 
     coordinator = makeCoordinator({
       hostCall,
@@ -264,7 +296,9 @@ export function createPlugin(orca, deps = {}) {
       },
       currentWorktreeId: () => coordinator.currentWorktreeId(),
       toggleWorktree: (id) => model.toggleWorktreeById(id),
+      setWorktree: (id, enabled) => model.setWorktreeById(id, enabled),
       setPaused: (paused) => model.setPaused(paused),
+      togglePaused: () => model.togglePaused(),
       statusSummary: async () => model.statusSummary(),
     }
 
@@ -288,6 +322,49 @@ export function createPlugin(orca, deps = {}) {
       // 명령·대시보드는 살리되 direct RPC sender는 시작하지 않는다.
       diagnostics.record({ event: 'safety_skipped', code: 'terminal_send_not_granted' })
     }
+
+    // 터미널 CLI가 접속할 수 있게 대시보드를 즉시 시작하고 제어 파일·CLI를 준비한다.
+    // activate는 이 작업을 await하지 않는다. 실패는 삼키고 안전한 코드만 로그한다.
+    controlPromise = (async () => {
+      let server
+      try {
+        server = await ensureDashboard()
+      } catch (error) {
+        logControlUnavailable(error)
+        return
+      }
+      // deactivate가 이미 시작됐으면 늦게 준비된 서버의 제어 파일을 쓰지 않는다.
+      if (deactivated) {
+        return
+      }
+      try {
+        await writeControlFileImpl({
+          fs,
+          home: os.homedir(),
+          pathJoin,
+          pid: proc.pid,
+          port: server.port,
+          token: server.token,
+          instanceId: clientId,
+          platform: proc.platform,
+        })
+      } catch (error) {
+        logControlUnavailable(error)
+        return
+      }
+      // CLI 복사 실패는 제어 파일을 유지한다(플러그인 폴더에서 직접 실행 가능).
+      try {
+        await installCliImpl({
+          fs,
+          home: os.homedir(),
+          pathJoin,
+          sourcePath: fileURLToPath(new URLCtor('./bin/keepalive.mjs', import.meta.url)),
+          platform: proc.platform,
+        })
+      } catch (error) {
+        logControlUnavailable(error)
+      }
+    })()
   }
 
   /**
@@ -307,6 +384,25 @@ export function createPlugin(orca, deps = {}) {
         } catch {
           // ignore
         }
+      }
+      // 서버를 닫기 전에 background 제어 파일 작업을 정리하고 제어 파일을 지운다.
+      if (controlPromise !== null) {
+        try {
+          await controlPromise
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        await removeControlFileImpl({
+          fs,
+          home: os.homedir(),
+          pathJoin,
+          pid: proc.pid,
+          instanceId: clientId,
+        })
+      } catch {
+        // ignore
       }
       if (dashboardServer !== null && typeof dashboardServer.close === 'function') {
         try {

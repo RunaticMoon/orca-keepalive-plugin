@@ -11,7 +11,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createStateStore } from '../src/state-store.mjs';
+import { createStateStore, StoreError } from '../src/state-store.mjs';
 import { createDashboardModel, ActionError } from '../src/dashboard-model.mjs';
 
 /* ------------------------------------------------------------------ */
@@ -486,12 +486,181 @@ test('toggleWorktreeById: runtime 준비 전이면 503 not_ready', async () => {
   await expectActionError(model.toggleWorktreeById(WORKTREE), 503, 'not_ready');
 });
 
+/* ------------------------------------------------------------------ */
+/* setWorktreeById / dispatch worktree-orca / worktreeHash              */
+/* ------------------------------------------------------------------ */
+
+test('snapshot: worktreeHash는 원시 worktreeId의 sha256 앞 16자', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({ worktrees: [wt({ worktreeId: WORKTREE, label: 'main' })] });
+  const { model } = makeModel({ store, runtime });
+
+  const snap = model.snapshot();
+  assert.equal(snap.worktrees[0].worktreeHash, '19e89c042ff154fc');
+  assert.equal(JSON.stringify(snap).includes(WORKTREE), false);
+});
+
+test('setWorktreeById: true/false/null override와 effective 반환', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+
+  const on = await model.setWorktreeById(WORKTREE, false);
+  assert.deepEqual(on, { enabled: false, override: false, label: 'main' });
+  assert.equal(model.snapshot().worktrees[0].enabled, false);
+  assert.equal(calls.policy, 1);
+
+  const off = await model.setWorktreeById(WORKTREE, true);
+  assert.deepEqual(off, { enabled: true, override: true, label: 'main' });
+  assert.equal(model.snapshot().worktrees[0].enabled, true);
+
+  // default를 true로 바꾼 뒤 null(상속)로 제거하면 effective는 default를 따른다.
+  await store.updateConfig({ defaultWorktreeEnabled: true });
+  const inherit = await model.setWorktreeById(WORKTREE, null);
+  assert.deepEqual(inherit, { enabled: true, override: null, label: 'main' });
+  assert.equal(model.snapshot().worktrees[0].enabled, null);
+  assert.equal(model.snapshot().worktrees[0].effectiveEnabled, true);
+
+  await store.updateConfig({ defaultWorktreeEnabled: false });
+  const inheritOff = await model.setWorktreeById(WORKTREE, null);
+  assert.deepEqual(inheritOff, { enabled: false, override: null, label: 'main' });
+});
+
+test('setWorktreeById: 없는 worktreeId는 404 unknown_target', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+  await expectActionError(model.setWorktreeById('does-not-exist', false), 404, 'unknown_target');
+  await expectActionError(model.setWorktreeById('', false), 404, 'unknown_target');
+  assert.equal(calls.policy, 0);
+});
+
+test('setWorktreeById: runtime 준비 전이면 503 not_ready', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView({ userDataKey: null, profileId: null }) });
+  await expectActionError(model.setWorktreeById(WORKTREE, true), 503, 'not_ready');
+});
+
+test('setWorktreeById: enabled가 boolean/null이 아니면 400 invalid_action', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView() });
+  await expectActionError(model.setWorktreeById(WORKTREE, 'yes'), 400, 'invalid_action');
+  await expectActionError(model.setWorktreeById(WORKTREE, 1), 400, 'invalid_action');
+  await expectActionError(model.setWorktreeById(WORKTREE, undefined), 400, 'invalid_action');
+});
+
+test('dispatch: worktree-orca 성공 경로와 onPolicyChanged 1회', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+
+  let snap = model.snapshot();
+  snap = await model.dispatch({ type: 'worktree-orca', worktreeId: WORKTREE, enabled: false, expectedRevision: snap.revision });
+  assert.equal(snap.worktrees[0].enabled, false);
+  assert.equal(calls.policy, 1);
+
+  snap = await model.dispatch({ type: 'worktree-orca', worktreeId: WORKTREE, enabled: null, expectedRevision: snap.revision });
+  assert.equal(snap.worktrees[0].enabled, null);
+  assert.equal(calls.policy, 2);
+});
+
+test('dispatch: worktree-orca revision 불일치는 409', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+  const snap = model.snapshot();
+  await expectActionError(
+    model.dispatch({ type: 'worktree-orca', worktreeId: WORKTREE, enabled: true, expectedRevision: snap.revision + 1 }),
+    409,
+    'revision_conflict',
+  );
+  assert.equal(calls.policy, 0);
+});
+
+test('dispatch: worktree-orca 검증 실패는 400 invalid_action', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView() });
+  const rev = model.snapshot().revision;
+
+  await expectActionError(model.dispatch({ type: 'worktree-orca', enabled: true, expectedRevision: rev }), 400, 'invalid_action');
+  await expectActionError(
+    model.dispatch({ type: 'worktree-orca', worktreeId: 5, enabled: true, expectedRevision: rev }),
+    400,
+    'invalid_action',
+  );
+  await expectActionError(
+    model.dispatch({ type: 'worktree-orca', worktreeId: WORKTREE, enabled: 'yes', expectedRevision: rev }),
+    400,
+    'invalid_action',
+  );
+  await expectActionError(
+    model.dispatch({ type: 'worktree-orca', worktreeId: WORKTREE, enabled: true, expectedRevision: 1.5 }),
+    400,
+    'invalid_action',
+  );
+  // 존재하지 않는 worktreeId는 저장 전에 404로 거부한다.
+  await expectActionError(
+    model.dispatch({ type: 'worktree-orca', worktreeId: 'nope', enabled: true, expectedRevision: rev }),
+    404,
+    'unknown_target',
+  );
+});
+
 test('setPaused: 저장 후 onPolicyChanged 호출', async () => {
   const { store } = await newStore();
   const { model, calls } = makeModel({ store, runtime: runtimeView() });
   await model.setPaused(true);
   assert.equal(model.snapshot().config.paused, true);
   assert.equal(calls.policy, 1);
+});
+
+test('togglePaused: false→true→false 연속 2회 토글하고 매번 onPolicyChanged 1회', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+
+  const first = await model.togglePaused();
+  assert.deepEqual(first, { paused: true });
+  assert.equal(model.snapshot().config.paused, true);
+  assert.equal(calls.policy, 1);
+
+  const second = await model.togglePaused();
+  assert.deepEqual(second, { paused: false });
+  assert.equal(model.snapshot().config.paused, false);
+  assert.equal(calls.policy, 2);
+});
+
+test('togglePaused: revision_conflict 1회 후 새 snapshot으로 재시도해 성공', async () => {
+  const { store } = await newStore();
+  let conflicts = 1;
+  const wrapped = {
+    ...store,
+    setPaused(paused, options) {
+      if (conflicts > 0) {
+        conflicts -= 1;
+        return Promise.reject(new StoreError('revision_conflict', { status: 409 }));
+      }
+      return store.setPaused(paused, options);
+    },
+  };
+  const { model, calls } = makeModel({ store: wrapped, runtime: runtimeView() });
+
+  const result = await model.togglePaused();
+  assert.deepEqual(result, { paused: true });
+  assert.equal(model.snapshot().config.paused, true);
+  assert.equal(calls.policy, 1);
+});
+
+test('togglePaused: 두 번 연속 revision_conflict이면 409 revision_conflict', async () => {
+  const { store } = await newStore();
+  let conflicts = 0;
+  const wrapped = {
+    ...store,
+    setPaused() {
+      conflicts += 1;
+      return Promise.reject(new StoreError('revision_conflict', { status: 409 }));
+    },
+  };
+  const { model, calls } = makeModel({ store: wrapped, runtime: runtimeView() });
+
+  await expectActionError(model.togglePaused(), 409, 'revision_conflict');
+  assert.equal(conflicts, 2, '충돌 시 정확히 한 번만 재시도한다');
+  assert.equal(calls.policy, 0);
 });
 
 test('statusSummary: 문구와 200자 이하 길이', async () => {
@@ -506,12 +675,15 @@ test('statusSummary: 문구와 200자 이하 길이', async () => {
   const { model } = makeModel({ store, runtime });
 
   const enabled = model.statusSummary();
-  assert.equal(enabled.text, '타이머 켜짐(5분) · 연결됨 · 대상 2개 중 활성 2 · 예약 1 · 확인 필요 0');
+  assert.equal(
+    enabled.text,
+    '켜짐 · 타이머 켜짐(5분) · 연결됨 · 워크트리 1개 · 대상 2개 중 활성 2 · 예약 1 · 확인 필요 0',
+  );
   assert.ok(enabled.text.length <= 200);
 
   await model.setPaused(true);
   const paused = model.statusSummary();
-  assert.ok(paused.text.startsWith('일시정지됨 · '));
+  assert.ok(paused.text.startsWith('꺼짐(일시정지) · '));
   assert.ok(paused.text.length <= 200);
 
   const offStore = (await newStore()).store;
@@ -520,7 +692,7 @@ test('statusSummary: 문구와 200자 이하 길이', async () => {
     runtime: runtimeView({ appTimer: { known: true, enabled: false, ttlMs: null, source: 'sqlite', readAt: 1 } }),
   });
   const offText = off.model.statusSummary();
-  assert.ok(offText.text.startsWith('Orca 프롬프트 캐시 타이머 꺼짐 · '));
+  assert.ok(offText.text.startsWith('켜짐 · Orca 프롬프트 캐시 타이머 꺼짐 · '));
   assert.ok(offText.text.length <= 200);
   assert.equal(offText.text.includes(USER), false);
 });

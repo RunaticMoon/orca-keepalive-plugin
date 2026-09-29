@@ -331,6 +331,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
   assert.deepEqual(contracts.ACTION_TYPES, [
     'pause',
     'worktree',
+    'worktree-orca',
     'terminal',
     'config',
     'reset-budget',

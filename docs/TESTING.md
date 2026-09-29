@@ -140,6 +140,24 @@ DESIGN.md §10 기반. 실제 Orca 데스크톱과 disposable Claude 세션에�
 12. macOS/Linux/Windows에서 개발 로드·경로/socket 또는 pipe·브라우저 열기·SQLite
     smoke를 확인한다. 각 OS에서 하지 않은 항목은 미지원 가능성으로 기록한다.
     SSH/VM/native chat은 의도적으로 unsupported 표시가 나와야 한다.
+13. UI 진입점(사이드바 패널·명령 팔레트·터미널 CLI)을 실제 Orca에서 확인한다.
+    - [ ] 오른쪽 사이드바 activity bar의 번개(zap) 아이콘으로 Cache Keepalive 패널이
+      열리고, 현재 워크트리 이름(또는 브랜치)과 터미널 수가 표시된다. 패널은
+      실시간 keepalive 상태나 토글을 표시하지 않는다(Orca 패널 API 제한).
+    - [ ] 패널 **새로고침**이 정상 값을 보여주고, 권한 거부·rate limit·timeout에서
+      각각 다른 안내 문구가 나온다. 복사 버튼은 clipboard를 못 쓰는 환경에서 명령
+      텍스트 선택으로 fallback 하고 그 사실을 안내한다.
+    - [ ] 명령 팔레트(⌘J / Ctrl+Shift+J)에 "Cache Keepalive"를 입력하면 새 명령 3개
+      (Toggle On/Off (All), Turn On for Current Worktree, Turn Off for Current
+      Worktree)가 보인다. worktree 명령은 활성 워크트리가 없으면 비활성이다.
+    - [ ] 플러그인 활성화 직후 `~/.orca-cache-keepalive/`(0700)에 `control.json`
+      (0600)과 `keepalive.mjs`가 생기고, `control.json`에 pid·127.0.0.1 포트·
+      토큰이 들어 있다.
+    - [ ] CLI `status`, `status --json`, `on`, `off`, `here`, `here on|off|default`,
+      `worktree <번호|label> on|off|default`, `url`(토큰 포함 경고 출력)가 동작하고
+      잘못된 사용법은 종료 코드 2를 낸다.
+    - [ ] 플러그인 disable 또는 Orca 종료 뒤 `control.json`이 삭제되고, 그 상태에서
+      CLI가 종료 코드 3과 "실행 중이 아닙니다" 안내를 낸다.
 
 **완료 판정:** 자동 테스트 전부 pass + 독립 검토 blocker 0 + 실제 E2E 중 지원
 플랫폼의 필수 항목 pass. 실제 Orca 없이 완료할 수 있는 범위는 "가짜 RPC 통합

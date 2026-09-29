@@ -1,0 +1,258 @@
+<body>
+  <main class="panel">
+    <header class="intro">
+      <div class="brand-mark" aria-hidden="true">↯</div>
+      <div>
+        <h1>Cache Keepalive</h1>
+        <p>유휴 Claude 터미널에 캐시 만료 직전 짧은 메시지를 보내 프롬프트 캐시를 유지합니다.</p>
+      </div>
+    </header>
+
+    <section class="context-card" aria-labelledby="context-heading">
+      <div class="section-head">
+        <h2 id="context-heading">현재 워크트리</h2>
+        <button id="refresh-context" class="small-button" type="button" aria-label="현재 워크트리 정보 새로고침">새로고침</button>
+      </div>
+      <p id="context-result" class="context-result" role="status" aria-live="polite">워크트리 정보를 불러오려면 새로고침을 누르세요.</p>
+      <p class="helper">이 정보는 적용 대상을 알려줍니다. keepalive 실행 상태는 대시보드나 명령으로 확인하세요.</p>
+    </section>
+
+    <section class="guide" aria-labelledby="palette-heading">
+      <h2 id="palette-heading">상태 확인과 켜기·끄기</h2>
+      <div class="step">
+        <p class="step-title">1. 명령 팔레트 열기</p>
+        <p class="shortcut-line"><kbd id="palette-primary">⌘J</kbd><span class="shortcut-alt">다른 OS: <kbd id="palette-other">Ctrl+Shift+J</kbd></span></p>
+        <p>명령 팔레트에 <strong>Cache Keepalive</strong>를 입력하세요.</p>
+      </div>
+
+      <details class="disclosure" open>
+        <summary>명령 목록 <span class="summary-count">8개</span></summary>
+        <div class="disclosure-content">
+          <dl class="command-list">
+            <div><dt>Cache Keepalive: Open Dashboard</dt><dd>상태와 설정을 볼 수 있는 대시보드를 엽니다. <span class="shortcut-note">단축키 <kbd id="dashboard-primary">⌘⌥⇧J</kbd><span class="shortcut-alt">다른 OS: <kbd id="dashboard-other">Ctrl+Alt+Shift+J</kbd></span></span></dd></div>
+            <div><dt>Cache Keepalive: Toggle On/Off (All)</dt><dd>전체 keepalive를 켜거나 일시정지합니다.</dd></div>
+            <div><dt>Cache Keepalive: Pause All</dt><dd>모든 워크트리의 keepalive를 일시정지합니다.</dd></div>
+            <div><dt>Cache Keepalive: Resume</dt><dd>일시정지를 해제합니다.</dd></div>
+            <div><dt>Cache Keepalive: Toggle Current Worktree</dt><dd>현재 워크트리의 설정을 반대로 바꿉니다.</dd></div>
+            <div><dt>Cache Keepalive: Turn On for Current Worktree</dt><dd>현재 워크트리에서 keepalive를 켭니다.</dd></div>
+            <div><dt>Cache Keepalive: Turn Off for Current Worktree</dt><dd>현재 워크트리에서 keepalive를 끕니다.</dd></div>
+            <div><dt>Cache Keepalive: Show Status</dt><dd>현재 상태를 Orca 알림으로 확인합니다.</dd></div>
+          </dl>
+        </div>
+      </details>
+
+      <details class="disclosure">
+        <summary>Orca 터미널에서 확인·설정</summary>
+        <div class="disclosure-content">
+          <p>플러그인이 실행 중이면 아래 명령 파일이 자동으로 생깁니다. Orca 터미널에 입력하세요.</p>
+          <ul class="terminal-list">
+            <li><span>상태 확인</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs status</code><button type="button" class="copy-button" aria-label="상태 확인 명령 복사">복사</button></div></li>
+            <li><span>전체 켜기</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs on</code><button type="button" class="copy-button" aria-label="전체 켜기 명령 복사">복사</button></div></li>
+            <li><span>전체 끄기</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs off</code><button type="button" class="copy-button" aria-label="전체 끄기 명령 복사">복사</button></div></li>
+            <li><span>현재 워크트리 상태</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs here</code><button type="button" class="copy-button" aria-label="현재 워크트리 상태 명령 복사">복사</button></div></li>
+            <li><span>현재 워크트리 켜기</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs here on</code><button type="button" class="copy-button" aria-label="현재 워크트리 켜기 명령 복사">복사</button></div></li>
+            <li><span>현재 워크트리 끄기</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs here off</code><button type="button" class="copy-button" aria-label="현재 워크트리 끄기 명령 복사">복사</button></div></li>
+            <li><span>현재 워크트리 기본값 사용</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs here default</code><button type="button" class="copy-button" aria-label="현재 워크트리 기본값 명령 복사">복사</button></div></li>
+            <li><span>대시보드 주소</span><div class="code-row"><code tabindex="-1">node ~/.orca-cache-keepalive/keepalive.mjs url</code><button type="button" class="copy-button" aria-label="대시보드 주소 명령 복사">복사</button></div></li>
+          </ul>
+          <p class="platform-label">Windows 상태 확인</p>
+          <div class="code-row"><code tabindex="-1">node %USERPROFILE%\.orca-cache-keepalive\keepalive.mjs status</code><button type="button" class="copy-button" aria-label="Windows 상태 확인 명령 복사">복사</button></div>
+          <p id="copy-feedback" class="copy-feedback" role="status" aria-live="polite"></p>
+        </div>
+      </details>
+    </section>
+
+    <section class="plugin-off" aria-labelledby="off-heading">
+      <h2 id="off-heading">플러그인 전체 끄기</h2>
+      <p><strong>Settings &gt; Plugins &gt; Cache Keepalive</strong>에서 스위치를 끄세요.</p>
+    </section>
+
+    <footer class="footnote">
+      <p>Orca 패널 API 제한으로 이 패널에는 실시간 상태와 토글을 표시할 수 없습니다. 대시보드·명령·터미널 명령을 사용하세요.</p>
+      <p>Keepalive 메시지는 사용량을 소비하고 대화 기록에 남습니다.</p>
+    </footer>
+  </main>
+
+  <style>
+    :root { color-scheme: light dark; }
+    html.light { color-scheme: light; }
+    html.dark { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 0; background: var(--background, Canvas); color: var(--foreground, CanvasText); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; overflow-wrap: anywhere; }
+    .panel { width: 100%; max-width: 420px; margin-inline: auto; padding: 20px 16px 28px; }
+    h1, h2, p, dl, dd, ul { margin: 0; }
+    h1 { font-size: 19px; line-height: 1.25; letter-spacing: -.02em; }
+    h2 { font-size: 15px; line-height: 1.35; }
+    p + p { margin-top: 8px; }
+    .intro { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; align-items: start; padding-bottom: 18px; border-bottom: 1px solid var(--border, ButtonBorder); }
+    .intro p { margin-top: 7px; color: var(--muted-foreground, GrayText); }
+    .brand-mark { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid var(--primary, Highlight); border-radius: 8px; color: var(--primary, Highlight); font-size: 21px; line-height: 1; }
+    .context-card { margin-top: 18px; padding: 14px; background: var(--card, Canvas); color: var(--card-foreground, CanvasText); border: 1px solid var(--border, ButtonBorder); border-radius: var(--radius, 10px); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .context-result { margin-top: 12px; min-height: 22px; font-weight: 600; }
+    .context-result .subline { display: block; margin-top: 2px; font-weight: 400; color: var(--muted-foreground, GrayText); }
+    .helper { margin-top: 8px; color: var(--muted-foreground, GrayText); font-size: 12px; line-height: 1.45; }
+    button { min-height: 44px; padding: 6px 11px; border: 1px solid var(--border, ButtonBorder); border-radius: 7px; color: var(--foreground, ButtonText); background: var(--secondary, ButtonFace); font: inherit; font-weight: 600; cursor: pointer; }
+    button:hover:not(:disabled) { border-color: var(--primary, Highlight); }
+    button:disabled { opacity: .6; cursor: wait; }
+    :focus-visible { outline: 2px solid var(--ring, Highlight); outline-offset: 3px; }
+    .guide { margin-top: 24px; }
+    .guide > h2 { margin-bottom: 12px; }
+    .step { border-left: 3px solid var(--primary, Highlight); padding: 1px 0 3px 12px; }
+    .step-title { font-weight: 700; }
+    .shortcut-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px 12px; margin: 9px 0 7px; }
+    kbd { display: inline-block; padding: 2px 6px; border: 1px solid var(--border, ButtonBorder); border-bottom-width: 2px; border-radius: 5px; background: var(--card, Canvas); color: var(--card-foreground, CanvasText); font: 600 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; white-space: nowrap; }
+    .shortcut-line > kbd { font-size: 16px; padding: 5px 8px; border-color: var(--primary, Highlight); }
+    .shortcut-alt { color: var(--muted-foreground, GrayText); font-size: 12px; }
+    .shortcut-alt kbd { font-size: 11px; }
+    .disclosure { margin-top: 14px; border: 1px solid var(--border, ButtonBorder); border-radius: var(--radius, 10px); background: var(--card, Canvas); }
+    .disclosure summary { min-height: 44px; padding: 11px 13px; cursor: pointer; font-weight: 700; }
+    .disclosure summary::marker { color: var(--primary, Highlight); }
+    .summary-count { font-size: 12px; color: var(--muted-foreground, GrayText); font-weight: 400; }
+    .disclosure-content { padding: 0 13px 14px; }
+    .disclosure-content > p { color: var(--muted-foreground, GrayText); }
+    .command-list > div { border-top: 1px solid var(--border, ButtonBorder); padding: 10px 0; }
+    .command-list > div:last-child { padding-bottom: 0; }
+    dt { font-weight: 650; font-size: 12px; line-height: 1.4; }
+    dd { margin-top: 3px; color: var(--muted-foreground, GrayText); font-size: 12px; }
+    .shortcut-note { display: block; margin-top: 5px; }
+    .shortcut-note .shortcut-alt { display: block; margin-top: 3px; }
+    .terminal-list { list-style: none; padding: 0; margin: 12px 0 0; }
+    .terminal-list li { margin-top: 11px; }
+    .terminal-list li > span, .platform-label { display: block; margin-bottom: 4px; font-size: 12px; font-weight: 650; }
+    .code-row { display: flex; min-width: 0; align-items: stretch; gap: 6px; }
+    .code-row code { display: block; min-width: 0; flex: 1; padding: 8px; overflow-x: auto; white-space: nowrap; border: 1px solid var(--border, ButtonBorder); border-radius: 6px; background: var(--muted, Canvas); color: var(--foreground, CanvasText); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; user-select: text; }
+    .code-row button { min-width: 44px; padding-inline: 7px; font-size: 12px; }
+    .platform-label { margin-top: 15px !important; color: var(--foreground, CanvasText) !important; }
+    .copy-feedback { min-height: 1.5em; margin-top: 8px; font-size: 12px; }
+    .plugin-off { margin-top: 22px; padding-top: 17px; border-top: 1px solid var(--border, ButtonBorder); }
+    .plugin-off p { margin-top: 6px; }
+    .footnote { margin-top: 22px; padding: 12px; border-left: 3px solid var(--border, ButtonBorder); color: var(--muted-foreground, GrayText); font-size: 12px; }
+    @media (max-width: 300px) { .panel { padding-inline: 12px; } .section-head { flex-wrap: wrap; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }
+  </style>
+
+  <script>
+    (() => {
+      const refreshButton = document.getElementById('refresh-context');
+      const contextResult = document.getElementById('context-result');
+      const copyFeedback = document.getElementById('copy-feedback');
+      let requestCounter = 0;
+      let waiting = false;
+
+      const platform = navigator.userAgentData?.platform || navigator.platform || '';
+      if (!/Mac/i.test(platform)) {
+        document.getElementById('palette-primary').textContent = 'Ctrl+Shift+J';
+        document.getElementById('palette-other').textContent = '⌘J';
+        document.getElementById('dashboard-primary').textContent = 'Ctrl+Alt+Shift+J';
+        document.getElementById('dashboard-other').textContent = '⌘⌥⇧J';
+      }
+
+      function setContext(message, detail) {
+        contextResult.replaceChildren(document.createTextNode(message));
+        if (detail) {
+          const subline = document.createElement('span');
+          subline.className = 'subline';
+          subline.textContent = detail;
+          contextResult.appendChild(subline);
+        }
+      }
+
+      function showContext(value) {
+        if (value === null) {
+          setContext('열린 워크트리가 없습니다.');
+          return;
+        }
+        if (!value || typeof value !== 'object') {
+          setContext('워크트리 정보를 읽을 수 없습니다.', '새로고침을 눌러 다시 확인하세요.');
+          return;
+        }
+        const displayName = typeof value.displayName === 'string' ? value.displayName.trim() : '';
+        const branch = typeof value.branch === 'string' ? value.branch.trim() : '';
+        const name = displayName || branch || '이름 없는 워크트리';
+        const terminals = Array.isArray(value.terminals) ? value.terminals.length : 0;
+        const branchLabel = branch && branch !== name ? branch + ' · ' : '';
+        setContext(name, branchLabel + '터미널 ' + terminals + '개');
+      }
+
+      function showContextError(code) {
+        if (code === 'consent_required' || code === 'capability_denied') {
+          setContext('워크트리 정보를 볼 권한이 없습니다.', 'Settings > Plugins에서 Cache Keepalive 권한을 승인하세요.');
+        } else if (code === 'rate_limited') {
+          setContext('요청이 잠시 제한되었습니다.', '잠시 뒤 새로고침을 눌러 주세요.');
+        } else if (code === 'timeout') {
+          setContext('워크트리 정보 요청 시간이 초과되었습니다.', '새로고침을 눌러 다시 확인하세요.');
+        } else {
+          setContext('워크트리 정보를 읽을 수 없습니다.', 'Orca에서 플러그인 권한을 확인한 뒤 다시 시도하세요.');
+        }
+      }
+
+      function readContext() {
+        if (waiting) return;
+        waiting = true;
+        refreshButton.disabled = true;
+        refreshButton.setAttribute('aria-busy', 'true');
+        setContext('워크트리 정보를 확인하는 중…');
+        const requestId = 'keepalive-context-' + Date.now() + '-' + (++requestCounter) + '-' + Math.random().toString(36).slice(2);
+        let settled = false;
+        let timer;
+
+        function finish(data) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          window.removeEventListener('message', onMessage);
+          waiting = false;
+          refreshButton.disabled = false;
+          refreshButton.removeAttribute('aria-busy');
+          if (data.ok) showContext(data.value);
+          else showContextError(data.errorCode);
+        }
+
+        function onMessage(event) {
+          const data = event.data;
+          if (event.source !== window.parent || !data || data.type !== 'orca-panel-action-result' || data.requestId !== requestId) return;
+          finish(data);
+        }
+
+        window.addEventListener('message', onMessage);
+        timer = setTimeout(() => finish({ ok: false, errorCode: 'timeout' }), 5000);
+        try {
+          window.parent.postMessage({ type: 'orca-panel-action', requestId, action: 'workspace.readContext' }, '*');
+        } catch {
+          finish({ ok: false, errorCode: 'unavailable' });
+        }
+      }
+
+      refreshButton.addEventListener('click', readContext);
+      readContext();
+
+      function selectCode(code) {
+        code.focus();
+        const selection = window.getSelection();
+        if (!selection) return false;
+        const range = document.createRange();
+        range.selectNodeContents(code);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+      }
+
+      document.querySelectorAll('.copy-button').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const code = button.previousElementSibling;
+          if (!code) return;
+          try {
+            if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+            await navigator.clipboard.writeText(code.textContent || '');
+            copyFeedback.textContent = '명령을 복사했습니다.';
+          } catch {
+            copyFeedback.textContent = selectCode(code)
+              ? '복사할 명령을 선택했습니다. Ctrl+C 또는 ⌘C를 누르세요.'
+              : '복사할 수 없습니다. 명령을 직접 선택해 복사하세요.';
+          }
+        });
+      });
+    })();
+  </script>
+</body>

@@ -1,5 +1,5 @@
 /**
- * Orca 커맨드 5개를 controller 동작에 연결하는 얇은 어댑터와, 내장 브라우저에
+ * Orca 커맨드 8개를 controller 동작에 연결하는 얇은 어댑터와, 내장 브라우저에
  * 대시보드를 여는 헬퍼. DESIGN.md §7.1, §7.2, §4.3의 M 작업을 구현한다.
  *
  * 이 모듈은 정책/상태머신/RPC transport를 구현하지 않는다. controller(호출자가
@@ -12,13 +12,16 @@
 
 /**
  * Orca manifest `contributes.commands`의 id. §7.2.
- * @type {Readonly<{open:string, toggleWorktree:string, pause:string, resume:string, status:string}>}
+ * @type {Readonly<{open:string, togglePause:string, pause:string, resume:string, toggleWorktree:string, worktreeOn:string, worktreeOff:string, status:string}>}
  */
 export const COMMAND_IDS = Object.freeze({
   open: 'keepalive-open',
-  toggleWorktree: 'keepalive-toggle-worktree',
+  togglePause: 'keepalive-toggle-pause',
   pause: 'keepalive-pause',
   resume: 'keepalive-resume',
+  toggleWorktree: 'keepalive-toggle-worktree',
+  worktreeOn: 'keepalive-worktree-on',
+  worktreeOff: 'keepalive-worktree-off',
   status: 'keepalive-status',
 })
 
@@ -147,6 +150,28 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
     }
   }
 
+  /**
+   * 현재 워크트리 override를 on/off로 설정하고 결과를 알린다. worktreeId를 특정할 수
+   * 없으면 변경하지 않고 안내만 한다.
+   * @param {boolean} enabled
+   * @returns {Promise<void>}
+   */
+  async function setWorktreeEnabled(enabled) {
+    const worktreeId = await controller.currentWorktreeId()
+    if (worktreeId === null || worktreeId === undefined) {
+      await notifySafe(
+        NOTIFICATION_TITLE,
+        '현재 워크트리를 특정할 수 없습니다. 대시보드에서 선택하세요.',
+      )
+      return
+    }
+    const result = await controller.setWorktree(worktreeId, enabled)
+    await notifySafe(
+      NOTIFICATION_TITLE,
+      `${result.label ?? '현재 워크트리'}: keepalive ${result.enabled ? '켜짐' : '꺼짐'}`,
+    )
+  }
+
   return {
     /** 대시보드 열기. 성공하면 조용히 종료하고, 실패하면 이때만 URL을 알린다. */
     [COMMAND_IDS.open]: () =>
@@ -159,6 +184,18 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
         await notifySafe(
           NOTIFICATION_TITLE,
           '대시보드를 Orca 브라우저에서 열지 못했습니다. 브라우저에서 다음 주소를 여세요: ' + url,
+        )
+      }),
+
+    /** 전역 pause on/off 토글. 모델이 최신 revision으로 원자적으로 반전한다. */
+    [COMMAND_IDS.togglePause]: () =>
+      withGuard(async () => {
+        const { paused } = await controller.togglePaused()
+        await notifySafe(
+          NOTIFICATION_TITLE,
+          paused
+            ? '모든 keepalive를 껐습니다(일시정지).'
+            : '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
         )
       }),
 
@@ -179,6 +216,12 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
           `${result.label ?? '현재 워크트리'}: keepalive ${result.enabled ? '켜짐' : '꺼짐'}`,
         )
       }),
+
+    /** 현재 워크트리 keepalive 명시적 켜기. */
+    [COMMAND_IDS.worktreeOn]: () => withGuard(async () => setWorktreeEnabled(true)),
+
+    /** 현재 워크트리 keepalive 명시적 끄기. */
+    [COMMAND_IDS.worktreeOff]: () => withGuard(async () => setWorktreeEnabled(false)),
 
     /** 전역 일시정지(멱등). */
     [COMMAND_IDS.pause]: () =>
@@ -207,7 +250,7 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
 }
 
 /**
- * Orca 커맨드 5개를 정확히 1회 등록한다. 등록 시점에는 어떤 I/O도 하지 않는다.
+ * Orca 커맨드 8개를 정확히 1회 등록한다. 등록 시점에는 어떤 I/O도 하지 않는다.
  *
  * notify는 실패를 삼킨다: 알림 오류가 handler를 실패로 만들지 않는다.
  *
