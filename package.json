@@ -1,0 +1,13 @@
+{
+  "name": "orca-cache-keepalive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Orca community plugin that schedules small keepalive messages for idle Claude terminals.",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "manifestVersion": 1,
+  "id": "cache-keepalive",
+  "publisher": "community-keepalive",
+  "name": "Cache Keepalive",
+  "version": "0.1.0",
+  "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",
+  "engines": { "orca": ">=1.4.214" },
+  "pluginApi": 1,
+  "main": "main.mjs",
+  "contributes": {
+    "commands": [
+      { "id": "keepalive-open", "title": "Cache Keepalive: Open Dashboard", "context": "global" },
+      { "id": "keepalive-toggle-worktree", "title": "Cache Keepalive: Toggle Current Worktree", "context": "worktree" },
+      { "id": "keepalive-pause", "title": "Cache Keepalive: Pause All", "context": "global" },
+      { "id": "keepalive-resume", "title": "Cache Keepalive: Resume", "context": "global" },
+      { "id": "keepalive-status", "title": "Cache Keepalive: Show Status", "context": "global" }
+    ],
+    "events": [
+      { "on": "agent.status.changed" },
+      { "on": "worktree.removed" }
+    ],
+    "keybindings": [
+      { "command": "keepalive-open", "key": "Mod+Alt+Shift+J", "when": "global" }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "terminal:send" },
+    { "kind": "notifications:show" },
+    { "kind": "storage" },
+    { "kind": "events:subscribe" }
+  ]
+}
