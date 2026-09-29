@@ -679,6 +679,8 @@ node scripts/demo.mjs
 
 개발 단계에는 build/install 명령이 필요 없다. 저장소 루트의 `orca-plugin.json`, main.mjs, src, ui가 그대로 배포물이다. `package.json` dependencies/devDependencies를 비워두고 `npm test`만 제공한다. main.mjs 변경 시 기존 worker가 유지될 수 있으므로 manifest version bump 또는 plugin disable/enable로 새 worker 사용을 확인한다. 앱에 수정 사항을 반영했는지 process start/diagnostic version으로 확인한다.
 
+> 결정(2026-09): 마켓플레이스 등록은 하지 않는다. 커뮤니티 플러그인으로 공개 Git 저장소에서 Orca "Install plugin" > "Git URL"(`<URL>#<tag>`)로 직접 설치한다. 아래 marketplace 계획은 참고용 기록으로만 남긴다. 현행 절차는 docs/PUBLISHING.md를 따른다.
+
 커뮤니티 marketplace는 별도 Git 저장소의 루트 `orca-marketplace.json`로 제공 가능하다. 실제 게시자/remote가 확정되면 다음 placeholder를 치환한다.
 
 ```json

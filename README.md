@@ -8,7 +8,7 @@ and per-terminal toggles, a global pause, and a small authenticated dashboard.
 This is a **community, experimental** plugin. It is not an official Stably plugin.
 
 - Plugin id: `cache-keepalive`
-- Publisher slug: `runaticmoon` (marketplace id `runaticmoon.cache-keepalive`)
+- Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
 - License: MIT (see [LICENSE](LICENSE))
 - Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
 - Version: `0.1.0`
@@ -92,10 +92,30 @@ the file is only read, never written.
 
 ---
 
-## Installation (development path)
+## Installation
 
 There is no build or install command. The repository root *is* the plugin
-(`orca-plugin.json`, `main.mjs`, `src/`, `ui/`).
+(`orca-plugin.json`, `main.mjs`, `src/`, `ui/`). This community plugin is not listed
+in any marketplace; install it directly from Git or from a local folder.
+
+### From the Git URL
+
+1. In Orca open **Settings > Plugins** and click **Install plugin**.
+2. Choose the **Git URL** tab and enter the repository URL with a release tag:
+
+   ```text
+   https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0
+   ```
+
+   The `#ref` (tag or commit) is required. Orca copies the plugin and shows the
+   requested permissions for review.
+3. Approve the permissions, then run **Cache Keepalive: Open Dashboard** from the
+   command palette.
+
+To update, install again with the newer tag. You can also use the **Local folder**
+tab with a local clone.
+
+### Development path
 
 1. In Orca open **Settings > Plugins** and expand the **Development** section.
 2. In **Development plugin folder path**, enter the absolute path to this repository
@@ -257,7 +277,7 @@ test/                node:test unit + integration (fake Orca runtime)
 scripts/demo.mjs     runnable local demo
 docs/DESIGN.md       full design
 docs/TESTING.md      how to test
-docs/PUBLISHING.md   how to release / register in a marketplace
+docs/PUBLISHING.md   how to release and install from Git
 ```
 
 No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22.5).
@@ -275,8 +295,11 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   `완료+TTL-120초`. 캐시 epoch당 최대 1회만 보내고, 마감이 지나면 따라잡지 않습니다.
 - **상한:** 연속 keepalive 기본 3회(0=무제한). 자체 전송이 아닌 새 working 턴이
   관측되면 카운터가 자동 초기화됩니다. `~/.claude/cwarm.disabled`를 존중합니다.
-- **설치:** Orca 설정 > Plugins > Development에서 이 폴더 절대 경로를 넣고
-  "Add path". Dev 플러그인도 권한 검토가 필요합니다. 빌드/설치는 없습니다.
+- **설치:** 마켓플레이스에는 등록하지 않는 커뮤니티 플러그인입니다. Orca 설정 >
+  Plugins > "Install plugin" > "Git URL" 탭에
+  `https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0`을 넣어 설치합니다
+  (`#태그`는 필수). 개발 중에는 Plugins > Development에서 폴더 절대 경로를 넣고
+  "Add path". 어느 방식이든 권한 검토가 필요하며 빌드/설치 명령은 없습니다.
 - **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
   events:subscribe.
 - **명령 5개 + 단축키:** keepalive-open(Mod+Alt+Shift+J), keepalive-toggle-worktree,

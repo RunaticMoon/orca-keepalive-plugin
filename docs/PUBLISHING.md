@@ -1,25 +1,27 @@
 # Publishing Cache Keepalive
 
-This document covers the pre-release inputs, a marketplace entry example, and the
-release checklist. **Some release inputs are still undecided** — they are marked
-below and must be resolved by the repository owner before a public release.
+This document covers the release inputs, how users install the plugin, and the
+release checklist.
 
-The distribution model is a **Git-backed Orca plugin**: the repository root is the
-plugin, and there is no build step or `npm install` at install time. A release is a
-git tag whose commit contains `orca-plugin.json`, `main.mjs`, `src/`, `ui/`.
+Cache Keepalive is a **community plugin distributed directly from its public Git
+repository**. It is **not registered in any Orca marketplace index**, and no
+marketplace registration is planned.
+
+The repository root is the plugin. There is no build step and no `npm install` at
+install time. A release is a git tag whose commit contains `orca-plugin.json`,
+`main.mjs`, `src/`, `ui/`.
 
 ---
 
-## 1. Required inputs before release
+## 1. Release inputs
 
-| Input | Current state | Action |
+| Input | State | Notes |
 |---|---|---|
-| Publisher slug | **Decided**: `runaticmoon` (the repository owner's GitHub account, lowercased to satisfy the kebab-case slug rule). | Keep it identical in the manifest and the marketplace entry. |
-| Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Keep or rename before first publish; changing identity after install creates a different plugin. |
+| Publisher slug | **Decided**: `runaticmoon` (the repository owner's GitHub account, lowercased to satisfy the kebab-case slug rule). | Keep it stable; the plugin identity is `<publisher>.<id>`. |
+| Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Changing identity after install creates a different plugin. |
 | License | **Decided**: MIT (`LICENSE`, `package.json` `license`). | This repository implements its own code and does not copy `claude-cache-keepalive` code. |
-| Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin`. | The repository must be **public** before a marketplace entry can resolve it. This is `<REMOTE_URL>` below. |
-| Version tag | Manifest `version` is `0.1.0`; suggested tag `v0.1.0`. | Confirm the tag matches the manifest version and the resolved commit. |
-| Marketplace categories | **확인 필요** — see §2. | Pick categories that actually exist in the marketplace index. |
+| Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin` (public). | Users install from this URL. |
+| Version tag | Manifest `version` is `0.1.0`; release tag `v0.1.0`. | The tag must match the manifest version. |
 
 The manifest currently declares:
 
@@ -35,72 +37,31 @@ The manifest currently declares:
 ```
 
 Note: `stablyai` as publisher and the `orca-` id prefix are reserved for official
-plugins. This community plugin must not claim either.
+plugins. This community plugin must not claim either, and must not be described as
+official or Stably-published.
 
 ---
 
-## 2. Marketplace entry
+## 2. How users install it
 
-The community/Orca marketplace index is a Git repository whose root file is
-`orca-marketplace.json`. A plugin entry has the shape:
+Orca's **Settings > Plugins > "Install plugin"** dialog offers two tabs that do not
+go through a marketplace:
 
-```json
-{
-  "id": "<publisher-slug>.<plugin-id>",
-  "source": { "kind": "git", "url": "<REMOTE_URL>", "ref": "<tag>" },
-  "description": "<short description>",
-  "categories": ["<category>", "..."]
-}
-```
+- **Git URL** — enter the repository URL with an explicit ref (tag or commit):
 
-Example for this plugin (placeholders in angle brackets are **확인 필요**):
+  ```text
+  https://github.com/RunaticMoon/orca-keepalive-plugin#v0.1.0
+  ```
 
-```json
-{
-  "id": "<publisher-slug>.cache-keepalive",
-  "source": {
-    "kind": "git",
-    "url": "<REMOTE_URL>",
-    "ref": "v0.1.0"
-  },
-  "description": "Schedules small keepalive messages for idle Claude terminals in Orca, with per-worktree and per-terminal controls.",
-  "categories": ["<category>"]
-}
-```
+  Only HTTPS or SSH URLs are accepted, and the `#ref` is required. Orca copies the
+  plugin into its plugin directory and shows the requested permissions for review.
+- **Local folder** — point at a local clone of this repository.
 
-With the decided publisher and remote, the entry looks like this — **do not submit
-until the repository is public, the tag exists, and the category is confirmed**:
+For development there is also **Settings > Plugins > Development > "Development
+plugin folder path"** + "Add path" (see the README), which loads the folder in place.
 
-```json
-{
-  "id": "runaticmoon.cache-keepalive",
-  "source": {
-    "kind": "git",
-    "url": "https://github.com/RunaticMoon/orca-keepalive-plugin.git",
-    "ref": "v0.1.0"
-  },
-  "description": "Schedules small keepalive messages for idle Claude terminals in Orca, with per-worktree and per-terminal controls.",
-  "categories": ["utilities"]
-}
-```
-
-### Categories
-
-The categories in the local official index (`orca-plugins/orca-marketplace.json`)
-include: `themes`, `official`, `skills`, `languages`, `icons`, `terminal-themes`,
-`vm-recipes`, `keybindings`. None of these cleanly describes Cache Keepalive, so the
-category value above is a **placeholder (확인 필요)**. Confirm which category names
-the target marketplace accepts before submitting. Do not use the reserved `official`
-category.
-
-### Notes taken from the source contract
-
-- The marketplace matches `source.kind: 'git'` with a URL and a **named ref**, and
-  resolves the ref to an exact commit. Keep the tag, the index `ref`, and the
-  manifest `version` consistent; do not point the index at one version and the
-  manifest at another.
-- The plugin id in the entry is `<publisher>.<id>`; keep the publisher consistent
-  between the manifest and the marketplace entry.
+Updating: a Git URL install is pinned to its ref. To update, install again with the
+new tag (e.g. `#v0.1.1`).
 
 ---
 
@@ -112,19 +73,12 @@ category.
        not run.
 3. [ ] `orca-plugin.json` `version` matches the release tag, and `engines.orca` is set
        to the verified minimum. (`>=1.4.214` is the current declared minimum.)
-4. [ ] Publisher slug, license, and remote URL are finalized (see §1).
-5. [ ] The release commit contains the full plugin (`orca-plugin.json`, `main.mjs`,
+4. [ ] The release commit contains the full plugin (`orca-plugin.json`, `main.mjs`,
        `src/`, `ui/`); no install/build hook is required.
-6. [ ] Tag the release (e.g. `v0.1.0`).
-7. [ ] Add or update the marketplace entry (§2) with the same publisher, remote and
-       ref.
-8. [ ] Smoke-test in Orca's Plugins marketplace management: list, permission review,
-       install, update, and remove. Diagnose any URL access or index validation
-       failure.
-
-Registration in the official `stablyai/orca-plugins` index is a separate decision and
-its acceptance is not guaranteed by this document. Do not describe this plugin as
-official or Stably-published.
+5. [ ] Tag the release and push the tag:
+       `git tag v0.1.0 && git push origin v0.1.0`.
+6. [ ] Smoke-test the Git URL install in Orca with the new tag: install, permission
+       review, enable, disable, and remove.
 
 ---
 
