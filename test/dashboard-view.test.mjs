@@ -653,6 +653,123 @@ test('config form: missing, true, and false snapshots render; Save sends changed
   }
 });
 
+test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UNSUPPORTED_AGENT는 유지한다', async () => {
+  const globals = Object.fromEntries(
+    ['document', 'window', 'sessionStorage', 'fetch'].map((key) => [key, globalThis[key]]),
+  );
+  const nodes = new Map();
+  const intervals = [];
+  const terminals = [
+    {
+      id: 't-noagent',
+      title: 'bash',
+      phase: 'UNKNOWN',
+      enabledOverride: null,
+      effectiveEnabled: false,
+      reason: 'NO_AGENT',
+      unsupportedReason: 'NO_AGENT',
+      dueAt: null,
+      expiresAt: null,
+      charged: 0,
+      confirmed: 0,
+      needsReview: false,
+      supported: false,
+    },
+    {
+      id: 't-codex',
+      title: 'codex',
+      phase: 'UNKNOWN',
+      enabledOverride: null,
+      effectiveEnabled: false,
+      reason: 'UNSUPPORTED_AGENT',
+      unsupportedReason: 'UNSUPPORTED_AGENT',
+      dueAt: null,
+      expiresAt: null,
+      charged: 0,
+      confirmed: 0,
+      needsReview: false,
+      supported: false,
+    },
+  ];
+  const worktree = { ...makeSnapshot().worktrees[0], terminals };
+  const state = makeSnapshot({ worktrees: [worktree], diagnostics: [] });
+
+  function makeNode() {
+    return {
+      checked: false,
+      value: '',
+      disabled: false,
+      textContent: '',
+      children: [],
+      listeners: new Map(),
+      classList: { add() {}, remove() {}, toggle() {} },
+      setAttribute() {},
+      addEventListener(type, listener) { this.listeners.set(type, listener); },
+      appendChild(child) { this.children.push(child); return child; },
+    };
+  }
+
+  const classTokens = (node) =>
+    typeof node.className === 'string' ? node.className.split(/\s+/).filter(Boolean) : [];
+  const findAllByClass = (root, className) => {
+    const found = [];
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (classTokens(node).includes(className)) found.push(node);
+      for (const child of Array.isArray(node.children) ? node.children : []) walk(child);
+    };
+    walk(root);
+    return found;
+  };
+
+  try {
+    globalThis.document = {
+      getElementById(id) {
+        if (!nodes.has(id)) nodes.set(id, makeNode());
+        return nodes.get(id);
+      },
+      createElement: makeNode,
+      querySelectorAll: () => [],
+    };
+    globalThis.window = {
+      location: { hash: '', pathname: '/', search: '' },
+      setInterval(callback) { intervals.push(callback); },
+    };
+    globalThis.sessionStorage = { getItem: () => 'test-token' };
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state });
+
+    await import('../ui/app.mjs?terminal-reason-dom-test');
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    await settle();
+
+    const rows = findAllByClass(nodes.get('worktrees'), 'terminal');
+    assert.equal(rows.length, 2, '두 터미널 행이 렌더링되어야 한다');
+
+    const titleOf = (row) => findAllByClass(row, 'terminal-title')[0]?.textContent;
+    const noAgentRow = rows.find((row) => titleOf(row) === 'bash');
+    const codexRow = rows.find((row) => titleOf(row) === 'codex');
+    assert.ok(noAgentRow, 'NO_AGENT 행을 찾아야 한다');
+    assert.ok(codexRow, 'UNSUPPORTED_AGENT 행을 찾아야 한다');
+
+    // NO_AGENT: 이유 문구와 '읽기 전용 · 미지원' 표시가 모두 없어야 한다.
+    assert.equal(findAllByClass(noAgentRow, 'terminal-reason').length, 0);
+    assert.equal(findAllByClass(noAgentRow, 'readonly-note').length, 0);
+
+    // UNSUPPORTED_AGENT(codex 등): 둘 다 있고 문구가 그대로여야 한다.
+    const reasonNode = findAllByClass(codexRow, 'terminal-reason');
+    const readonlyNode = findAllByClass(codexRow, 'readonly-note');
+    assert.equal(reasonNode.length, 1);
+    assert.equal(readonlyNode.length, 1);
+    assert.equal(readonlyNode[0].textContent, '읽기 전용 · 미지원');
+    assert.equal(reasonNode[0].textContent, '이 터미널의 에이전트는 지원하지 않습니다.');
+  } finally {
+    for (const [key, value] of Object.entries(globals)) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
+  }
+});
+
 test('app.mjs: never uses innerHTML', () => {
   assert.doesNotMatch(appSource, /innerHTML/);
 });

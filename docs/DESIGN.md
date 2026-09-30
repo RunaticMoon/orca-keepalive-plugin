@@ -387,7 +387,7 @@ terminal:send를 명시하여 사용 의도를 드러내고 grantedCapabilities�
 
 순수 HTML/CSS/JS, system font, 밝은/어두운 OS 테마, 상태를 색상만으로 구별하지 않음, keyboard focus·label·aria-live error 포함. 패널/외부 폰트/CDN/프레임워크 없음. 서버가 없어지면 “연결 종료, Orca에서 다시 열기”로 표시하고 버튼을 잠근다.
 
-상단: 앱 timer enabled/TTL, plugin pause, runtime 연결/설정 freshness, 전역 pause/resume. 본문은 워크트리별 그룹 및 terminal row: title(plain text), scope 토글, 실제 적용 on/off와 이유, agent/phase, **예상 만료** countdown, 다음 예정 전송, charged/confirmed, 횟수 초기화. 삭제된 대상은 active처럼 보이지 않게 한다. unsupported target도 읽기 전용으로 이유 표시. 수정한 설정은 explicit 저장 버튼을 눌러 반영한다.
+상단: 앱 timer enabled/TTL, plugin pause, runtime 연결/설정 freshness, 전역 pause/resume. 본문은 워크트리별 그룹 및 terminal row: title(plain text), scope 토글, 실제 적용 on/off와 이유, agent/phase, **예상 만료** countdown, 다음 예정 전송, charged/confirmed, 횟수 초기화. 삭제된 대상은 active처럼 보이지 않게 한다. unsupported target도 읽기 전용으로 이유 표시. 단, 에이전트가 없는 일반 터미널(NO_AGENT)은 이유 문구와 미지원 표시를 생략한다. 수정한 설정은 explicit 저장 버튼을 눌러 반영한다.
 
 “전송 결과 확인 필요”에는 터미널에서 초안을 확인하도록 설명하고 “다음 작업부터 재개” 버튼 제공. 버튼은 pending paste/Enter를 실행하지 않는다. 실시간 테스트 메시지 보내기 버튼은 제공하지 않는다. 사용자에게 앱 timer 설정과 플러그인 자체 설정을 구분해서 보여준다. 최초 화면에 “메시지는 사용량을 소비하고 대화에 남습니다. 입력 감지는 제한적입니다.”를 짧게 표시한다.
 
