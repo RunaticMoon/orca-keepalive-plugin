@@ -3,7 +3,7 @@
   "id": "cache-keepalive",
   "publisher": "runaticmoon",
   "name": "Cache Keepalive",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",
   "engines": { "orca": ">=1.4.214" },
   "pluginApi": 1,
