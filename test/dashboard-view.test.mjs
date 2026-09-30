@@ -130,7 +130,7 @@ test('formatRemaining: boundaries', () => {
 
 test('reasonText: every REASON_CODES value maps to a Korean sentence', () => {
   const codes = Object.keys(REASON_CODES);
-  assert.equal(codes.length, 24, 'expected 24 reason codes in contracts');
+  assert.equal(codes.length, 25, 'expected 25 reason codes in contracts');
   for (const code of codes) {
     const text = reasonText(code);
     assert.equal(typeof text, 'string', `${code} should map to a string`);
@@ -262,6 +262,32 @@ test('toViewModel: needsReview and unsupported terminals are surfaced', () => {
   assert.equal(t3.reasonText, reasonText('UNSUPPORTED_AGENT'));
   assert.equal(t3.expiresAt, null);
   assert.equal(t3.remainingText, '\u2014');
+});
+
+test('toViewModel: NO_AGENT 사유는 문구를 숨기되 reason 필드는 유지한다', () => {
+  const snap = makeSnapshot();
+  snap.worktrees[0].terminals.push({
+    id: 't-4',
+    title: 'bash',
+    phase: 'UNKNOWN',
+    enabledOverride: null,
+    effectiveEnabled: false,
+    reason: 'NO_AGENT',
+    dueAt: null,
+    expiresAt: null,
+    charged: 0,
+    confirmed: 0,
+    needsReview: false,
+    supported: false,
+  });
+  const vm = toViewModel(snap, 0);
+  const t4 = vm.worktrees[0].terminals[3];
+  assert.equal(t4.supported, false);
+  assert.equal(t4.reason, 'NO_AGENT');
+  assert.equal(t4.reasonText, '');
+  // UNSUPPORTED_AGENT(예: codex)는 기존 문구를 그대로 유지한다.
+  const t3 = vm.worktrees[0].terminals[2];
+  assert.equal(t3.reasonText, reasonText('UNSUPPORTED_AGENT'));
 });
 
 test('toViewModel: paused snapshot reports resume label', () => {
