@@ -206,85 +206,166 @@ input[type="checkbox"] {
 
 .worktrees {
   display: grid;
-  gap: 1rem;
+  gap: 0.55rem;
+}
+
+.project {
+  display: grid;
+  grid-template-columns: minmax(13rem, 14rem) minmax(0, 1fr);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.project-cell {
+  min-width: 0;
+  padding: 0.2rem 0.65rem;
+  background: var(--surface-alt);
+  border-right: 1px solid var(--border);
+  border-radius: 7px 0 0 7px;
+  line-height: 1.1;
+}
+
+.worktree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-name {
+  overflow-wrap: anywhere;
+  font-size: 0.94rem;
+  line-height: 1.1;
+}
+
+.project-count,
+.worktree-folder {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-worktrees {
+  display: grid;
+  min-width: 0;
 }
 
 .worktree {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 0.75rem 1rem;
+  display: grid;
+  grid-template-columns: minmax(17rem, 19rem) minmax(0, 1fr);
+  min-width: 0;
 }
 
-.worktree-head {
+.worktree + .worktree {
+  border-top: 1px solid var(--border);
+}
+
+.worktree-cell {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 0.5rem 0.75rem;
+  gap: 0.2rem 0.35rem;
+  min-width: 0;
+  padding: 0.2rem 0.5rem;
+  border-right: 1px solid var(--border);
+}
+
+.worktree-identity {
+  flex: 1 1 4rem;
+  min-width: 0;
+  line-height: 1.1;
+}
+
+.worktree-name {
+  font-size: 0.88rem;
+  margin: 0;
 }
 
 .worktree-effective {
   color: var(--muted);
-  font-size: 0.88rem;
+  font-size: 0.8rem;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
-.worktree-branch {
+.worktree-reason {
   color: var(--muted);
-  font-size: 0.85rem;
-  font-weight: 400;
+  font-size: 0.8rem;
+  flex: 0 1 4rem;
+  min-width: 2.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worktree-cell .compact-button {
+  font-size: 0.8rem;
 }
 
 .terminals {
   display: grid;
-  gap: 0.6rem;
-  margin-top: 0.6rem;
+  min-width: 0;
 }
 
 .terminal {
-  background: var(--surface-alt);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.6rem 0.75rem;
   display: grid;
+  grid-template-columns: minmax(8rem, 1fr) auto auto;
+  align-items: center;
   gap: 0.4rem;
+  min-height: 38px;
+  min-width: 0;
+  padding: 0.15rem 0.5rem;
+  background: var(--surface);
+}
+
+.terminal + .terminal {
+  border-top: 1px solid var(--border);
 }
 
 .terminal-review {
-  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, var(--surface));
+  box-shadow: inset 3px 0 var(--warn);
 }
 
 .terminal-unsupported {
-  border-style: dashed;
+  box-shadow: inset 3px 0 var(--muted);
 }
 
 .terminal-head {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 0.4rem 0.6rem;
+  gap: 0.3rem;
+  min-width: 0;
 }
 
 .terminal-title {
   font-weight: 600;
-  word-break: break-word;
-}
-
-.badge {
-  font-size: 0.78rem;
-  border-radius: 999px;
-  padding: 0.1rem 0.55rem;
-  border: 1px solid var(--border);
-  background: var(--surface);
+  min-width: 4rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.badge-on {
-  color: var(--ok);
-  border-color: var(--ok);
+.badge {
+  font-size: 0.8rem;
+  border-radius: 999px;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  white-space: nowrap;
 }
 
-.badge-off {
+.terminal-applied.is-on {
+  color: var(--ok);
+}
+
+.terminal-applied {
   color: var(--muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
 
 .badge-phase {
@@ -293,9 +374,11 @@ input[type="checkbox"] {
 
 .terminal-meta {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 1rem;
-  font-size: 0.88rem;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .terminal-expiry.is-expired {
@@ -305,41 +388,118 @@ input[type="checkbox"] {
 
 .terminal-reason {
   color: var(--muted);
-  font-size: 0.88rem;
+  font-size: 0.8rem;
+  flex: 1 1 3rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminal-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.3rem;
   align-items: center;
+  white-space: nowrap;
 }
 
-.review {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  align-items: center;
+.review-warning {
   color: var(--warn);
   font-weight: 600;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.review-action {
+  border-color: var(--warn);
+  color: var(--warn);
 }
 
 .readonly-note {
-  color: var(--muted);
-  font-size: 0.88rem;
+  color: var(--warn);
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
 
 .field-inline {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.2rem;
+  font-size: 0.8rem;
 }
 
 .field-inline select {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+  padding: 0.15rem 0.25rem;
+}
+
+.compact-button {
+  padding: 0.15rem 0.35rem;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.terminal-empty {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 1150px) {
+  .project,
+  .worktree {
+    display: block;
+  }
+
+  .project-cell,
+  .worktree-cell {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .project-cell {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    border-radius: 7px 7px 0 0;
+  }
+
+  .worktree-cell {
+    flex-wrap: wrap;
+    padding: 0.35rem 0.5rem;
+  }
+
+  .worktree-identity {
+    flex: 1 1 12rem;
+  }
+}
+
+@media (max-width: 1050px) {
+  .terminal {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.15rem;
+    padding: 0.45rem 0.5rem;
+  }
+
+  .terminal-meta,
+  .terminal-actions {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 760px) {
+  .terminal-title {
+    flex: 1 1 6rem;
+  }
+
+  .terminal-head {
+    flex-wrap: wrap;
+  }
+
+  .terminal-reason {
+    flex-basis: 100%;
+  }
 }
 
 .config-form {

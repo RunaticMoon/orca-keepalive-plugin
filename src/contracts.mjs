@@ -164,7 +164,9 @@
  * @typedef {Object} DashboardWorktree
  * @property {string} id opaque worktreeId.
  * @property {string} worktreeHash 원시 worktreeId의 sha256 앞 16 hex(원시 id 미노출).
+ * @property {string|null} projectId 같은 저장소 worktree가 공유하는 불투명 ID('p' + repoId SHA-256 앞 16 hex).
  * @property {string} label 표시용 label(프로젝트 이름).
+ * @property {string} projectLabel 프로젝트 표시 이름.
  * @property {string|null} branch 표시용 짧은 branch 이름(없으면 null).
  * @property {boolean} enabled
  * @property {boolean} effectiveEnabled
@@ -437,6 +439,7 @@ export const PUBLIC_SNAPSHOT_FORBIDDEN_KEYS = deepFreeze([
   'screen',
   'tail',
   'settings',
+  'repoId',
   'worktreePath',
   'userDataPath',
   'endpoint',

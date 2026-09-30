@@ -15,6 +15,7 @@
 import { REASON_CODES, TIMING } from './contracts.mjs'
 import { sameBinding } from './runtime-location.mjs'
 import { marginFor } from './scheduler.mjs'
+import { repoIdFromWorktreeId } from './terminal-observer.mjs'
 
 /** targets Map key 구분자. worktreeId/paneKey를 tuple로 join한다. */
 const KEY_SEP = '\u0000'
@@ -30,6 +31,10 @@ const TITLE_RESTORE_TIMEOUT_MS = 5000
 const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 15000, 30000]
 /** 전송 결과 불확실을 나타내는 reason. */
 const UNKNOWN_SEND_REASON = 'PARTIAL_OR_UNKNOWN_SEND'
+/** repo 이름 캐시를 강제로 갱신하는 주기(ms). 마지막 성공 후 이 시간이 지나면 다시 읽는다. */
+const REPO_NAME_REFRESH_MS = 300000
+/** repo 이름 조회 재시도 최소 간격(ms). 성공/실패와 무관하게 이 간격 안에는 다시 시도하지 않는다. */
+const REPO_NAME_RETRY_MS = 30000
 
 /**
  * @typedef {Object} RuntimeConnection
@@ -49,8 +54,10 @@ const UNKNOWN_SEND_REASON = 'PARTIAL_OR_UNKNOWN_SEND'
  *
  * @typedef {Object} RuntimeWorktreeView
  * @property {string} worktreeId
+ * @property {string|null} repoId worktreeId의 첫 `::` 앞 저장소 식별자. 없으면 null.
  * @property {string|null} label
  * @property {string|null} branch 표시용 짧은 branch 이름.
+ * @property {string|null} projectLabel 같은 저장소의 워크트리가 공유하는 프로젝트 표시 이름.
  * @property {RuntimeTerminalView[]} terminals
  *
  * @typedef {Object} RuntimeView
@@ -231,6 +238,19 @@ export function createCoordinator({
   const skipUntil = new Map()
   /** 실제(사람/기타) 턴의 working을 관측한 target key. 그 done에서 탭 제목을 새로 고친다. @type {Set<string>} */
   const pendingRealTurn = new Set()
+
+  /** repoId → displayName 캐시. observer.listRepoNames 성공 결과만 반영한다. @type {Map<string, string>} */
+  const repoNames = new Map()
+  /** 성공한 조회 결과에 없던 repoId. 영구 미지 repoId의 반복 조회를 막는다. @type {Set<string>} */
+  const repoNamesMissing = new Set()
+  /** 마지막 listRepoNames 성공 시각(clock.now). 한 번도 성공하지 않았으면 null. @type {number|null} */
+  let repoNamesLoadedAt = null
+  /** 마지막 listRepoNames 시도 시각(성공/실패 무관). @type {number|null} */
+  let repoNamesAttemptedAt = null
+  /** 진행 중 listRepoNames 호출. 중복 호출 방지용. @type {Promise<void>|null} */
+  let repoNamesInFlight = null
+  /** stop 시 진행 중 repo 이름 조회를 중단하는 signal. */
+  const repoNameAbort = new AbortController()
 
   /** @type {unknown[]} */
   const eventQueue = []
@@ -782,6 +802,12 @@ export function createCoordinator({
     }
     titleIndicatorCatalogFailed = catalogReadFailed
 
+    // c2. repo 이름 캐시 갱신(필요 시). catalog 읽기에 성공한 뒤에만 시도한다.
+    // startSend와 같이 tick을 막지 않도록 백그라운드로 시작하고, 예외는 안에서 삼킨다.
+    if (!catalogReadFailed) {
+      scheduleRefreshRepoNames(clock.now())
+    }
+
     // d. 대기 중 이벤트 drain.
     await drainEvents()
 
@@ -975,6 +1001,10 @@ export function createCoordinator({
         title: typeof row.title === 'string' ? row.title : null,
         label: row.projectName ?? row.branchName ?? null,
         branch: row.branchName ?? null,
+        repoId:
+          typeof row.repoId === 'string' && row.repoId.length > 0
+            ? row.repoId
+            : repoIdFromWorktreeId(row.worktreeId),
         supported: row.supported === true,
         unsupportedReason: typeof row.unsupportedReason === 'string' ? row.unsupportedReason : null,
         tabId: typeof row.tabId === 'string' ? row.tabId : null,
@@ -1003,6 +1033,115 @@ export function createCoordinator({
         }
       }
     }
+  }
+
+  /**
+   * 현재 target에 '새' repoId(캐시에도 missing에도 없는)가 있는지 확인한다. 영구
+   * 미지 repoId는 repoNamesMissing에 기록되어 반복 조회를 유발하지 않는다.
+   * @returns {boolean}
+   */
+  function hasUnknownRepoId() {
+    for (const entry of targets.values()) {
+      const repoId = entry.meta.repoId
+      if (
+        typeof repoId === 'string' &&
+        repoId.length > 0 &&
+        !repoNames.has(repoId) &&
+        !repoNamesMissing.has(repoId)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * 성공한 조회 결과를 반영한다. 캐시를 교체하고, 현재 target의 repoId 중 결과에
+   * 없는 것을 repoNamesMissing으로 재계산한다(5분 주기 갱신 시 재평가).
+   * @param {Map<string, string>} result
+   * @param {number} now
+   */
+  function applyRepoNames(result, now) {
+    repoNames.clear()
+    for (const [repoId, name] of result) {
+      if (
+        typeof repoId === 'string' &&
+        repoId.length > 0 &&
+        typeof name === 'string' &&
+        name.length > 0
+      ) {
+        repoNames.set(repoId, name)
+      }
+    }
+    repoNamesMissing.clear()
+    for (const entry of targets.values()) {
+      const repoId = entry.meta.repoId
+      if (typeof repoId === 'string' && repoId.length > 0 && !repoNames.has(repoId)) {
+        repoNamesMissing.add(repoId)
+      }
+    }
+    repoNamesLoadedAt = now
+  }
+
+  /**
+   * repo 이름 조회를 실제로 수행한다. null/throw/non-Map은 모두 삼키고 기존 캐시를
+   * 유지한다. 완료 시 attemptedAt을 갱신하고, 성공이면 캐시/loadedAt도 갱신한다.
+   * stop 이후 늦게 끝난 결과는 무시한다(tick/전송에 영향 없음).
+   * @returns {Promise<void>}
+   */
+  async function runRefreshRepoNames() {
+    let result = null
+    let failed = false
+    try {
+      result = await observer.listRepoNames({ signal: repoNameAbort.signal })
+    } catch {
+      failed = true
+    }
+    if (stopped) {
+      return
+    }
+    const completedAt = clock.now()
+    repoNamesAttemptedAt = completedAt
+    if (failed || !(result instanceof Map)) {
+      return
+    }
+    applyRepoNames(result, completedAt)
+  }
+
+  /**
+   * repo 이름 캐시(repoId → displayName) 갱신을 필요할 때만 백그라운드로 시작한다.
+   * 한 번도 성공하지 않았거나, 현재 target에 캐시/missing에 없는 새 repoId가 있거나,
+   * 마지막 성공 후 REPO_NAME_REFRESH_MS가 지났을 때 시도한다. 단 마지막 시도
+   * (성공/실패 무관) 후 REPO_NAME_RETRY_MS 이내에는 재시도하지 않는다. observer가
+   * 메서드를 제공하지 않으면 건너뛰고, 진행 중 호출이 있으면 중복 시작하지 않는다.
+   * tick을 막지 않는다.
+   * @param {number} now
+   */
+  function scheduleRefreshRepoNames(now) {
+    if (stopped || repoNamesInFlight !== null) {
+      return
+    }
+    if (observer === null || typeof observer.listRepoNames !== 'function') {
+      return
+    }
+    const needRefresh =
+      repoNamesLoadedAt === null ||
+      now - repoNamesLoadedAt >= REPO_NAME_REFRESH_MS ||
+      hasUnknownRepoId()
+    if (!needRefresh) {
+      return
+    }
+    if (repoNamesAttemptedAt !== null && now - repoNamesAttemptedAt < REPO_NAME_RETRY_MS) {
+      return
+    }
+    const task = runRefreshRepoNames()
+    repoNamesInFlight = task
+    const clear = () => {
+      if (repoNamesInFlight === task) {
+        repoNamesInFlight = null
+      }
+    }
+    task.then(clear, clear)
   }
 
   /**
@@ -1415,11 +1554,16 @@ export function createCoordinator({
       if (!group) {
         group = {
           worktreeId: target.worktreeId,
+          repoId: entry.meta.repoId ?? null,
           label: entry.meta.label ?? null,
           branch: entry.meta.branch ?? null,
+          projectLabel: null,
           terminals: [],
         }
         groups.set(target.worktreeId, group)
+      }
+      if (group.repoId === null && entry.meta.repoId) {
+        group.repoId = entry.meta.repoId
       }
       if (group.label === null && entry.meta.label) {
         group.label = entry.meta.label
@@ -1438,6 +1582,33 @@ export function createCoordinator({
         supported: entry.meta.supported === true,
         unsupportedReason: entry.meta.unsupportedReason ?? null,
       })
+    }
+
+    // 같은 repoId의 워크트리는 항상 같은 projectLabel을 갖게 한다. repo 캐시에
+    // displayName이 있으면 그것을 쓰고, 없으면 같은 repo의 label 중 사전순
+    // 최솟값을 쓴다. repoId가 없으면 기존 group.label을 그대로 쓴다.
+    const minLabelByRepo = new Map()
+    for (const group of groups.values()) {
+      if (typeof group.repoId !== 'string' || group.repoId.length === 0) {
+        continue
+      }
+      if (typeof group.label !== 'string' || group.label.length === 0) {
+        continue
+      }
+      const current = minLabelByRepo.get(group.repoId)
+      if (current === undefined || group.label < current) {
+        minLabelByRepo.set(group.repoId, group.label)
+      }
+    }
+    for (const group of groups.values()) {
+      const repoId = group.repoId
+      if (typeof repoId !== 'string' || repoId.length === 0) {
+        group.projectLabel = group.label ?? null
+        continue
+      }
+      const cached = repoNames.get(repoId)
+      group.projectLabel =
+        typeof cached === 'string' ? cached : minLabelByRepo.get(repoId) ?? null
     }
 
     const worktrees = [...groups.values()]
@@ -1483,6 +1654,12 @@ export function createCoordinator({
       return stopPromise
     }
     stopped = true
+    // 진행 중 repo 이름 조회는 중단한다. 늦게 끝난 결과는 stopped 가드로 무시된다.
+    try {
+      repoNameAbort.abort()
+    } catch {
+      // ignore
+    }
     if (tickTimer !== null) {
       try {
         clock.clearTimeout(tickTimer)

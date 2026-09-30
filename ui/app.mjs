@@ -284,6 +284,10 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
         return {
           id: typeof wt.id === 'string' ? wt.id : '',
           label: typeof wt.label === 'string' ? wt.label : '',
+          projectId: typeof wt.projectId === 'string' && wt.projectId ? wt.projectId : null,
+          projectLabel: typeof wt.projectLabel === 'string' && wt.projectLabel
+            ? wt.projectLabel
+            : typeof wt.label === 'string' ? wt.label : '',
           branch: typeof wt.branch === 'string' ? wt.branch : '',
           enabled,
           inherited: enabled === null,
@@ -295,6 +299,16 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
         };
       })
     : [];
+
+  const projectsByKey = new Map();
+  for (const worktree of worktrees) {
+    const key = worktree.projectId ?? `label:${worktree.projectLabel}`;
+    if (!projectsByKey.has(key)) {
+      projectsByKey.set(key, { key, label: worktree.projectLabel, worktrees: [] });
+    }
+    projectsByKey.get(key).worktrees.push(worktree);
+  }
+  const projects = Array.from(projectsByKey.values());
 
   const diagnostics = Array.isArray(snap.diagnostics)
     ? snap.diagnostics.slice(-20).map((entry) => {
@@ -339,6 +353,7 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
     },
     config: rawConfig,
     worktrees,
+    projects,
     diagnostics,
   };
 }
@@ -683,60 +698,86 @@ function boot() {
       return;
     }
 
-    for (const worktree of vm.worktrees) {
-      const section = el('section', 'worktree');
+    for (const [projectIndex, project] of vm.projects.entries()) {
+      const projectSection = el('section', 'project');
+      const projectCell = el('div', 'project-cell');
+      const projectName = el('h3', 'project-name', project.label || '이름 없는 프로젝트');
+      projectName.id = `dashboard-project-${projectIndex}`;
+      projectName.title = project.label || '이름 없는 프로젝트';
+      projectSection.setAttribute('aria-labelledby', projectName.id);
+      projectCell.appendChild(projectName);
+      projectCell.appendChild(el('span', 'project-count', `워크트리 ${project.worktrees.length}`));
+      projectSection.appendChild(projectCell);
 
-      const head = el('div', 'worktree-head');
-      const titleEl = el('h3', null, worktree.label || '워크트리');
-      if (worktree.branch && worktree.branch !== worktree.label) {
-        titleEl.appendChild(el('span', 'worktree-branch', ` (${worktree.branch})`));
-      }
-      head.appendChild(titleEl);
-      const toggle = el(
-        'button',
-        'btn',
-        worktreeToggleLabel(worktree),
-      );
-      toggle.type = 'button';
-      toggle.setAttribute('aria-pressed', String(worktree.scopeOn));
-      toggle.setAttribute('aria-label', `워크트리 keepalive 토글: ${worktree.label || worktree.id}`);
-      toggle.disabled = !connected;
-      toggle.addEventListener('click', () => {
-        postAction(
-          buildAction('worktree', { targetId: worktree.id, enabled: !worktree.scopeOn }, snapshot.revision),
+      const worktreeList = el('div', 'project-worktrees');
+      for (const worktree of project.worktrees) {
+        const section = el('section', 'worktree');
+        const head = el('div', 'worktree-cell');
+        const identity = el('div', 'worktree-identity');
+        const primary = worktree.branch || worktree.label || '워크트리';
+        const titleEl = el('h4', 'worktree-name', primary);
+        titleEl.title = primary;
+        identity.appendChild(titleEl);
+        if (worktree.label && worktree.label !== worktree.projectLabel && worktree.label !== primary) {
+          const folder = el('span', 'worktree-folder', worktree.label);
+          folder.title = worktree.label;
+          identity.appendChild(folder);
+        }
+        head.appendChild(identity);
+        const toggle = el(
+          'button',
+          'btn compact-button',
+          worktreeToggleLabel(worktree),
         );
-      });
-      head.appendChild(toggle);
-      if (!worktree.inherited) {
-        const inherit = el('button', 'btn', '기본값으로');
-        inherit.type = 'button';
-        inherit.setAttribute('aria-label', `워크트리 keepalive를 기본값으로: ${worktree.label || worktree.id}`);
-        inherit.disabled = !connected;
-        inherit.addEventListener('click', () => {
+        toggle.type = 'button';
+        toggle.setAttribute('aria-pressed', String(worktree.scopeOn));
+        toggle.setAttribute('aria-label', `워크트리 keepalive 토글: ${worktree.label || worktree.id}`);
+        toggle.disabled = !connected;
+        toggle.addEventListener('click', () => {
           postAction(
-            buildAction('worktree', { targetId: worktree.id, enabled: null }, snapshot.revision),
+            buildAction('worktree', { targetId: worktree.id, enabled: !worktree.scopeOn }, snapshot.revision),
           );
         });
-        head.appendChild(inherit);
-      }
-      section.appendChild(head);
+        head.appendChild(toggle);
+        if (!worktree.inherited) {
+          const inherit = el('button', 'btn compact-button', '기본값으로');
+          inherit.type = 'button';
+          inherit.setAttribute('aria-label', `워크트리 keepalive를 기본값으로: ${worktree.label || worktree.id}`);
+          inherit.disabled = !connected;
+          inherit.addEventListener('click', () => {
+            postAction(
+              buildAction('worktree', { targetId: worktree.id, enabled: null }, snapshot.revision),
+            );
+          });
+          head.appendChild(inherit);
+        }
+        const effective = el('span', 'worktree-effective',
+          `적용 ${worktree.effectiveEnabled ? '● 켜짐' : '○ 꺼짐'}`);
+        effective.title = `실제 적용: ${worktree.effectiveEnabled ? '켜짐' : '꺼짐'}`;
+        if (worktree.reasonText) {
+          effective.title += ` — ${worktree.reasonText}`;
+        }
+        head.appendChild(effective);
+        if (worktree.reasonText) {
+          const reason = el('span', 'worktree-reason', worktree.reasonText);
+          reason.title = worktree.reasonText;
+          head.appendChild(reason);
+        }
+        section.appendChild(head);
 
-      const effective = el(
-        'p',
-        'worktree-effective',
-        `실제 적용: ${worktree.effectiveEnabled ? '켜짐' : '꺼짐'}`,
-      );
-      if (worktree.reasonText) {
-        effective.textContent += ` — ${worktree.reasonText}`;
+        const list = el('div', 'terminals');
+        if (worktree.terminals.length === 0) {
+          list.appendChild(el('div', 'terminal terminal-empty', '표시할 세션이 없습니다.'));
+        } else {
+          for (const terminal of worktree.terminals) {
+            list.appendChild(renderTerminal(terminal, vm));
+          }
+        }
+        section.appendChild(list);
+        worktreeList.appendChild(section);
       }
-      section.appendChild(effective);
-
-      const list = el('div', 'terminals');
-      for (const terminal of worktree.terminals) {
-        list.appendChild(renderTerminal(terminal, vm));
-      }
-      section.appendChild(list);
-      nodes.worktrees.appendChild(section);
+      projectSection.appendChild(worktreeList);
+      nodes.worktrees.appendChild(projectSection);
     }
   }
 
@@ -751,20 +792,28 @@ function boot() {
     if (!terminal.supported) row.classList.add('terminal-unsupported');
 
     const head = el('div', 'terminal-head');
-    head.appendChild(el('span', 'terminal-title', terminal.title || '(제목 없음)'));
+    const title = el('span', 'terminal-title', terminal.title || '(제목 없음)');
+    title.title = terminal.title || '(제목 없음)';
+    head.appendChild(title);
     head.appendChild(el('span', 'badge badge-phase', terminal.phase));
     head.appendChild(
       el(
         'span',
-        terminal.effectiveEnabled ? 'badge badge-on' : 'badge badge-off',
+        terminal.effectiveEnabled ? 'terminal-applied is-on' : 'terminal-applied',
         `${terminal.effectiveEnabled ? '●' : '○'} 적용 ${terminal.effectiveEnabled ? '켜짐' : '꺼짐'}`,
       ),
     );
-    row.appendChild(head);
-
-    if (terminal.reasonText) {
-      row.appendChild(el('p', 'terminal-reason', `이유: ${terminal.reasonText}`));
+    if (!terminal.supported) {
+      const readonly = el('span', 'readonly-note', '읽기 전용 · 미지원');
+      readonly.title = `지원하지 않는 대상이라 읽기 전용입니다.${terminal.reasonText ? ` ${terminal.reasonText}` : ''}`;
+      head.appendChild(readonly);
     }
+    if (terminal.reasonText) {
+      const reason = el('span', 'terminal-reason', terminal.reasonText);
+      reason.title = terminal.reasonText;
+      head.appendChild(reason);
+    }
+    row.appendChild(head);
 
     const actions = el('div', 'terminal-actions');
 
@@ -791,14 +840,14 @@ function boot() {
     scopeLabel.appendChild(select);
     actions.appendChild(scopeLabel);
 
-    const reset = el('button', 'btn', '횟수 초기화');
+    const reset = el('button', 'btn compact-button', '횟수 초기화');
     reset.type = 'button';
+    reset.setAttribute('aria-label', `횟수 초기화: ${terminal.title || terminal.id}`);
     reset.disabled = !connected || !terminal.supported;
     reset.addEventListener('click', () => {
       postAction(buildAction('reset-budget', { targetId: terminal.id }, snapshot.revision));
     });
     actions.appendChild(reset);
-    row.appendChild(actions);
 
     const meta = el('div', 'terminal-meta');
     const expiry = el(
@@ -812,7 +861,7 @@ function boot() {
     const budget = el(
       'span',
       'terminal-budget',
-      `연속 keepalive: ${terminal.charged}회 / 상한 ${vm.maxConsecutiveText} · 확인 ${terminal.confirmed}회`,
+      `연속 ${terminal.charged}/상한 ${vm.maxConsecutiveText} · 확인 ${terminal.confirmed}`,
     );
     meta.appendChild(budget);
     row.appendChild(meta);
@@ -824,23 +873,19 @@ function boot() {
     });
 
     if (terminal.needsReview) {
-      const review = el('div', 'review');
-      review.appendChild(el('span', 'review-warning', '⚠ 전송 결과 확인 필요: 터미널 입력창을 확인하세요.'));
-      const clear = el('button', 'btn', '다음 작업부터 재개');
+      const warning = el('span', 'review-warning', '⚠ 확인 필요');
+      warning.title = '전송 결과 확인 필요: 터미널 입력창을 확인하세요.';
+      actions.appendChild(warning);
+      const clear = el('button', 'btn compact-button review-action', '다음 작업부터 재개');
       clear.type = 'button';
       clear.disabled = !connected || !terminal.supported;
       clear.addEventListener('click', () => {
         postAction(buildAction('clear-review', { targetId: terminal.id }, snapshot.revision));
       });
-      review.appendChild(clear);
-      row.appendChild(review);
+      actions.appendChild(clear);
     }
 
-    if (!terminal.supported) {
-      row.appendChild(
-        el('p', 'readonly-note', `지원하지 않는 대상이라 읽기 전용입니다.${terminal.reasonText ? ` ${terminal.reasonText}` : ''}`),
-      );
-    }
+    row.appendChild(actions);
 
     return row;
   }

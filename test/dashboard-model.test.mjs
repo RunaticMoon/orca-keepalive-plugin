@@ -10,6 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
 import { createStateStore, StoreError } from '../src/state-store.mjs';
 import { createDashboardModel, ActionError } from '../src/dashboard-model.mjs';
@@ -187,6 +188,57 @@ test('snapshot: 같은 label 워크트리 2개와 split terminal은 각각 다�
   assert.notEqual(snap.worktrees[0].terminals[0].id, snap.worktrees[1].terminals[0].id);
 });
 
+test('snapshot: 같은 repoId는 프로젝트 해시를 공유하고 다른 repoId는 분리한다', async () => {
+  const { store } = await newStore();
+  const repoIdA = '/private/workspace/repository-alpha';
+  const repoIdB = '/private/workspace/repository-beta';
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView({
+      worktrees: [
+        wt({ worktreeId: 'project-w1', repoId: repoIdA }),
+        wt({ worktreeId: 'project-w2', repoId: repoIdA }),
+        wt({ worktreeId: 'project-w3', repoId: repoIdB }),
+      ],
+    }),
+  });
+
+  const snap = model.snapshot();
+  const [first, second, third] = snap.worktrees;
+  const expectedProjectId = `p${crypto.createHash('sha256').update(repoIdA, 'utf8').digest('hex').slice(0, 16)}`;
+  assert.equal(first.projectId, expectedProjectId);
+  assert.equal(second.projectId, expectedProjectId);
+  assert.notEqual(first.projectId, third.projectId);
+  assert.equal(first.projectId.includes(repoIdA), false);
+  assert.equal(JSON.stringify(snap).includes(repoIdA), false);
+  assert.equal(JSON.stringify(snap).includes(repoIdB), false);
+});
+
+test('snapshot: repoId가 없으면 projectId는 null이고 projectLabel은 label을 사용한다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView({ worktrees: [wt({ label: 'main' })] }) });
+
+  const [worktree] = model.snapshot().worktrees;
+  assert.equal(worktree.projectId, null);
+  assert.equal(worktree.projectLabel, 'main');
+});
+
+test('snapshot: projectLabel을 사용하고 200자로 제한한다', async () => {
+  const { store } = await newStore();
+  const projectLabel = 'Project display name';
+  const longProjectLabel = 'x'.repeat(250);
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView({
+      worktrees: [wt({ projectLabel }), wt({ worktreeId: 'project-long-label', projectLabel: longProjectLabel })],
+    }),
+  });
+
+  const [worktree, longLabelWorktree] = model.snapshot().worktrees;
+  assert.equal(worktree.projectLabel, projectLabel);
+  assert.equal(longLabelWorktree.projectLabel, 'x'.repeat(200));
+});
+
 test('snapshot: targetId는 프로세스 수명 동안 안정적', async () => {
   const { store } = await newStore();
   const { model } = makeModel({ store, runtime: runtimeView() });
@@ -218,6 +270,16 @@ test('snapshot: 금지 필드(원문 식별자/비밀)가 JSON에 없다', async
   assert.equal(json.includes('ptyId'), false);
   assert.equal(json.includes('term_'), false);
   assert.equal(snap.config.runtimeUserDataPath, null);
+});
+
+test('snapshot: worktree 객체에 repoId 키를 넣지 않는다', async () => {
+  const { store } = await newStore();
+  const repoId = '/private/repository/without-raw-id';
+  const { model } = makeModel({ store, runtime: runtimeView({ worktrees: [wt({ repoId })] }) });
+
+  const snap = model.snapshot();
+  assert.equal('repoId' in snap.worktrees[0], false);
+  assert.equal(JSON.stringify(snap).includes(repoId), false);
 });
 
 test('snapshot: 진단은 최근 50개만 {at,level,event,code?}로 매핑', async () => {

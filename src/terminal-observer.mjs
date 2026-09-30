@@ -17,6 +17,7 @@ import { REASON_CODES } from './contracts.mjs'
  * @typedef {Object} TerminalRow
  * @property {string} handle RPC handle.
  * @property {string} worktreeId
+ * @property {string|null} repoId worktreeId의 `::` 앞부분(저장소 식별자). 없으면 null.
  * @property {string} tabId
  * @property {string} leafId
  * @property {string} paneKey `${tabId}:${leafId}`.
@@ -76,6 +77,7 @@ import { REASON_CODES } from './contracts.mjs'
  */
 
 const MAX_TITLE_LENGTH = 200
+const MAX_REPO_NAME_LENGTH = 200
 const TERMINAL_LIST_LIMIT = 1000
 const READ_LIMIT = 200
 
@@ -121,6 +123,24 @@ export function projectNameFromPath(worktreePath) {
     return null
   }
   return segments[segments.length - 1]
+}
+
+/**
+ * worktreeId에서 저장소 식별자(repoId)를 뽑는다. Orca의 worktreeId는
+ * `${repoId}::${worktreePath}` 형식이고 구분자는 첫 `::`다. 문자열이 아니거나 `::`가
+ * 없거나 앞부분이 빈 문자열이면 null이다. 뒤에 `::`가 더 있어도 첫 번째 기준으로 자른다.
+ * @param {unknown} worktreeId
+ * @returns {string|null}
+ */
+export function repoIdFromWorktreeId(worktreeId) {
+  if (typeof worktreeId !== 'string') {
+    return null
+  }
+  const separatorIndex = worktreeId.indexOf('::')
+  if (separatorIndex <= 0) {
+    return null
+  }
+  return worktreeId.slice(0, separatorIndex)
 }
 
 /**
@@ -192,6 +212,7 @@ function parseRow(raw) {
   const row = {
     handle,
     worktreeId,
+    repoId: repoIdFromWorktreeId(worktreeId),
     tabId,
     leafId,
     paneKey: `${tabId}:${leafId}`,
@@ -346,6 +367,7 @@ function isStale(shown, target) {
  *   resolveEvent: (event: unknown, catalog: Catalog) => Target|null,
  *   inspect: (target: Target, options?: {signal?: AbortSignal}) => Promise<Observation>,
  *   currentWorktree: (catalog: Catalog) => Promise<string|null>,
+ *   listRepoNames: (options?: {signal?: AbortSignal}) => Promise<Map<string, string>|null>,
  * }}
  */
 export function createObserver({ rpc, hostCall, now = Date.now }) {
@@ -604,5 +626,44 @@ export function createObserver({ rpc, hostCall, now = Date.now }) {
     return worktreeIds.size === 1 ? [...worktreeIds][0] : null
   }
 
-  return { list, resolveEvent, inspect, currentWorktree }
+  /**
+   * repo.list를 호출해 repoId → displayName 매핑을 만든다. 대시보드에서 같은 저장소의
+   * 여러 워크트리를 한 프로젝트로 묶는 데 쓴다. path 등 다른 필드는 버리고, id와
+   * displayName이 모두 비어 있지 않은 문자열인 항목만 넣는다(displayName은 200자로 자름).
+   * rpc 호출이 실패하거나 결과 형식이 틀리면 예외를 던지지 않고 null을 반환한다.
+   * @param {{signal?: AbortSignal}} [options]
+   * @returns {Promise<Map<string, string>|null>}
+   */
+  async function listRepoNames({ signal } = {}) {
+    let result
+    try {
+      result = await rpc.call('repo.list', null, {
+        timeoutMs: 5000,
+        ...(signal ? { signal } : {}),
+      })
+    } catch {
+      return null
+    }
+
+    if (!isObject(result) || !Array.isArray(result.repos)) {
+      return null
+    }
+
+    /** @type {Map<string, string>} */
+    const names = new Map()
+    for (const repo of result.repos) {
+      if (!isObject(repo)) {
+        continue
+      }
+      const id = stringOrNull(repo.id)
+      const displayName = stringOrNull(repo.displayName)
+      if (id === null || displayName === null) {
+        continue
+      }
+      names.set(id, displayName.slice(0, MAX_REPO_NAME_LENGTH))
+    }
+    return names
+  }
+
+  return { list, resolveEvent, inspect, currentWorktree, listRepoNames }
 }

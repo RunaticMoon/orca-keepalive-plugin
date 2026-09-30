@@ -158,12 +158,21 @@ function makeRow(overrides = {}) {
   }
 }
 
-function createObserverFake({ rows = [makeRow()] } = {}) {
-  const state = { rows: rows.slice(), complete: true, onList: null, currentWorktree: null }
+function createObserverFake({ rows = [makeRow()], repoNames, onListRepoNames } = {}) {
+  const state = {
+    rows: rows.slice(),
+    complete: true,
+    onList: null,
+    currentWorktree: null,
+    repoNames,
+    onListRepoNames: onListRepoNames ?? null,
+  }
   const listCalls = []
-  return {
+  const repoNamesCalls = []
+  const adapter = {
     state,
     listCalls,
+    repoNamesCalls,
     async list() {
       listCalls.push({ rows: state.rows.slice() })
       if (typeof state.onList === 'function') {
@@ -215,6 +224,17 @@ function createObserverFake({ rows = [makeRow()] } = {}) {
       return state.currentWorktree
     },
   }
+  // listRepoNames를 요청한 경우에만 메서드를 노출한다(미제공 시 coordinator가 건너뜀).
+  if (repoNames !== undefined || onListRepoNames !== undefined) {
+    adapter.listRepoNames = async (options) => {
+      repoNamesCalls.push({ options })
+      if (typeof state.onListRepoNames === 'function') {
+        return state.onListRepoNames(repoNamesCalls.length, state)
+      }
+      return state.repoNames
+    }
+  }
+  return adapter
 }
 
 /**
@@ -1038,6 +1058,260 @@ test('getRuntimeView: 지원되지 않는 행도 이유와 함께 포함한다',
   await arm(h, h.clock.now())
   await h.clock.advance(TTL_5M)
   assert.equal(h.sendCalls.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 13b. RuntimeView: 프로젝트(repo) 정보
+// ---------------------------------------------------------------------------
+
+test('getRuntimeView: listRepoNames가 없으면 같은 repo label의 사전순 최솟값을 projectLabel로 쓴다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1', projectName: 'zeta' }),
+    makeRow({ handle: 'h2', worktreeId: 'r1::/x/b', paneKey: 'tab:leaf2', projectName: 'alpha' }),
+  ]
+  // listRepoNames를 노출하지 않는 observer → 폴백 경로.
+  const h = createHarness({ terminals: rows })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees.length, 2)
+  const byId = new Map(view.worktrees.map((w) => [w.worktreeId, w]))
+  assert.equal(byId.get('r1::/x/a').repoId, 'r1')
+  assert.equal(byId.get('r1::/x/b').repoId, 'r1')
+  assert.equal(byId.get('r1::/x/a').projectLabel, 'alpha')
+  assert.equal(byId.get('r1::/x/b').projectLabel, 'alpha')
+})
+
+test('getRuntimeView: listRepoNames가 null이면 같은 repo label 최솟값을 projectLabel로 쓴다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1', projectName: 'zeta' }),
+    makeRow({ handle: 'h2', worktreeId: 'r1::/x/b', paneKey: 'tab:leaf2', projectName: 'alpha' }),
+  ]
+  const observer = createObserverFake({ rows, repoNames: null })
+  const h = createHarness({ observer })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  const byId = new Map(view.worktrees.map((w) => [w.worktreeId, w]))
+  assert.equal(byId.get('r1::/x/a').projectLabel, 'alpha')
+  assert.equal(byId.get('r1::/x/b').projectLabel, 'alpha')
+  assert.equal(observer.repoNamesCalls.length, 1)
+})
+
+test('getRuntimeView: 같은 repoId 두 워크트리는 listRepoNames 결과를 projectLabel로 공유한다', async () => {
+  // row.repoId를 명시한 행과 worktreeId에서 파싱한 행이 같은 repo로 묶인다.
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'different::/x/a', repoId: 'r1', paneKey: 'tab:leaf1' }),
+    makeRow({ handle: 'h2', worktreeId: 'r1::/x/b', paneKey: 'tab:leaf2' }),
+  ]
+  const observer = createObserverFake({
+    rows,
+    repoNames: new Map([['r1', 'mtt-claude-plugins']]),
+  })
+  const h = createHarness({ observer })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees.length, 2)
+  const byId = new Map(view.worktrees.map((w) => [w.worktreeId, w]))
+  assert.equal(byId.get('different::/x/a').repoId, 'r1')
+  assert.equal(byId.get('r1::/x/b').repoId, 'r1')
+  assert.equal(byId.get('different::/x/a').projectLabel, 'mtt-claude-plugins')
+  assert.equal(byId.get('r1::/x/b').projectLabel, 'mtt-claude-plugins')
+  assert.equal(observer.repoNamesCalls.length, 1)
+})
+
+test('getRuntimeView: repoId가 없으면 projectLabel은 group label을 쓴다', async () => {
+  const h = createHarness({
+    terminals: [makeRow({ worktreeId: 'w1', projectName: 'solo' })],
+  })
+  await startHarness(h)
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].repoId, null)
+  assert.equal(view.worktrees[0].projectLabel, 'solo')
+})
+
+test('repo 이름 캐시: 30초 이내 재호출하지 않고 새 repoId 등장 시에만 다시 호출한다', async () => {
+  const rows = [makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1' })]
+  const observer = createObserverFake({
+    rows,
+    repoNames: new Map([['r1', 'repo-one']]),
+  })
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // 새 repoId 등장. 마지막 시도 후 30초 이내에는 재시도하지 않는다.
+  observer.state.rows.push(makeRow({ handle: 'h2', worktreeId: 'r2::/x/b', paneKey: 'tab:leaf2' }))
+  await h.clock.advance(29000)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // 30초가 지나면 새 repoId 때문에 다시 호출한다.
+  await h.clock.advance(2000)
+  assert.equal(observer.repoNamesCalls.length, 2)
+})
+
+test('repo 이름 캐시: listRepoNames가 throw해도 tick과 전송이 정상 진행된다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1', projectName: 'zeta' }),
+  ]
+  const observer = createObserverFake({
+    rows,
+    onListRepoNames: () => {
+      throw new Error('boom')
+    },
+  })
+  const h = createHarness({ observer })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].projectLabel, 'zeta')
+
+  const t0 = h.clock.now()
+  h.coordinator.onAgentEvent({
+    worktreeId: 'r1::/x/a',
+    paneKey: 'tab:leaf1',
+    state: 'working',
+    receivedAt: t0,
+  })
+  await h.clock.settle()
+  h.coordinator.onAgentEvent({
+    worktreeId: 'r1::/x/a',
+    paneKey: 'tab:leaf1',
+    state: 'done',
+    receivedAt: t0 + 1000,
+  })
+  await h.clock.settle()
+  assert.equal(viewTerminal(h, 'r1::/x/a').phase, 'ARMED')
+
+  await advanceToDue(h, 'r1::/x/a')
+  assert.equal(h.sendCalls.length, 1)
+})
+
+test('repo 이름 캐시: listRepoNames가 pending이어도 tick과 전송이 진행된다', async () => {
+  let resolveRepoNames
+  const pending = new Promise((resolve) => {
+    resolveRepoNames = resolve
+  })
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1', projectName: 'zeta' }),
+  ]
+  const observer = createObserverFake({ rows, onListRepoNames: () => pending })
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.equal(observer.repoNamesCalls.length, 1)
+  assert.equal(h.coordinator.getRuntimeView().worktrees.length, 1)
+
+  const t0 = h.clock.now()
+  h.coordinator.onAgentEvent({
+    worktreeId: 'r1::/x/a',
+    paneKey: 'tab:leaf1',
+    state: 'working',
+    receivedAt: t0,
+  })
+  await h.clock.settle()
+  h.coordinator.onAgentEvent({
+    worktreeId: 'r1::/x/a',
+    paneKey: 'tab:leaf1',
+    state: 'done',
+    receivedAt: t0 + 1000,
+  })
+  await h.clock.settle()
+  assert.equal(viewTerminal(h, 'r1::/x/a').phase, 'ARMED')
+
+  await advanceToDue(h, 'r1::/x/a')
+  assert.equal(h.sendCalls.length, 1)
+
+  // pending을 해소해 dangling을 남기지 않는다.
+  resolveRepoNames(new Map([['r1', 'repo-one']]))
+  await h.clock.settle()
+})
+
+test('repo 이름 캐시: 진행 중 호출이 있으면 중복 호출하지 않고 5분 경과 시 재조회한다', async () => {
+  let resolveRepoNames
+  const pending = new Promise((resolve) => {
+    resolveRepoNames = resolve
+  })
+  const rows = [makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1' })]
+  const observer = createObserverFake({ rows, onListRepoNames: () => pending })
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // pending 동안 2분이 지나도 중복 호출하지 않는다.
+  await h.clock.advance(120000)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // 해소 후 5분 주기 갱신으로 다시 호출한다.
+  resolveRepoNames(new Map([['r1', 'repo-one']]))
+  await h.clock.settle()
+  await h.clock.advance(300000)
+  assert.ok(observer.repoNamesCalls.length >= 2)
+})
+
+test('repo 이름 캐시: 결과에 없는 repoId는 30초 후에도 재호출하지 않는다', async () => {
+  const rows = [makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1' })]
+  // 결과에 r1이 없는 빈 Map → missing으로 기록된다.
+  const observer = createObserverFake({ rows, repoNames: new Map() })
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  await h.clock.advance(31000)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // 새 repoId가 등장하면 그때만 재호출한다.
+  observer.state.rows.push(makeRow({ handle: 'h2', worktreeId: 'r2::/x/b', paneKey: 'tab:leaf2' }))
+  await h.clock.advance(2000)
+  assert.equal(observer.repoNamesCalls.length, 2)
+})
+
+test('repo 이름 캐시: 마지막 성공 후 5분이 지나면 주기 갱신한다', async () => {
+  const rows = [makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1' })]
+  const observer = createObserverFake({ rows, repoNames: new Map([['r1', 'repo-one']]) })
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  // 5분 직전에는 호출하지 않는다.
+  await h.clock.advance(298000)
+  assert.equal(observer.repoNamesCalls.length, 1)
+
+  await h.clock.advance(4000)
+  assert.equal(observer.repoNamesCalls.length, 2)
+})
+
+test('repo 이름 캐시: non-Map 결과는 무시하고 label 폴백을 유지한다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1', projectName: 'zeta' }),
+  ]
+  const observer = createObserverFake({ rows, onListRepoNames: () => ({ r1: 'bad-shape' }) })
+  const h = createHarness({ observer })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].projectLabel, 'zeta')
+  assert.equal(observer.repoNamesCalls.length, 1)
+})
+
+test('repo 이름 캐시: listRepoNames에 AbortSignal을 전달하고 stop 시 abort한다', async () => {
+  let seenSignal = null
+  const observer = createObserverFake({
+    rows: [makeRow({ handle: 'h1', worktreeId: 'r1::/x/a', paneKey: 'tab:leaf1' })],
+    repoNames: new Map([['r1', 'repo-one']]),
+  })
+  const baseList = observer.listRepoNames
+  observer.listRepoNames = async (options) => {
+    seenSignal = options?.signal ?? null
+    return baseList(options)
+  }
+  const h = createHarness({ observer })
+  await startHarness(h)
+  assert.ok(seenSignal instanceof AbortSignal)
+  assert.equal(seenSignal.aborted, false)
+
+  await h.coordinator.stop()
+  assert.equal(seenSignal.aborted, true)
 })
 
 // ---------------------------------------------------------------------------

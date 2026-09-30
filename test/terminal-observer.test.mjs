@@ -1,7 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createObserver, projectNameFromPath, branchNameFromRef } from '../src/terminal-observer.mjs'
+import {
+  createObserver,
+  projectNameFromPath,
+  branchNameFromRef,
+  repoIdFromWorktreeId,
+} from '../src/terminal-observer.mjs'
 import { RpcError } from '../src/rpc-client.mjs'
 import { REASON_CODES } from '../src/contracts.mjs'
 
@@ -286,6 +291,31 @@ test('list: worktreePath와 branch ref로 projectName/branchName을 만든다', 
   assert.equal(byHandle['h-none'].projectName, null)
   assert.equal(byHandle['h-none'].branchName, null)
   assert.ok(!('worktreePath' in byHandle['h-proj']))
+})
+
+test('repoIdFromWorktreeId: 첫 :: 앞부분, 없거나 빈 prefix/비문자열은 null', () => {
+  assert.equal(repoIdFromWorktreeId('repo-1::/a/b'), 'repo-1')
+  // 경로에 ::가 더 있어도 첫 번째 구분자 기준으로 자른다.
+  assert.equal(repoIdFromWorktreeId('repo-1::/a/b::c'), 'repo-1')
+  assert.equal(repoIdFromWorktreeId('::/a/b'), null)
+  assert.equal(repoIdFromWorktreeId('no-separator'), null)
+  assert.equal(repoIdFromWorktreeId(''), null)
+  assert.equal(repoIdFromWorktreeId(null), null)
+  assert.equal(repoIdFromWorktreeId(42), null)
+})
+
+test('list: worktreeId의 :: 앞부분을 repoId로 채운다', async () => {
+  const { observer } = observerFor({
+    'terminal.list': listResult([
+      summary({ handle: 'h-repo', worktreeId: 'repo-1::/a/b' }),
+      summary({ handle: 'h-bare', worktreeId: 'wt-1' }),
+    ]),
+  })
+  const catalog = await observer.list()
+  const byHandle = Object.fromEntries(catalog.terminals.map((row) => [row.handle, row]))
+  assert.equal(byHandle['h-repo'].repoId, 'repo-1')
+  assert.equal(byHandle['h-bare'].repoId, null)
+  assert.ok(!('worktreePath' in byHandle['h-repo']))
 })
 
 test('list: unsupportedReason 우선순위(agent → host → 연결)', async () => {
@@ -766,3 +796,83 @@ test('currentWorktree: hostCall 실패 시 null', async () => {
   const { observer } = observerFor({}, { hostCall })
   assert.equal(await observer.currentWorktree(catalog), null)
 })
+
+// ---------------------------------------------------------------------------
+// listRepoNames
+// ---------------------------------------------------------------------------
+
+test('listRepoNames: repoId → displayName 매핑을 만들고 method는 repo.list', async () => {
+  const { rpc, observer } = observerFor({
+    'repo.list': {
+      repos: [
+        { id: 'repo-1', displayName: 'Route Dashboard', path: '/Users/me/dev/route-dashboard' },
+        { id: 'repo-2', displayName: 'Keepalive Plugin', path: '/Users/me/dev/plugin' },
+      ],
+    },
+  })
+  const names = await observer.listRepoNames()
+  assert.ok(names instanceof Map)
+  assert.equal(names.size, 2)
+  assert.equal(names.get('repo-1'), 'Route Dashboard')
+  assert.equal(names.get('repo-2'), 'Keepalive Plugin')
+
+  const call = rpc.callsFor('repo.list')[0]
+  assert.equal(call.method, 'repo.list')
+  assert.equal(call.params, null)
+  assert.equal(call.options.timeoutMs, 5000)
+})
+
+test('listRepoNames: id/displayName이 잘못된 항목은 버리고 displayName은 200자로 자른다', async () => {
+  const { observer } = observerFor({
+    'repo.list': {
+      repos: [
+        { id: 'ok', displayName: 'Name' },
+        { id: '', displayName: 'NoId' },
+        { id: 'no-name', displayName: '' },
+        { id: 'missing-name' },
+        { id: 42, displayName: 'NumericId' },
+        { displayName: 'MissingId' },
+        'not-an-object',
+        { id: 'long', displayName: 'y'.repeat(250) },
+      ],
+    },
+  })
+  const names = await observer.listRepoNames()
+  assert.equal(names.size, 2)
+  assert.equal(names.get('ok'), 'Name')
+  assert.equal(names.get('long').length, 200)
+  assert.ok(!names.has(''))
+  assert.ok(!names.has('no-name'))
+  assert.ok(!names.has('missing-name'))
+})
+
+test('listRepoNames: rpc throw 시 예외 없이 null', async () => {
+  const { observer } = observerFor({ 'repo.list': new RpcError('runtime_unavailable', 'down') })
+  assert.equal(await observer.listRepoNames(), null)
+})
+
+test('listRepoNames: repos가 배열이 아니거나 결과가 객체가 아니면 null', async () => {
+  const notArray = observerFor({ 'repo.list': { repos: null } })
+  assert.equal(await notArray.observer.listRepoNames(), null)
+
+  const notObject = observerFor({ 'repo.list': 'nope' })
+  assert.equal(await notObject.observer.listRepoNames(), null)
+
+  const nullResult = observerFor({ 'repo.list': null })
+  assert.equal(await nullResult.observer.listRepoNames(), null)
+})
+
+test('listRepoNames: 빈 repos는 빈 Map', async () => {
+  const { observer } = observerFor({ 'repo.list': { repos: [] } })
+  const names = await observer.listRepoNames()
+  assert.ok(names instanceof Map)
+  assert.equal(names.size, 0)
+})
+
+test('listRepoNames: signal을 옵션으로 전달한다', async () => {
+  const controller = new AbortController()
+  const { rpc, observer } = observerFor({ 'repo.list': { repos: [] } })
+  await observer.listRepoNames({ signal: controller.signal })
+  assert.equal(rpc.callsFor('repo.list')[0].options.signal, controller.signal)
+})
+

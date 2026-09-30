@@ -402,7 +402,7 @@ POST /api/action -> Action -> DashboardSnapshot
 
 targetId는 worker가 발급한 opaque random ID로 snapshot에 노출, 현재 catalog에 속한 것만 허용한다. 브라우저가 보낸 worktreeId/terminalHandle을 RPC로 직접 넘기지 않는다. 오래된 revision은 409, unknown target 404, invalid payload 400, unauthorized 401, storage/unavailable 503. config edit에는 runtimeUserDataPath만 입력 가능하며 arbitrary file read endpoint는 없다.
 
-DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readAt,reason?},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시),worktrees:[{id,label,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,dueAt,expiresAt,charged,confirmed,needsReview}]}],diagnostics:[{at,level,code,targetId?}]}. 원시 authToken·binding·draft·screen·전체 settings·worktree 경로는 금지. 표시 label은 목록의 branch/title에서 생성하고 branch가 같아도 opaque ID가 다르면 별개 row다.
+DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readAt,reason?},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시),worktrees:[{id,worktreeHash,projectId,projectLabel,label,branch,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,dueAt,expiresAt,charged,confirmed,needsReview}]}],diagnostics:[{at,level,code,targetId?}]}. 원시 authToken·binding·draft·screen·전체 settings·repoId·worktree 경로는 금지. worktree는 worktreeId의 repoId(`${repoId}::${path}`)를 기준으로 프로젝트로 묶는다. 프로젝트 이름은 런타임 `repo.list`의 `displayName`을 사용하고, 조회 실패 시 같은 저장소 worktree의 label 중 사전순 최솟값을 쓴다. 화면은 `프로젝트 | 워크트리 | 세션` 3열 compact 행으로 표시하며 원시 repoId와 경로는 노출하지 않는다.
 
 ## 8. 로그·진단과 장애 처리
 

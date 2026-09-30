@@ -399,6 +399,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     'screen',
     'tail',
     'settings',
+    'repoId',
     'worktreePath',
     'userDataPath',
     'endpoint',

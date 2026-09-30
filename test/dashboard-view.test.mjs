@@ -194,6 +194,45 @@ test('toViewModel: branch가 없으면 빈 문자열', () => {
   assert.equal(vm.worktrees[0].branch, '');
 });
 
+test('toViewModel: 같은 projectId의 워크트리를 한 프로젝트로 묶고 순서를 유지한다', () => {
+  const source = makeSnapshot().worktrees[0];
+  const snap = makeSnapshot({ worktrees: [
+    { ...source, id: 'a', label: 'main', projectId: 'repo-a', projectLabel: 'mtt-claude-plugins' },
+    { ...source, id: 'b', label: 'other', projectId: 'repo-b', projectLabel: 'another' },
+    { ...source, id: 'c', label: 'rusalka', projectId: 'repo-a', projectLabel: 'mtt-claude-plugins' },
+  ] });
+  const vm = toViewModel(snap, 0);
+  assert.deepEqual(vm.worktrees.map((wt) => wt.id), ['a', 'b', 'c']);
+  assert.deepEqual(vm.projects.map((project) => project.key), ['repo-a', 'repo-b']);
+  assert.equal(vm.projects[0].label, 'mtt-claude-plugins');
+  assert.deepEqual(vm.projects[0].worktrees.map((wt) => wt.id), ['a', 'c']);
+  assert.strictEqual(vm.projects[0].worktrees[1], vm.worktrees[2]);
+});
+
+test('toViewModel: projectId가 없으면 projectLabel과 label로 묶는다', () => {
+  const source = makeSnapshot().worktrees[0];
+  const snap = makeSnapshot({ worktrees: [
+    { ...source, id: 'a', label: 'main', projectId: null, projectLabel: 'repo' },
+    { ...source, id: 'b', label: 'branch', projectLabel: 'repo' },
+    { ...source, id: 'c', label: 'solo' },
+    { ...source, id: 'd', label: 'solo', projectLabel: '' },
+  ] });
+  const vm = toViewModel(snap, 0);
+  assert.deepEqual(vm.projects.map((project) => project.key), ['label:repo', 'label:solo']);
+  assert.deepEqual(vm.projects.map((project) => project.worktrees.map((wt) => wt.id)),
+    [['a', 'b'], ['c', 'd']]);
+  assert.equal(vm.worktrees[2].projectId, null);
+  assert.equal(vm.worktrees[2].projectLabel, 'solo');
+});
+
+test('toViewModel: 구버전 스냅숏도 label 기준 프로젝트를 만든다', () => {
+  const vm = toViewModel(makeSnapshot(), 0);
+  assert.equal(vm.worktrees[0].projectId, null);
+  assert.equal(vm.worktrees[0].projectLabel, 'main');
+  assert.deepEqual(vm.projects.map(({ key, label }) => ({ key, label })),
+    [{ key: 'label:main', label: 'main' }]);
+});
+
 test('toViewModel: client elapsed time advances the countdown', () => {
   const vm = toViewModel(makeSnapshot(), 3000);
   const t1 = vm.worktrees[0].terminals[0];
@@ -267,6 +306,7 @@ test('toViewModel: diagnostics keep only the most recent 20 entries', () => {
 test('toViewModel: tolerates an empty/garbage snapshot without throwing', () => {
   const vm = toViewModel({}, 0);
   assert.equal(vm.worktrees.length, 0);
+  assert.deepEqual(vm.projects, []);
   assert.equal(vm.paused, false);
   assert.equal(vm.connection.connected, false);
 });

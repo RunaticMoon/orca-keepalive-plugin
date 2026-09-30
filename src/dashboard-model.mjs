@@ -8,6 +8,7 @@
  *
  * 공개 스냅숏에는 비밀·경로·draft·원문 식별자를 절대 넣지 않는다:
  *  - worktreeId/paneKey/handle/ptyId/authToken/draft는 스냅숏 JSON에 없다.
+ *  - repoId 원문은 노출하지 않고, 프로젝트 그룹에는 불투명한 해시만 쓴다.
  *  - 대상은 프로세스 수명 동안 안정적인 opaque `targetId`로만 노출한다.
  *  - 예외적으로 사용자가 직접 입력한 `config.runtimeUserDataPath`만 허용한다.
  *
@@ -121,6 +122,15 @@ function terminalKey(worktreeId, paneKey) {
  */
 function worktreeHashOf(worktreeId) {
   return crypto.createHash('sha256').update(worktreeId, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
+ * 원시 repoId의 프로젝트 그룹 식별용 불투명 해시.
+ * @param {string} repoId
+ * @returns {string}
+ */
+function projectHashOf(repoId) {
+  return `p${crypto.createHash('sha256').update(repoId, 'utf8').digest('hex').slice(0, 16)}`;
 }
 
 /**
@@ -472,6 +482,9 @@ export function createDashboardModel({
         if (worktreeId === null) {
           continue;
         }
+        const repoId = nonEmptyStringOrNull(rawWorktree.repoId);
+        const label = nonEmptyStringOrNull(rawWorktree.label) ?? '(이름 없음)';
+        const projectLabel = (nonEmptyStringOrNull(rawWorktree.projectLabel) ?? label).slice(0, 200);
         const worktreeScope = { userDataKey, profileId, worktreeId };
         const wtKey = worktreeKey(worktreeId);
         const wtId = ensureId(wtKey, 'worktree', { ...worktreeScope, paneKey: null });
@@ -539,12 +552,14 @@ export function createDashboardModel({
         worktrees.push({
           id: wtId,
           worktreeHash: worktreeHashOf(worktreeId),
-          label: nonEmptyStringOrNull(rawWorktree.label) ?? '(이름 없음)',
+          label,
           branch: nonEmptyStringOrNull(rawWorktree.branch),
           enabled,
           effectiveEnabled: gate.effectiveEnabled,
           reason: gate.reason,
           terminals,
+          projectId: repoId === null ? null : projectHashOf(repoId),
+          projectLabel,
         });
       }
     }
