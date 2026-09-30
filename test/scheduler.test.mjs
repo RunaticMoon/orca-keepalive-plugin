@@ -855,3 +855,130 @@ test('RESTORE_EPOCH 복원 뒤 중복 working/done은 basisAt을 유지한다', 
   state = reduce(state, hook('done', done + 9000));
   assert.equal(state.epoch.basisAt, done - 5000);
 });
+
+// ---------------------------------------------------------------------------
+// RESTORE_CACHE_HISTORY: 표시 이력 전용 복원(예약 없음)
+// ---------------------------------------------------------------------------
+
+/** RESTORE_CACHE_HISTORY 입력을 만든다. */
+function restoreHistory(expired, opts = {}) {
+  const input = { type: 'RESTORE_CACHE_HISTORY', expired };
+  if ('reason' in opts) {
+    input.reason = opts.reason;
+  }
+  return input;
+}
+
+test('RESTORE_CACHE_HISTORY: 초기 상태에서 만료/취소 이력을 복원한다', () => {
+  const base = initialTargetState(TARGET);
+
+  const expired = reduce(base, restoreHistory(true));
+  assert.equal(expired.phase, 'EXPIRED');
+  assert.equal(expired.reason, 'EXPIRED');
+  assert.equal(expired.seenWorking, false);
+  assert.equal(expired.epoch, null);
+  assert.equal(expired.attempt, null);
+  // 예약·단조 카운터는 변하지 않는다.
+  assert.equal(expired.epochSeq, base.epochSeq);
+  assert.equal(expired.budgetResetSeq, base.budgetResetSeq);
+  assert.equal(expired.selfTurnSeq, base.selfTurnSeq);
+  assert.equal(expired.generation, base.generation);
+
+  const suspended = reduce(base, restoreHistory(false, { reason: 'OUTPUT_ACTIVE' }));
+  assert.equal(suspended.phase, 'SUSPENDED');
+  assert.equal(suspended.reason, 'OUTPUT_ACTIVE');
+  assert.equal(suspended.epoch, null);
+  assert.equal(suspended.attempt, null);
+
+  // reason이 문자열이 아니면 NO_FRESH_TURN.
+  const noReason = reduce(base, restoreHistory(false));
+  assert.equal(noReason.phase, 'SUSPENDED');
+  assert.equal(noReason.reason, 'NO_FRESH_TURN');
+
+  const badReason = reduce(base, restoreHistory(false, { reason: 42 }));
+  assert.equal(badReason.phase, 'SUSPENDED');
+  assert.equal(badReason.reason, 'NO_FRESH_TURN');
+});
+
+test('RESTORE_CACHE_HISTORY: 이미 진행 중/예약/검토 상태면 거부한다', () => {
+  const busy = reduce(initialTargetState(TARGET), hook('working', 1000));
+  assert.equal(busy.phase, 'BUSY');
+
+  const armedState = armed(2000);
+  const review = reduce(awaitingTurn(3100), {
+    type: 'TICK',
+    now: 3100 + TIMING.turnStartConfirmMs + 1,
+  });
+  assert.equal(review.phase, 'NEEDS_REVIEW');
+
+  const seen = { ...initialTargetState(TARGET), seenWorking: true };
+  const lastWorking = { ...initialTargetState(TARGET), lastHook: 'working' };
+
+  for (const state of [busy, armedState, review, seen, lastWorking]) {
+    assert.deepEqual(reduce(state, restoreHistory(true)), state);
+    assert.deepEqual(reduce(state, restoreHistory(false, { reason: 'X' })), state);
+  }
+});
+
+test('RESTORE_CACHE_HISTORY 복원 뒤 단독 done은 예약하지 않고 phase/reason을 유지한다', () => {
+  let expired = reduce(initialTargetState(TARGET), restoreHistory(true));
+  expired = reduce(expired, hook('done', 9000));
+  assert.equal(expired.phase, 'EXPIRED');
+  assert.equal(expired.reason, 'EXPIRED');
+  assert.equal(expired.epoch, null);
+  assert.equal(expired.lastHook, 'done');
+  assert.equal(expired.lastHookAt, 9000);
+
+  let suspended = reduce(initialTargetState(TARGET), restoreHistory(false, { reason: 'OUTPUT_ACTIVE' }));
+  suspended = reduce(suspended, hook('done', 9000));
+  assert.equal(suspended.phase, 'SUSPENDED');
+  assert.equal(suspended.reason, 'OUTPUT_ACTIVE');
+  assert.equal(suspended.epoch, null);
+
+  // 초기 UNKNOWN의 기존 첫 done 동작은 유지한다.
+  const unknown = reduce(initialTargetState(TARGET), hook('done', 9000));
+  assert.equal(unknown.phase, 'UNKNOWN');
+  assert.equal(unknown.reason, 'NO_FRESH_TURN');
+});
+
+test('RESTORE_CACHE_HISTORY 복원 뒤 working→BUSY→done→ARMED', () => {
+  for (const expired of [true, false]) {
+    let state = reduce(initialTargetState(TARGET), restoreHistory(expired, { reason: 'OUTPUT_ACTIVE' }));
+    state = reduce(state, hook('working', 10000));
+    assert.equal(state.phase, 'BUSY');
+    assert.equal(state.epoch, null);
+    state = reduce(state, hook('done', 20000));
+    assert.equal(state.phase, 'ARMED');
+    assert.equal(state.epoch.id, 1);
+    assert.equal(state.epoch.doneAt, 20000);
+    assert.equal(state.reason, null);
+  }
+});
+
+test('RESTORE_CACHE_HISTORY: NEEDS_REVIEW 상태는 그대로 유지한다', () => {
+  const review = reduce(awaitingTurn(3100), {
+    type: 'TICK',
+    now: 3100 + TIMING.turnStartConfirmMs + 1,
+  });
+  const after = reduce(review, restoreHistory(true));
+  assert.equal(after.phase, 'NEEDS_REVIEW');
+  assert.equal(after.reason, 'PARTIAL_OR_UNKNOWN_SEND');
+  assert.deepEqual(after, review);
+});
+
+test('RESTORE_CACHE_HISTORY는 입력 state와 중첩 객체를 변경하지 않는다', () => {
+  const state = initialTargetState(TARGET);
+  const before = JSON.stringify(state);
+  reduce(state, restoreHistory(true));
+  reduce(state, restoreHistory(false, { reason: 'OUTPUT_ACTIVE' }));
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(state.phase, 'UNKNOWN');
+  assert.equal(state.epoch, null);
+});
+
+test('deepFreeze한 state에 RESTORE_CACHE_HISTORY를 적용해도 throw하지 않는다', () => {
+  const frozen = deepFreeze(initialTargetState(TARGET));
+  assert.doesNotThrow(() => reduce(frozen, restoreHistory(true)));
+  const rejected = deepFreeze(armed(2000));
+  assert.doesNotThrow(() => reduce(rejected, restoreHistory(false, { reason: 'X' })));
+});

@@ -17,6 +17,8 @@
  * - `REVIEW_CLEARED`: NEEDS_REVIEW를 해제한다.
  * - `EXPIRE`: 'expire' 결정 뒤 epoch를 닫는다.
  * - `RESTORE_EPOCH`: 리로드 전 저장한 doneAt(및 basisAt)으로 초기 상태에 epoch를 복원한다.
+ * - `RESTORE_CACHE_HISTORY`: 표시 이력 전용 복원. 초기 상태에 만료/취소 phase만 세우고
+ *   예약(epoch/attempt)은 만들지 않는다.
  *
  * @module scheduler
  */
@@ -259,8 +261,11 @@ function reduceHook(state, input) {
   next.lastHook = 'done';
 
   if (state.seenWorking === false) {
-    // 첫 done은 예약하지 않는다.
-    next.reason = 'NO_FRESH_TURN';
+    // 첫 done은 예약하지 않는다. 초기 관측 부재(UNKNOWN)에서만 안내 문구를 갱신하고,
+    // 복원된 만료/중단 이력(EXPIRED/SUSPENDED)의 phase·reason은 덮지 않는다.
+    if (state.phase === 'UNKNOWN') {
+      next.reason = 'NO_FRESH_TURN';
+    }
     return next;
   }
   if (
@@ -558,6 +563,39 @@ function reduceRestoreEpoch(state, input) {
 }
 
 /**
+ * 표시 이력 전용 복원(§2-5): 예약 이력이 전혀 없는 초기 상태에서만 저장된 만료/취소
+ * 상태를 되살린다. 예약(epoch/attempt)은 만들지 않고, seenWorking=false와 모든 단조
+ * 카운터를 그대로 둔다. 조건이 맞지 않으면 상태를 변경하지 않고 반환한다.
+ * - expired=true: 만료 이력 → EXPIRED/EXPIRED.
+ * - expired=false: 만료 전 취소 이력 → SUSPENDED(입력 reason이 문자열이면 그 값,
+ *   아니면 NO_FRESH_TURN).
+ * @param {SchedulerState} state
+ * @param {{expired?:boolean, reason?:string, at?:number}} input
+ * @returns {SchedulerState}
+ */
+function reduceRestoreCacheHistory(state, input) {
+  const eligible =
+    typeof input.expired === 'boolean' &&
+    state.phase === 'UNKNOWN' &&
+    state.epoch === null &&
+    state.attempt === null &&
+    state.seenWorking === false &&
+    state.lastHook !== 'working';
+  if (!eligible) {
+    return copyState(state);
+  }
+  const next = copyState(state);
+  if (input.expired === true) {
+    next.phase = 'EXPIRED';
+    next.reason = 'EXPIRED';
+  } else {
+    next.phase = 'SUSPENDED';
+    next.reason = typeof input.reason === 'string' ? input.reason : 'NO_FRESH_TURN';
+  }
+  return next;
+}
+
+/**
  * target 상태 머신 reducer. 알 수 없는 type은 조용히 무시한다(throw 금지).
  * 어떤 경우에도 입력 state를 변경하지 않고 새 객체를 반환한다.
  * @param {SchedulerState} state
@@ -597,6 +635,8 @@ export function reduceTarget(state, input) {
       return reduceExpire(state, input);
     case 'RESTORE_EPOCH':
       return reduceRestoreEpoch(state, input);
+    case 'RESTORE_CACHE_HISTORY':
+      return reduceRestoreCacheHistory(state, input);
     default:
       return copyState(state);
   }
