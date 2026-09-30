@@ -165,7 +165,7 @@ test('expiry cause: every allowed reason has separate past-tense Korean text', (
 test('cache statuses: all user-facing states come from cacheStatus, including no reservation variants', () => {
   const now = new Date(2026, 8, 30, 12, 0).getTime();
   const future = now + 60_000;
-  const base = { phase: 'ARMED', reason: 'NO_FRESH_TURN', expiresAt: future, expiredAt: null, expireCause: null };
+  const base = { phase: 'ARMED', reason: 'NO_FRESH_TURN', reservationNote: null, expiresAt: future, expiredAt: null, expireCause: null };
   const cases = [
     ['working', '캐시 유지 중 · 작업 진행 중'],
     ['scheduled', `캐시 유지 중 · 만료 예정 ${formatCacheTime(future, now)}`],
@@ -182,12 +182,25 @@ test('cache statuses: all user-facing states come from cacheStatus, including no
     `캐시 만료됨 · ${formatCacheTime(now, now)} · 입력창 초안이 감지되어 전송하지 못함`);
   assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'expired', expiredAt: now, expireCause: null }, now).text,
     `캐시 만료됨 · ${formatCacheTime(now, now)} · 전송 차단 사유 기록 없음`);
-  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation' }, now).text,
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', reservationNote: 'safety-cutoff' }, now).text,
     `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 ${formatCacheTime(future, now)}`);
-  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', phase: 'UNKNOWN', expiresAt: null }, now).text,
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', reservationNote: 'initial', phase: 'UNKNOWN', expiresAt: null }, now).text,
     '예약 없음 · 플러그인 시작 후 아직 작업의 시작과 완료를 관측하지 못함');
   assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', expiresAt: null }, now).text,
     '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다');
+});
+
+test('reservation note: review clear does not infer initial or safety cutoff from phase, reason, or future expiry', () => {
+  const now = SERVER_NOW;
+  const terminal = {
+    cacheStatus: 'no-reservation', reservationNote: null,
+    phase: 'UNKNOWN', reason: 'NO_FRESH_TURN',
+    expiresAt: now + 60_000, expiredAt: null, supported: true,
+  };
+  const display = cacheStatusDisplay(terminal, now);
+  assert.equal(display.text, '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다');
+  assert.doesNotMatch(display.text, /안전 전송|플러그인 시작 후|만료 예정/);
+  assert.equal(display.at, undefined, '이력의 미래 만료 시각은 이 상태의 보조 정보로 표시하지 않음');
 });
 
 test('cache times: same day is compact; previous day includes date', () => {
@@ -201,15 +214,24 @@ test('toViewModel: cache fields pass through safely and missing fields become no
   const first = snap.worktrees[0].terminals[0];
   first.cacheState = 'kept';
   first.cacheStatus = 'scheduled';
+  first.reservationNote = 'initial';
   first.indicatorOn = true;
   first.expiredAt = null;
   first.expireCause = 'DRAFT_PRESENT';
   first.blockedReason = 'DRAFT_PRESENT';
   const vm = toViewModel(snap, 0);
   assert.equal(vm.worktrees[0].terminals[0].cacheStatus, 'scheduled');
+  assert.equal(vm.worktrees[0].terminals[0].reservationNote, null, '예약 없음 외 상태의 메모는 숨김');
   assert.equal(vm.worktrees[0].terminals[0].indicatorOn, true);
   assert.equal(vm.worktrees[0].terminals[0].expireCause, 'DRAFT_PRESENT');
   assert.equal(vm.worktrees[0].terminals[2].cacheStatus, 'no-reservation');
+  assert.equal(vm.worktrees[0].terminals[2].reservationNote, null);
+  first.cacheStatus = 'no-reservation';
+  assert.equal(toViewModel(snap, 0).worktrees[0].terminals[0].reservationNote, 'initial');
+  first.reservationNote = 'safety-cutoff';
+  assert.equal(toViewModel(snap, 0).worktrees[0].terminals[0].reservationNote, 'safety-cutoff');
+  first.reservationNote = 'not-a-note';
+  assert.equal(toViewModel(snap, 0).worktrees[0].terminals[0].reservationNote, null);
   first.cacheStatus = 'not-a-status';
   first.expireCause = 'private arbitrary value';
   const invalid = toViewModel(snap, 0).worktrees[0].terminals[0];
@@ -778,6 +800,8 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
       id: 't-noagent',
       title: 'bash',
       phase: 'UNKNOWN',
+      cacheStatus: 'no-reservation',
+      reservationNote: 'initial',
       enabledOverride: null,
       effectiveEnabled: false,
       reason: 'NO_AGENT',
@@ -793,6 +817,8 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
       id: 't-codex',
       title: 'codex',
       phase: 'UNKNOWN',
+      cacheStatus: 'no-reservation',
+      reservationNote: 'initial',
       enabledOverride: null,
       effectiveEnabled: false,
       reason: 'UNSUPPORTED_AGENT',
@@ -879,6 +905,8 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     // NO_AGENT: 이유 문구와 '읽기 전용 · 미지원' 표시가 모두 없어야 한다.
     assert.equal(findAllByClass(noAgentRow, 'terminal-reason').length, 0);
     assert.equal(findAllByClass(noAgentRow, 'readonly-note').length, 0);
+    assert.equal(findAllByClass(noAgentRow, 'terminal-cache-text')[0]?.textContent,
+      '캐시 유지 대상 아님 · 일반 터미널');
 
     // UNSUPPORTED_AGENT(codex 등): 둘 다 있고 문구가 그대로여야 한다.
     const reasonNode = findAllByClass(codexRow, 'terminal-reason');
@@ -887,6 +915,11 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     assert.equal(readonlyNode.length, 1);
     assert.equal(readonlyNode[0].textContent, '읽기 전용 · 미지원');
     assert.equal(reasonNode[0].textContent, '이 터미널의 에이전트는 지원하지 않습니다.');
+    assert.equal(findAllByClass(codexRow, 'terminal-cache-text')[0]?.textContent,
+      '캐시 유지 미지원 · 이 터미널의 에이전트는 지원하지 않습니다.');
+    for (const row of [noAgentRow, codexRow]) {
+      assert.doesNotMatch(findAllByClass(row, 'terminal-cache-text')[0]?.textContent ?? '', /플러그인 시작 후/);
+    }
     for (const source of terminals.slice(2)) {
       const row = rows.find((candidate) => titleOf(candidate) === source.title);
       assert.ok(row, source.cacheStatus);

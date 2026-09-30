@@ -139,6 +139,11 @@ function fullCacheTime(at) {
 
 /** User-facing status is selected from the cache contract, never from phase alone. */
 export function cacheStatusDisplay(terminal, now) {
+  if (terminal.supported === false) {
+    return terminal.reason === 'NO_AGENT'
+      ? { category: 'none', label: '대상 아님', text: '캐시 유지 대상 아님 · 일반 터미널' }
+      : { category: 'none', label: '미지원', text: `캐시 유지 미지원 · ${Object.hasOwn(REASON_TEXT, terminal.reason) ? reasonText(terminal.reason) : '이 터미널에서는 캐시 유지를 지원하지 않습니다.'}` };
+  }
   const status = terminal.needsReview === true || terminal.cacheState === 'review'
     ? 'review'
     : CACHE_STATUSES.has(terminal.cacheStatus) ? terminal.cacheStatus : 'no-reservation';
@@ -154,12 +159,12 @@ export function cacheStatusDisplay(terminal, now) {
   if (status === 'interactive-wait') return { category: 'stopped', label: '유지 중단', text: '유지 중단 · 권한·입력 응답 대기' };
   if (status === 'suspended') return { category: 'stopped', label: '유지 중단', text: `유지 중단 · ${Object.hasOwn(REASON_TEXT, terminal.reason) ? reasonText(terminal.reason) : '현재 예약이 중단되었습니다.'}` };
   if (status === 'review') return { category: 'review', label: '확인 필요', text: '확인 필요 · 전송 결과를 확인하세요' };
-  if (expiry !== null && expiry > now && terminal.expiredAt === null) {
+  if (terminal.reservationNote === 'safety-cutoff' && expiry !== null) {
     return { category: 'none', label: '예약 없음', text: `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 ${time(expiry)}`, at: expiry };
   }
   return {
     category: 'none', label: '예약 없음',
-    text: terminal.phase === 'UNKNOWN' && terminal.reason === 'NO_FRESH_TURN'
+    text: terminal.reservationNote === 'initial'
       ? '예약 없음 · 플러그인 시작 후 아직 작업의 시작과 완료를 관측하지 못함'
       : '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다',
   };
@@ -364,6 +369,8 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
       phase: typeof terminal.phase === 'string' ? terminal.phase : 'UNKNOWN',
       cacheState: ['kept', 'none', 'review'].includes(terminal.cacheState) ? terminal.cacheState : 'none',
       cacheStatus: CACHE_STATUSES.has(terminal.cacheStatus) ? terminal.cacheStatus : 'no-reservation',
+      reservationNote: terminal.cacheStatus === 'no-reservation' && ['initial', 'safety-cutoff'].includes(terminal.reservationNote)
+        ? terminal.reservationNote : null,
       indicatorOn: terminal.indicatorOn === true,
       expiredAt,
       expireCause: typeof terminal.expireCause === 'string' && Object.hasOwn(EXPIRE_CAUSE_TEXT, terminal.expireCause) ? terminal.expireCause : null,
