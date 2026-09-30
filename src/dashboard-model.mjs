@@ -26,6 +26,7 @@ import {
   CACHE_STATES,
   CACHE_STATUSES,
   EXPIRE_CAUSE_REASONS,
+  RESERVATION_NOTES,
   TITLE_PREFIXES,
   TITLE_PREFIX_PRIORITY,
 } from './contracts.mjs';
@@ -57,6 +58,7 @@ const WORKTREE_IGNORED_POLICY_REASONS = new Set(['LIMIT_REACHED', 'PARTIAL_OR_UN
 const CACHE_STATE_SET = new Set(CACHE_STATES);
 const CACHE_STATUS_SET = new Set(CACHE_STATUSES);
 const EXPIRE_CAUSE_REASON_SET = new Set(EXPIRE_CAUSE_REASONS);
+const RESERVATION_NOTE_SET = new Set(RESERVATION_NOTES);
 
 /** 캐시 표시 필드 누락·불량 값의 기본값. §2-1. */
 const DEFAULT_CACHE_STATE = 'none';
@@ -122,14 +124,14 @@ function nonEmptyStringOrNull(value) {
  * 런타임 뷰 terminal의 캐시 표시 필드를 allowlist로 검증·정규화한다(§2-1).
  *
  * 알려진 enum·유한 timestamp·boolean만 복사하고, 누락·불량 값은
- * `cacheState='none'`, `cacheStatus='no-reservation'`, 나머지 null,
- * `indicatorOn=false`로 정규화한다. 알 수 없는 문자열(초안·제목·오류 원문 등)은
- * 어떤 형태로도 추가 노출하지 않는다. 영속 budget이 `needsReview`면 실제 캐시
- * 상태보다 사용자 확인 필요 표시를 우선해 `review`로 덮는다.
+ * `cacheState='none'`, `cacheStatus='no-reservation'`, `reservationNote=null`,
+ * 나머지 null, `indicatorOn=false`로 정규화한다. 알 수 없는 문자열(초안·제목·오류
+ * 원문 등)은 어떤 형태로도 추가 노출하지 않는다. 영속 budget이 `needsReview`면 실제
+ * 캐시 상태보다 사용자 확인 필요 표시를 우선해 `review`로 덮는다.
  *
  * @param {unknown} rawTerminal
  * @param {boolean} needsReview
- * @returns {{cacheState: string, cacheStatus: string, indicatorOn: boolean, dueAt: number|null, expiresAt: number|null, expiredAt: number|null, expireCause: string|null, blockedReason: string|null}}
+ * @returns {{cacheState: string, cacheStatus: string, reservationNote: 'initial'|'safety-cutoff'|null, indicatorOn: boolean, dueAt: number|null, expiresAt: number|null, expiredAt: number|null, expireCause: string|null, blockedReason: string|null}}
  */
 function cacheDisplayOf(rawTerminal, needsReview) {
   const raw = isPlainObject(rawTerminal) ? /** @type {Record<string, unknown>} */ (rawTerminal) : {};
@@ -145,6 +147,9 @@ function cacheDisplayOf(rawTerminal, needsReview) {
   return {
     cacheState,
     cacheStatus,
+    reservationNote: RESERVATION_NOTE_SET.has(raw.reservationNote)
+      ? /** @type {'initial'|'safety-cutoff'} */ (raw.reservationNote)
+      : null,
     indicatorOn: raw.indicatorOn === true,
     dueAt: finiteOrNull(raw.dueAt),
     expiresAt: finiteOrNull(raw.expiresAt),
@@ -723,6 +728,7 @@ export function createDashboardModel({
             reason: terminalGateResult.reason,
             cacheState: cache.cacheState,
             cacheStatus: cache.cacheStatus,
+            reservationNote: cache.reservationNote,
             indicatorOn: cache.indicatorOn,
             dueAt: cache.dueAt,
             expiresAt: cache.expiresAt,

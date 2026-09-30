@@ -47,23 +47,38 @@ function isFiniteNumber(value) {
  * `expiresAt`은 이력이 있으면 이력의 값을 예약 취소 후에도 유지한다.
  * `blockedReason`은 이력의 마지막 차단 reason(만료 전 포함)이다.
  *
+ * `reservationNote`는 cacheStatus='no-reservation'일 때만 채운다(검토 지적 1+2).
+ * - `observed === false`(이번 실행에서 아무 관측도 없음)면 'initial'.
+ * - `expiredBy === 'cutoff'`(10초 조기 EXPIRE)이고 이력이 아직 실제 만료 전이면 'safety-cutoff'.
+ * - 그 밖(검토 해제·CLOCK_GAP·handle 변경 등)은 null.
+ *
  * @param {{
  *   state: any,
  *   history: import('./contracts.mjs').CacheHistory|null,
  *   now: number,
  *   needsReview?: boolean,
  *   dueAt?: number|null,
+ *   expiredBy?: 'cutoff'|'clock-gap'|null,
+ *   observed?: boolean,
  * }} input
  * @returns {{
  *   cacheState: 'kept'|'none'|'review',
  *   cacheStatus: 'working'|'scheduled'|'sending'|'awaiting-turn'|'expired'|'no-reservation'|'interactive-wait'|'suspended'|'review',
+ *   reservationNote: 'initial'|'safety-cutoff'|null,
  *   expiresAt: number|null,
  *   expiredAt: number|null,
  *   expireCause: string|null,
  *   blockedReason: string|null,
  * }}
  */
-export function projectCacheStatus({ state, history, now, needsReview } = /** @type {any} */ ({})) {
+export function projectCacheStatus({
+  state,
+  history,
+  now,
+  needsReview,
+  expiredBy,
+  observed,
+} = /** @type {any} */ ({})) {
   const phase = isObject(state) && typeof state.phase === 'string' ? state.phase : null
   const reason = isObject(state) && typeof state.reason === 'string' ? state.reason : null
   const epoch = isObject(state) ? state.epoch : null
@@ -83,11 +98,39 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
   const expiredAt = historyExpiredAt !== null ? historyExpiredAt : pastKnownExpiry ? historyExpiresAt : null
   const expiresAt = historyExpiresAt
 
+  // 10초 조기 EXPIRE(cutoff)로 닫힌 예약 구간: 이력이 아직 실제 만료 전일 때만.
+  // CLOCK_GAP으로 생긴 EXPIRED(expiredBy='clock-gap')는 여기 해당하지 않는다.
+  const cutoff =
+    expiredBy === 'cutoff' &&
+    historyExpiresAt !== null &&
+    historyExpiredAt === null &&
+    nowMs < historyExpiresAt
+
+  /**
+   * cacheStatus='no-reservation' 문구 구분. 초기 관측 부재('initial')를
+   * 검토 해제·TARGET_CHANGED·CLOCK_GAP 뒤의 '예약 없음'과 구분한다.
+   * @param {string} cacheStatus
+   * @returns {'initial'|'safety-cutoff'|null}
+   */
+  const noteFor = (cacheStatus) => {
+    if (cacheStatus !== 'no-reservation') {
+      return null
+    }
+    if (observed === false) {
+      return 'initial'
+    }
+    if (cutoff) {
+      return 'safety-cutoff'
+    }
+    return null
+  }
+
   // 1. 검토 필요가 항상 우선한다.
   if (needsReview === true || phase === 'NEEDS_REVIEW') {
     return {
       cacheState: 'review',
       cacheStatus: 'review',
+      reservationNote: noteFor('review'),
       expiresAt,
       expiredAt,
       expireCause: null,
@@ -100,6 +143,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
     return {
       cacheState: 'kept',
       cacheStatus: 'working',
+      reservationNote: noteFor('working'),
       expiresAt: null,
       expiredAt: null,
       expireCause: null,
@@ -112,6 +156,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
     return {
       cacheState: 'kept',
       cacheStatus: 'scheduled',
+      reservationNote: noteFor('scheduled'),
       expiresAt,
       expiredAt: null,
       expireCause: null,
@@ -125,6 +170,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
       return {
         cacheState: 'kept',
         cacheStatus: 'sending',
+        reservationNote: noteFor('sending'),
         expiresAt,
         expiredAt: null,
         expireCause: null,
@@ -135,6 +181,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
       return {
         cacheState: 'kept',
         cacheStatus: 'awaiting-turn',
+        reservationNote: noteFor('awaiting-turn'),
         expiresAt,
         expiredAt: null,
         expireCause: null,
@@ -148,6 +195,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
     return {
       cacheState: 'none',
       cacheStatus: 'expired',
+      reservationNote: noteFor('expired'),
       expiresAt,
       expiredAt,
       expireCause: blockedReason,
@@ -160,6 +208,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
     return {
       cacheState: 'none',
       cacheStatus: reason === 'INTERACTIVE_WAIT' ? 'interactive-wait' : 'suspended',
+      reservationNote: null,
       expiresAt,
       expiredAt: null,
       expireCause: null,
@@ -171,6 +220,7 @@ export function projectCacheStatus({ state, history, now, needsReview } = /** @t
   return {
     cacheState: 'none',
     cacheStatus: 'no-reservation',
+    reservationNote: noteFor('no-reservation'),
     expiresAt,
     expiredAt: null,
     expireCause: null,

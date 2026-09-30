@@ -198,6 +198,7 @@
  * @typedef {Object} CacheDisplayFields
  * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태. 실제 캐시 적중 여부가 아니다. 누락 시 'none'.
  * @property {'working'|'scheduled'|'sending'|'awaiting-turn'|'expired'|'no-reservation'|'interactive-wait'|'suspended'|'review'} cacheStatus 표시용 상태(§2-1 표). 누락 시 'no-reservation'.
+ * @property {'initial'|'safety-cutoff'|null} reservationNote cacheStatus='no-reservation'일 때 문구를 구분하는 신호. 이번 실행에서 아무 관측도 못 한 초기 상태면 'initial', 실제 만료 전 10초 조기 EXPIRE로 예약이 닫힌 구간이면 'safety-cutoff', 그 밖은 null.
  * @property {boolean} indicatorOn 탭 표시용 활성 조건(§2-2). 전송 허용 필드로 사용하지 않는다.
  * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약이 취소돼도 이력이 있으면 유지하며, 이력이 없으면 null.
  * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). tick 실행 시각이 아니라 expiresAt이며, 그 전에는 null.
@@ -218,6 +219,7 @@
  * @property {string} reason 적용/차단 이유 코드.
  * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태. 실제 캐시 적중 여부가 아니다.
  * @property {'working'|'scheduled'|'sending'|'awaiting-turn'|'expired'|'no-reservation'|'interactive-wait'|'suspended'|'review'} cacheStatus 표시용 상태.
+ * @property {'initial'|'safety-cutoff'|null} reservationNote cacheStatus='no-reservation'일 때 문구를 구분하는 신호. 초기 관측 부재면 'initial', 10초 조기 EXPIRE 구간이면 'safety-cutoff', 그 밖은 null.
  * @property {boolean} indicatorOn 탭 표시용 활성 조건. 전송 허용 필드로 사용하지 않는다.
  * @property {number|null} dueAt 실행 가능한 예약이 있을 때만 값이 있다(ms). 이력 복원만으로는 생성하지 않는다.
  * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약 취소 후에도 이력이 있으면 유지, 이력이 없으면 null.
@@ -544,6 +546,15 @@ export const CACHE_STATUSES = deepFreeze([
   'suspended',
   'review',
 ]);
+
+/**
+ * 캐시 유지 예약 안내 구분(§2-1). cacheStatus='no-reservation'일 때 UI가 문구를
+ * 정확히 고르도록 하는 표시 신호다. `initial`은 이번 플러그인 실행에서 아무 관측도
+ * 하지 못한 초기 상태, `safety-cutoff`는 실제 만료 전 10초 조기 EXPIRE로 예약이 닫힌
+ * 구간(이력 expiresAt > now, expiredAt === null)을 뜻한다. 그 밖의 경우 null이다.
+ * @type {ReadonlyArray<string>}
+ */
+export const RESERVATION_NOTES = deepFreeze(['initial', 'safety-cutoff']);
 
 /**
  * 표시 이력 보존 시간(ms). 만료 후 이 시간이 지나면 이력을 제거한다(§2-3, §2-4).

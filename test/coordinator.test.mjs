@@ -3372,3 +3372,213 @@ test('indicatorOn: review 예외로도 검토 필요 뒤에 가려진 연속 상
   assert.equal(term.cacheStatus, 'review')
   assert.equal(term.indicatorOn, false, '검토 필요에 가려진 연속 상한은 표시를 끈다')
 })
+
+// ---------------------------------------------------------------------------
+// 27. reservationNote 문구 신호 (검토 지적 1+2)
+// ---------------------------------------------------------------------------
+
+test('reservationNote: 새 target은 initial, 관측 뒤에는 null', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  // 아직 아무 관측도 없는 초기 UNKNOWN.
+  let term = viewTerminal(h)
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, 'initial')
+
+  // 첫 done(seenWorking=false)을 관측하면 초기 상태를 벗어난다.
+  worktreeEvent(h, 'w1', 'done', h.clock.now() + 1000)
+  await h.clock.settle()
+  term = viewTerminal(h)
+  assert.equal(term.phase, 'UNKNOWN')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, null, '관측 뒤에는 initial이 아니다')
+})
+
+test('reservationNote: 검토 해제 뒤에는 initial이 아니라 null', async () => {
+  const h = createHarness()
+  h.setSendBehavior(async (args) => {
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    return {
+      kind: 'uncertain',
+      reason: 'PARTIAL_OR_UNKNOWN_SEND',
+      attemptId,
+      at: h.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).phase, 'NEEDS_REVIEW')
+
+  await h.store.clearReview(SCOPE)
+  h.coordinator.onReviewCleared({ worktreeId: 'w1', paneKey: 'tab:leaf' })
+  await h.clock.settle()
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'UNKNOWN')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, null)
+})
+
+test('reservationNote: handle만 바뀐 TARGET_CHANGED 뒤에는 initial이 아니다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  assert.equal(viewTerminal(h).reservationNote, 'initial')
+
+  // 같은 pty/incarnation, handle만 변경: 예약 이력은 보존하되 관측은 있었다.
+  h.observer.state.rows = [makeRow({ handle: 'h2' })]
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'UNKNOWN')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, null)
+})
+
+test('reservationNote: 10초 조기 EXPIRE 구간은 safety-cutoff, 실제 만료 뒤에는 null', async () => {
+  const h = createHarness()
+  h.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: 'DRAFT_PRESENT',
+    attemptId: null,
+    at: h.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const expiresAt = t0 + TTL_5M
+  await advanceToDue(h)
+
+  await h.clock.advance(expiresAt - TIMING.minimumRemainingMs - h.clock.now() + h.tickMs)
+  let term = viewTerminal(h)
+  assert.equal(term.phase, 'EXPIRED')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, 'safety-cutoff')
+
+  await h.clock.advance(TIMING.minimumRemainingMs + h.tickMs * 2)
+  term = viewTerminal(h)
+  assert.equal(term.cacheStatus, 'expired')
+  assert.equal(term.reservationNote, null, '실제 만료 뒤에는 cutoff가 아니다')
+})
+
+test('reservationNote: CLOCK_GAP으로 만료되면 safety-cutoff가 아니다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  // 실제 만료 전이지만 mono/wall이 함께 크게 점프해 clock gap으로 예약을 닫는다.
+  const jump = TIMING.clockGapMs + h.tickMs + 1000
+  h.clock.jumpWall(jump)
+  h.clock.jumpMono(jump)
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'EXPIRED')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.reservationNote, null)
+})
+
+// ---------------------------------------------------------------------------
+// 28. 검토 해제 시 관측 이력 보존 (검토 지적 3)
+// ---------------------------------------------------------------------------
+
+test('onReviewCleared: target이 있으면 관측 이력을 지우지 않아 재시작 뒤에도 유지한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  h1.setSendBehavior(async (args) => {
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h1.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h1.clock.now() })
+    return {
+      kind: 'uncertain',
+      reason: 'PARTIAL_OR_UNKNOWN_SEND',
+      attemptId,
+      at: h1.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  await advanceToDue(h1)
+  await h1.clock.advance(h1.tickMs)
+  assert.equal(viewTerminal(h1).phase, 'NEEDS_REVIEW')
+  const hist1 = h1.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist1)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+
+  await h1.store.clearReview(SCOPE)
+  h1.coordinator.onReviewCleared({ worktreeId: 'w1', paneKey: 'tab:leaf' })
+  await h1.clock.settle()
+
+  assert.equal(viewTerminal(h1).phase, 'UNKNOWN')
+  // 검토 해제가 저장 이력을 지우지 않는다.
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+  const hist2 = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist2, '재시작 뒤에도 관측 이력이 유지된다')
+  assert.equal(hist2.expiresAt, hist1.expiresAt)
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  await h2.clock.advance(TTL_5M)
+  assert.equal(h2.sendCalls.length, 0, '이력만으로 전송 예약을 만들지 않는다')
+})
+
+// ---------------------------------------------------------------------------
+// 29. cwarm gate 캐시·snapshot 성능 (검토 지적 4·5)
+// ---------------------------------------------------------------------------
+
+test('indicatorOn: 탭 표시기 옵션이 꺼져도 cwarm gate를 tick에서 갱신한다', async () => {
+  let disabled = false
+  const h = createHarness({ cwarmDisabled: () => disabled })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: false })
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).indicatorOn, true)
+
+  disabled = true
+  const before = h.cwarmCalls.length
+  await h.clock.advance(h.tickMs)
+  assert.ok(h.cwarmCalls.length > before, '옵션이 꺼져도 cwarm 상태를 확인한다')
+  assert.equal(viewTerminal(h).indicatorOn, false)
+})
+
+test('indicatorOn: 검토 필요 target이 여러 개여도 getRuntimeView는 snapshot을 1회만 읽는다', async () => {
+  const rows = [
+    makeRow({ handle: 'h1', paneKey: 'tab:leaf1', ptyId: 'pty1', incarnationId: 'inc1' }),
+    makeRow({ handle: 'h2', paneKey: 'tab:leaf2', ptyId: 'pty2', incarnationId: 'inc2' }),
+    makeRow({ handle: 'h3', paneKey: 'tab:leaf3', ptyId: 'pty3', incarnationId: 'inc3' }),
+  ]
+  const h = createHarness({ terminals: rows })
+  await startHarness(h)
+  for (const row of rows) {
+    await h.rawStore.markReview({
+      userDataKey: 'key-p',
+      profileId: 'p1',
+      worktreeId: 'w1',
+      paneKey: row.paneKey,
+    })
+  }
+
+  const rawSnapshot = h.rawStore.snapshot
+  let snapshotCalls = 0
+  h.store.snapshot = (...args) => {
+    snapshotCalls += 1
+    return rawSnapshot.apply(h.rawStore, args)
+  }
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].terminals.length, 3)
+  assert.equal(
+    snapshotCalls,
+    1,
+    `snapshot은 target 수와 무관하게 1회여야 한다: ${snapshotCalls}`,
+  )
+})

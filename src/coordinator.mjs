@@ -64,6 +64,7 @@ const EPOCH_MEMORY_PRUNE_INTERVAL_MS = 3600000
  * @property {string|null} unsupportedReason
  * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태(§2-1).
  * @property {string} cacheStatus 표시용 상태(§2-1 표).
+ * @property {'initial'|'safety-cutoff'|null} reservationNote cacheStatus='no-reservation' 문구 구분(§2-1). 초기 관측 부재면 'initial', 10초 조기 EXPIRE 구간이면 'safety-cutoff', 그 밖은 null.
  * @property {boolean} indicatorOn 탭 표시용 활성 조건(§2-2). 전송 허용 필드로 사용하지 않는다.
  * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). 그 전에는 null.
  * @property {string|null} expireCause 만료된 epoch의 마지막 차단 reason 또는 null.
@@ -264,10 +265,15 @@ export function createCoordinator({
   let connection = { state: 'starting', reason: null }
 
   /**
-   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason}, cacheHistory: CacheHistory|null }
+   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason}, cacheHistory: CacheHistory|null, observed: boolean, expiredBy: 'cutoff'|'clock-gap'|null }
    * cacheHistory는 표시 전용 관측 이력(§2-3)이다. scheduler의 epoch와 독립이며
    * 영속 저장·복원·제목 출력은 다른 작업(I/J)이 담당한다.
-   * @type {Map<string, {state:any, decision:any, meta:any, cacheHistory:any}>}
+   * observed는 이번 플러그인 실행에서 이 target이 초기(UNKNOWN) 상태를 벗어나는
+   * 입력을 한 번이라도 적용받았는지다(§2-1 reservationNote 'initial' 판정).
+   * expiredBy는 phase가 EXPIRED일 때 마지막 만료를 만든 원인이다. 10초 조기
+   * EXPIRE면 'cutoff', CLOCK_GAP이면 'clock-gap', 그 밖은 null이며 phase가
+   * EXPIRED를 벗어나면 null로 되돌린다.
+   * @type {Map<string, {state:any, decision:any, meta:any, cacheHistory:any, observed:boolean, expiredBy:'cutoff'|'clock-gap'|null}>}
    */
   const targets = new Map()
   /** key → 다음 시도 허용 시각(skipped 후 최소 tickMs 대기). @type {Map<string, number>} */
@@ -352,6 +358,22 @@ export function createCoordinator({
     }
     const before = entry.state
     entry.state = scheduler.reduceTarget(entry.state, input)
+    // 초기 상태를 벗어나는 입력(관측·복원·검토 해제·handle 변경 등)을 한 번이라도
+    // 적용받으면 observed=true가 된다. TICK은 상태를 바꾸지 않을 수 있으므로 제외한다.
+    const type = isObject(input) ? input.type : null
+    if (type !== 'TICK') {
+      entry.observed = true
+    }
+    // phase가 EXPIRED일 때만 마지막 만료 원인을 기록하고, 벗어나면 지운다(§2-1).
+    if (entry.state.phase === 'EXPIRED') {
+      if (type === 'EXPIRE') {
+        entry.expiredBy = 'cutoff'
+      } else if (type === 'CLOCK_GAP') {
+        entry.expiredBy = 'clock-gap'
+      }
+    } else {
+      entry.expiredBy = null
+    }
     updateCacheHistory(key, before, entry.state, input)
     syncEpochMemory(key, entry.state)
     refreshDecision(key, config)
@@ -1079,18 +1101,19 @@ export function createCoordinator({
    * 확인한다(§2-2). isAllowedByPolicy는 needsReview를 연속 상한·memoryPaused보다
    * 먼저 검사하므로, 검토 필요 자체를 표시에서 예외로 둘 때 이 두 조건을 별도로
    * 확인해야 기존 off 조건을 잃지 않는다. 확인할 수 없으면 보수적으로 off(true)다.
+   *
+   * store.snapshot()은 target마다 다시 부르지 않는다(§성능). 호출자가 한 번 읽은
+   * `gateInfo`를 넘긴다. snapshot을 읽지 못했으면 gateInfo=null이고 off(true)다.
+   * @param {{memoryPaused:boolean, config:any}|null} gateInfo 한 번 읽은 snapshot 요약.
    * @param {Record<string, any>} target
    * @param {number|null} ttlMs
    * @returns {boolean} true면 표시를 꺼야 하는 숨은 조건이 있다.
    */
-  function displayHiddenOff(target, ttlMs) {
-    let snap
-    try {
-      snap = store.snapshot()
-    } catch {
+  function displayHiddenOff(gateInfo, target, ttlMs) {
+    if (!isObject(gateInfo)) {
       return true
     }
-    if (isObject(snap) && snap.memoryPaused === true) {
+    if (gateInfo.memoryPaused === true) {
       return true
     }
     try {
@@ -1099,7 +1122,7 @@ export function createCoordinator({
       }
       const budget = store.getBudget(scopeOf(target))
       const charged = isObject(budget) && isFiniteNumber(budget.charged) ? budget.charged : 0
-      const max = capFor(ttlMs ?? null, isObject(snap) ? snap.config : null)
+      const max = capFor(ttlMs ?? null, gateInfo.config ?? null)
       return max !== 0 && charged >= max
     } catch {
       return true
@@ -1111,7 +1134,7 @@ export function createCoordinator({
    * assertAllowed)와 분리되며 정책 판정 자체를 바꾸지 않는다. 기존 paused/settings/
    * connection/cwarm/scope/상한/storage 실패 조건을 유지하되, `PARTIAL_OR_UNKNOWN_SEND`
    * (검토 필요)는 표시를 끄는 이유에서 제외한다(그 뒤에 가려진 off 조건은 보존).
-   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, settingsEnabled:boolean, connectionOk:boolean}} gates
+   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, settingsEnabled:boolean, connectionOk:boolean, gateInfo?:{memoryPaused:boolean, config:any}|null}} gates
    * @param {Record<string, any>} target
    * @param {number|null} ttlMs
    * @returns {boolean}
@@ -1131,7 +1154,7 @@ export function createCoordinator({
       return true
     }
     if (policy.reason === UNKNOWN_SEND_REASON) {
-      return !displayHiddenOff(target, ttlMs)
+      return !displayHiddenOff(gates.gateInfo ?? null, target, ttlMs)
     }
     return false
   }
@@ -1151,6 +1174,8 @@ export function createCoordinator({
       now: clock.now(),
       needsReview: needsReviewFor(target),
       dueAt: decision ? decision.dueAt ?? null : null,
+      expiredBy: entry.expiredBy ?? null,
+      observed: entry.observed === true,
     })
   }
 
@@ -1230,8 +1255,9 @@ export function createCoordinator({
    *   확인이 비동기이므로 tick을 막지 않게 내부 async 함수로 감싼다.
    * @param {object} config
    * @param {boolean} catalogFailed
+   * @param {{memoryPaused:boolean, config:any}|null} [gateInfo] 호출자가 한 번 읽은 snapshot 요약(§성능).
    */
-  function updateTitleIndicator(config, catalogFailed) {
+  function updateTitleIndicator(config, catalogFailed, gateInfo = null) {
     if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
       return
     }
@@ -1242,7 +1268,7 @@ export function createCoordinator({
       return
     }
     const removeOnly = catalogIncomplete || catalogFailed
-    fireAndForget(reconcileTitleIndicator(config, seq, removeOnly))
+    fireAndForget(reconcileTitleIndicator(config, seq, removeOnly, gateInfo))
   }
 
   /**
@@ -1254,9 +1280,10 @@ export function createCoordinator({
    * @param {object} config
    * @param {number} seq updateTitleIndicator가 부여한 순번. 더 새 호출이 있으면 버린다.
    * @param {boolean} removeOnly 불완전 catalog면 off 제거만 수행한다.
+   * @param {{memoryPaused:boolean, config:any}|null} [gateInfo] 호출자가 한 번 읽은 snapshot 요약.
    * @returns {Promise<void>}
    */
-  async function reconcileTitleIndicator(config, seq, removeOnly = false) {
+  async function reconcileTitleIndicator(config, seq, removeOnly = false, gateInfo = null) {
     let cwarmBlocked = false
     if (config.respectCwarmDisabled === true) {
       try {
@@ -1282,6 +1309,7 @@ export function createCoordinator({
       settingsKnown,
       settingsEnabled,
       connectionOk,
+      gateInfo,
     }
     const ttlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
     /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean, cacheState:string}>} */
@@ -1547,7 +1575,8 @@ export function createCoordinator({
 
     // 이번 tick에서 쓸 config를 한 번만 읽는다. store.snapshot()은 전체 상태를
     // structuredClone+freeze 하므로 target마다 반복 호출하지 않는다.
-    let tickConfig = store.snapshot().config
+    let tickSnapshot = store.snapshot()
+    let tickConfig = tickSnapshot.config
 
     // a. clock gap 검사.
     const now = clock.now()
@@ -1600,7 +1629,8 @@ export function createCoordinator({
     await drainEvents()
 
     // 위 await 동안 대시보드에서 바뀐 config를 반영하도록 target 루프 직전에 다시 읽는다.
-    tickConfig = store.snapshot().config
+    tickSnapshot = store.snapshot()
+    tickConfig = tickSnapshot.config
 
     // e. supported target 결정.
     const candidates = []
@@ -1674,8 +1704,29 @@ export function createCoordinator({
     // f. 동시 1개 전송.
     maybeSend(candidates)
 
-    // g. 탭 제목 ⚡ 표시. await하지 않아 tick을 막지 않는다.
-    updateTitleIndicator(tickConfig, catalogReadFailed)
+    // g. cwarm 표시 gate 캐시를 탭 제목 표시기 옵션과 무관하게 tick에서 갱신한다(§2-2).
+    // 옵션이 꺼져 있으면 reconcileTitleIndicator가 갱신하지 않아 초기값(false)이 남아
+    // getRuntimeView의 indicatorOn이 실제(cwarm.disabled로 전송 차단)와 달라진다.
+    // 옵션이 켜져 있으면 reconcile이 같은 정보를 얻으므로 여기서 중복 조회하지 않는다.
+    if (tickConfig.tabTitleIndicator !== true) {
+      if (tickConfig.respectCwarmDisabled === true) {
+        try {
+          cwarmBlockedCache = (await cwarmDisabled()) === true
+        } catch {
+          cwarmBlockedCache = false
+        }
+      } else {
+        cwarmBlockedCache = false
+      }
+    }
+
+    const gateInfo = {
+      memoryPaused: isObject(tickSnapshot) && tickSnapshot.memoryPaused === true,
+      config: tickConfig,
+    }
+
+    // h. 탭 제목 ⚡ 표시. await하지 않아 tick을 막지 않는다.
+    updateTitleIndicator(tickConfig, catalogReadFailed, gateInfo)
   }
 
   /**
@@ -1828,6 +1879,8 @@ export function createCoordinator({
           decision: null,
           meta,
           cacheHistory: null,
+          observed: false,
+          expiredBy: null,
         })
         // 새 target을 만들었을 때만 저장된 예약을 복원한다(전환/삭제 후 재생성 포함).
         restoreEpochMemory(key, target)
@@ -2374,7 +2427,11 @@ export function createCoordinator({
     // 다음 tick을 앞당기지 않는다. 진행 중 전송은 assertAllowed가 막으며, paste 이후
     // abort로 uncertain을 만들지 않는다.
     diagnostics.record({ event: 'policy_changed' })
-    updateTitleIndicator(store.snapshot().config, titleIndicatorCatalogFailed)
+    const snap = store.snapshot()
+    updateTitleIndicator(snap.config, titleIndicatorCatalogFailed, {
+      memoryPaused: snap.memoryPaused === true,
+      config: snap.config,
+    })
   }
 
   function onWorktreeRemoved(payload) {
@@ -2405,10 +2462,14 @@ export function createCoordinator({
     }
     const key = keyFor(worktreeId, paneKey)
     if (targets.has(key)) {
+      // applyReduce가 phase를 UNKNOWN으로 되돌리고 syncEpochMemory가 관측 이력을
+      // kind='history'로 저장한다. 여기서 forget하면 재시작 뒤 24시간 보존 이력이
+      // 유실되므로(target이 존재할 때) 지우지 않는다.
       applyReduce(key, { type: 'REVIEW_CLEARED' })
+    } else {
+      // target이 없으면 저장된 예약/이력을 정리한다.
+      forgetEpochMemory(key)
     }
-    // 검토가 해제됐으므로 이전 예약을 복원 후보로 남기지 않는다.
-    forgetEpochMemory(key)
   }
 
   async function currentWorktreeId() {
@@ -2441,22 +2502,28 @@ export function createCoordinator({
    */
   function getRuntimeView() {
     // 표시 gate(indicatorOn)에 필요한 값을 한 번만 읽는다. store.snapshot()은 전체
-    // 상태를 복제하므로 target마다 반복 호출하지 않는다(§2-2).
-    let gateConfig = null
+    // 상태를 복제하므로 target마다 반복 호출하지 않는다(§2-2, §성능).
+    let gateSnapshot = null
     try {
-      gateConfig = store.snapshot().config
+      gateSnapshot = store.snapshot()
     } catch {
-      gateConfig = null
+      gateSnapshot = null
     }
+    const gateConfig = isObject(gateSnapshot) ? gateSnapshot.config : null
     const settingsKnown = isObject(lastSettings) && lastSettings.known === true
     const settingsEnabled = settingsKnown && lastSettings.enabled === true
     const gateTtlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    const gateInfo =
+      gateSnapshot === null
+        ? null
+        : { memoryPaused: gateSnapshot.memoryPaused === true, config: gateConfig }
     const gateBase = {
       cwarmBlocked: cwarmBlockedCache,
       paused: isObject(gateConfig) && gateConfig.paused === true,
       settingsKnown,
       settingsEnabled,
       connectionOk: connection.state === 'connected',
+      gateInfo,
     }
     /** @type {Map<string, any>} */
     const groups = new Map()
@@ -2506,6 +2573,7 @@ export function createCoordinator({
         unsupportedReason: entry.meta.unsupportedReason ?? null,
         cacheState: display.cacheState,
         cacheStatus: display.cacheStatus,
+        reservationNote: display.reservationNote,
         indicatorOn: computeIndicatorOn(gateBase, target, gateTtlMs),
         expiredAt: display.expiredAt,
         expireCause: display.expireCause,

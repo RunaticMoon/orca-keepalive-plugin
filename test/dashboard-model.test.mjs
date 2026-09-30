@@ -399,6 +399,29 @@ test('snapshot: 누락·불량 캐시 필드는 none/no-reservation/null로 정�
   }
 });
 
+test('snapshot: reservationNote 허용값만 전달하고 그 밖은 null', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [
+          term({ paneKey: 'p1', cacheStatus: 'no-reservation', reservationNote: 'initial' }),
+          term({ paneKey: 'p2', cacheStatus: 'no-reservation', reservationNote: 'safety-cutoff' }),
+          term({ paneKey: 'p3', cacheStatus: 'no-reservation', reservationNote: 'BOGUS' }),
+          term({ paneKey: 'p4', cacheStatus: 'no-reservation' }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const [initial, cutoff, bogus, missing] = model.snapshot().worktrees[0].terminals;
+  assert.equal(initial.reservationNote, 'initial');
+  assert.equal(cutoff.reservationNote, 'safety-cutoff');
+  assert.equal(bogus.reservationNote, null);
+  assert.equal(missing.reservationNote, null);
+});
+
 test('snapshot: 알 수 없는 캐시 문자열·민감정보를 노출하지 않는다', async () => {
   const { store } = await newStore();
   const runtime = runtimeView({

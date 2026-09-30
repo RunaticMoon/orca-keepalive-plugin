@@ -298,3 +298,76 @@ test('입력 state/history를 변경하지 않는다', () => {
   assert.deepEqual(st, stSnapshot);
   assert.deepEqual(hist, histSnapshot);
 });
+
+// ── reservationNote (검토 지적 1+2) ──────────────────────────────────────────
+
+test('reservationNote: 관측 전 초기 상태(observed=false)는 initial', () => {
+  const out = projectCacheStatus({ state: state(), history: null, now: T0, observed: false });
+  assert.equal(out.cacheStatus, 'no-reservation');
+  assert.equal(out.reservationNote, 'initial');
+});
+
+test('reservationNote: 검토 해제·TARGET_CHANGED 뒤(observed=true)는 null', () => {
+  const out = projectCacheStatus({
+    state: state({ phase: 'UNKNOWN', reason: 'NO_FRESH_TURN' }),
+    history: null,
+    now: T0,
+    observed: true,
+  });
+  assert.equal(out.cacheStatus, 'no-reservation');
+  assert.equal(out.reservationNote, null);
+});
+
+test('reservationNote: observed 신호가 없으면 initial을 만들지 않는다', () => {
+  const out = projectCacheStatus({ state: state(), history: null, now: T0 });
+  assert.equal(out.cacheStatus, 'no-reservation');
+  assert.equal(out.reservationNote, null);
+});
+
+test('reservationNote: 10초 조기 EXPIRE(cutoff) 구간은 safety-cutoff', () => {
+  const out = projectCacheStatus({
+    state: state({ phase: 'EXPIRED', reason: 'EXPIRED' }),
+    history: history(),
+    now: EXPIRES - 5_000,
+    expiredBy: 'cutoff',
+    observed: true,
+  });
+  assert.equal(out.cacheStatus, 'no-reservation');
+  assert.equal(out.expiresAt, EXPIRES);
+  assert.equal(out.reservationNote, 'safety-cutoff');
+});
+
+test('reservationNote: CLOCK_GAP으로 생긴 EXPIRED는 safety-cutoff가 아니다', () => {
+  const out = projectCacheStatus({
+    state: state({ phase: 'EXPIRED', reason: 'EXPIRED' }),
+    history: history(),
+    now: EXPIRES - 5_000,
+    expiredBy: 'clock-gap',
+    observed: true,
+  });
+  assert.equal(out.cacheStatus, 'no-reservation');
+  assert.equal(out.reservationNote, null);
+});
+
+test('reservationNote: cutoff여도 실제 만료가 지났으면 null', () => {
+  const out = projectCacheStatus({
+    state: state({ phase: 'EXPIRED', reason: 'EXPIRED' }),
+    history: history({ expiredAt: EXPIRES }),
+    now: EXPIRES + 1,
+    expiredBy: 'cutoff',
+    observed: true,
+  });
+  assert.equal(out.cacheStatus, 'expired');
+  assert.equal(out.reservationNote, null);
+});
+
+test('reservationNote: cutoff여도 이력이 없으면 safety-cutoff가 아니다', () => {
+  const out = projectCacheStatus({
+    state: state({ phase: 'EXPIRED', reason: 'EXPIRED' }),
+    history: null,
+    now: EXPIRES - 5_000,
+    expiredBy: 'cutoff',
+    observed: true,
+  });
+  assert.equal(out.reservationNote, null);
+});
