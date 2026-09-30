@@ -13,7 +13,11 @@
  *  - 기록(records)을 storage에 먼저 저장한 뒤 rename한다. 비정상 종료 시 prefix가
  *    남아도 다음 시작의 reconcile이 되돌릴 수 있게 하기 위함이다. 기록의
  *    `confirmed`가 false면 rename이 아직 확인되지 않았다는 뜻이고, 다음
- *    reconcile이 재적용을 시도한다.
+ *    reconcile이 재적용을 시도한다. 새 인스턴스는 storage에서 읽은 기록을 이번
+ *    실행에서 확인되지 않은 것(confirmed:false)으로 취급해 첫 전체 reconcile에서
+ *    want=true 탭에 ⚡를 다시 적용한다. 이전 인스턴스 종료가 2초 제한으로 중간에
+ *    끊기면(Orca 업데이트/종료 시 runtime RPC가 동시에 닫힘) ⚡가 지워졌는데 기록은
+ *    confirmed:true로 남을 수 있기 때문이다.
  *  - `session.tabs.list`의 terminal 항목 `id`는 탭 합성 키일 뿐 terminal
  *    핸들이 아니다. rename에는 coordinator가 terminal.list에서 넘긴 handle만 쓴다.
  *  - 모든 RPC/저장 오류는 삼키고 진단에는 안전한 code만 남긴다. 제목 문자열/토큰은
@@ -88,8 +92,9 @@ function stripPrefix(value, prefix) {
 
 /**
  * 저장된 tabKey에서 records Map을 복원한다. 최상위 형식이 불량이면 null을 돌려준다.
- * 개별 record가 불량이면 그 항목만 버린다. `confirmed`가 없으면 true로 간주한다
- * (하위 호환: 기존 저장 데이터는 rename이 이미 확인된 것으로 본다).
+ * 개별 record가 불량이면 그 항목만 버린다. `confirmed`가 없으면 true로 채운다(형식
+ * 기본값). load()는 이 값을 저장소에 남기지 않고 모든 항목을 미확정으로 다시
+ * 표시하므로 이 기본값은 재적용 여부에 영향을 주지 않는다.
  * @param {unknown} raw
  * @returns {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>|null}
  */
@@ -741,7 +746,9 @@ export function createTitleIndicator({
   }
 
   /**
-   * storage에서 기록을 읽는다. 형식이 불량이면 빈 기록으로 시작한다.
+   * storage에서 기록을 읽는다. 형식이 불량이면 빈 기록으로 시작한다. 읽은 기록은
+   * 저장된 `confirmed`와 무관하게 이번 실행에서 미확정(confirmed:false)으로
+   * 표시해, 첫 전체 reconcile이 want=true 탭에 ⚡를 다시 적용하게 한다.
    * @returns {Promise<void>}
    */
   function load() {
@@ -767,8 +774,12 @@ export function createTitleIndicator({
         }
         return
       }
+      // 저장된 confirmed 값과 무관하게 이번 실행에서는 미확정으로 취급한다. 이전
+      // 인스턴스 종료가 2초 제한으로 중간에 끊기면 ⚡가 지워졌는데 기록은
+      // confirmed:true로 남을 수 있으므로, 첫 전체 reconcile이 want=true 탭에
+      // 새 handle로 ⚡를 다시 적용하게 한다. 저장 형식의 confirmed 필드는 유지한다.
       for (const [tabKey, record] of parsed) {
-        records.set(tabKey, record)
+        records.set(tabKey, { ...record, confirmed: false })
       }
       trimRecords()
     })

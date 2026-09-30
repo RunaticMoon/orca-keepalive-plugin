@@ -472,7 +472,9 @@ Known limitations (read before enabling):
   that refresh.
 - Orca stores the tab title, so an abnormal exit can leave ⚡ behind on a tab. On the
   next start the plugin removes the leftover ⚡ when the option is off; when the
-  option is on it keeps or re-applies ⚡ only where the conditions above hold.
+  option is on it re-applies ⚡ only where the conditions above hold (saved records
+  from the previous run are treated as unconfirmed, so ⚡ is rewritten with the
+  current terminal handle).
 - Split panes in the same tab share one tab title. ⚡ is shown when any Claude pane
   in that tab is on.
 - This is a best-effort integration over Orca internals. Failures are swallowed
@@ -611,9 +613,12 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   config 값으로 켭니다(CLI의 config 명령은 없음). rename 실패는 다음 주기에 재시도하고,
   연속 실패가 상한(3회)에 달하면 그 탭은 이번 실행 동안 건너뜁니다. 조건이 안 맞거나
   끄면, 플러그인 종료 시 Orca 자동 이름으로 되돌립니다. 비정상 종료 뒤 남은 ⚡는 다음
-  시작 시 옵션이 꺼져 있으면 제거되고, 켜져 있으면 조건에 맞게 유지·재적용됩니다. ⚡가
-  붙어 있는 동안 직접 이름을 바꾼 탭(⚡ 적용 값과 달라진 경우)은 플러그인이 덮어쓰거나
-  지우지 않습니다. 반대로 ⚡가 붙기 **전에** 직접 지정한 탭 이름은 복원되지 않고 끄면
+  시작 시 옵션이 꺼져 있으면 제거되고, 켜져 있으면 조건에 맞는 탭에 새 handle로
+  재적용됩니다(이전 실행 기록은 미확정으로 취급). `session.tabs.list` title로는
+  수동 변경을 판별할 수 없어, ⚡가
+  붙어 있는 동안 직접 이름을 바꾼 탭(⚡ 적용 값과 달라진 경우)도 플러그인이 덮어쓰거나
+  해제할 수 있습니다(끄기·턴 완료 새로고침·재시작 후 재적용·플러그인 종료 시). 반대로
+  ⚡가 붙기 **전에** 직접 지정한 탭 이름은 복원되지 않고 끄면
   Orca 자동 이름이 됩니다. 한계:
   ⚡가 붙은 동안 Orca 자동 제목 갱신이 멈추며(턴 완료 후 최소 60초 간격으로 해제→재적용,
   깜빡임 가능), 같은 탭 분할 창은 이름을 공유합니다.
