@@ -182,6 +182,23 @@ function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, contro
   }
 
   /**
+   * 대시보드를 Orca 내장 브라우저로 연다. 성공하면 조용히 끝나고, 열지 못했을 때만
+   * URL 안내를 알린다. open/status handler가 공유한다.
+   * @returns {Promise<void>}
+   */
+  async function openDashboardOrNotify() {
+    const { url } = await controller.ensureDashboard()
+    const { opened } = await controller.openDashboard(url)
+    if (opened) {
+      return
+    }
+    await notifySafe(
+      NOTIFICATION_TITLE,
+      '대시보드를 Orca 브라우저에서 열지 못했습니다. 브라우저에서 다음 주소를 여세요: ' + url,
+    )
+  }
+
+  /**
    * 현재 워크트리 override를 on/off로 설정하고 결과를 알린다. worktreeId를 특정할 수
    * 없으면 변경하지 않고 안내만 한다.
    * @param {boolean} enabled
@@ -205,18 +222,7 @@ function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, contro
 
   return {
     /** 대시보드 열기. 성공하면 조용히 종료하고, 실패하면 이때만 URL을 알린다. */
-    [COMMAND_IDS.open]: () =>
-      withGuard(async () => {
-        const { url } = await controller.ensureDashboard()
-        const { opened } = await controller.openDashboard(url)
-        if (opened) {
-          return
-        }
-        await notifySafe(
-          NOTIFICATION_TITLE,
-          '대시보드를 Orca 브라우저에서 열지 못했습니다. 브라우저에서 다음 주소를 여세요: ' + url,
-        )
-      }),
+    [COMMAND_IDS.open]: () => withGuard(openDashboardOrNotify),
 
     /** 전역 pause on/off 토글. 모델이 최신 revision으로 원자적으로 반전한다. */
     [COMMAND_IDS.togglePause]: () =>
@@ -282,6 +288,9 @@ function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, contro
         )
         const { text } = await controller.statusSummary({ currentWorktreeId: currentWorktreeId ?? null })
         await notifySafe(NOTIFICATION_TITLE, text)
+        // 플러그인 알림이 macOS에서 표시되지 않을 수 있어 대시보드도 연다.
+        // 요약을 먼저 알린 뒤 열기 때문에, 여기서 예외가 나도 상태 알림은 이미 전송됐다.
+        await openDashboardOrNotify()
       }),
   }
 }

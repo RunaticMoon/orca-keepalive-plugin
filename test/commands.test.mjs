@@ -537,6 +537,71 @@ test('status handler notifies promptly even when currentWorktreeId never resolve
   assert.equal(notifyCalls[0].body, '상태 요약')
 })
 
+test('status handler notifies first, then opens the dashboard', async () => {
+  const events = []
+  const { orca, registrations } = createFakeOrca()
+  const { controller, calls } = createFakeController({
+    async statusSummary() {
+      calls.statusSummary.push({})
+      return { text: '상태 요약' }
+    },
+    async ensureDashboard() {
+      calls.ensureDashboard.push({})
+      events.push('ensureDashboard')
+      return { url: 'http://127.0.0.1:1234/#token=tok' }
+    },
+    async openDashboard(url) {
+      calls.openDashboard.push({ url })
+      events.push('openDashboard')
+      return { opened: true }
+    },
+  })
+  const notify = async () => {
+    events.push('notify')
+  }
+  registerCommands({ orca, controller, notify })
+  const handler = registrations.find((r) => r.id === COMMAND_IDS.status).handler
+
+  await handler()
+
+  assert.deepEqual(events, ['notify', 'ensureDashboard', 'openDashboard'])
+  assert.equal(calls.ensureDashboard.length, 1)
+  assert.equal(calls.openDashboard.length, 1)
+  assert.equal(calls.openDashboard[0].url, 'http://127.0.0.1:1234/#token=tok')
+})
+
+test('status handler adds a URL notification when the dashboard fails to open', async () => {
+  const { notifyCalls, handlerFor, calls } = setup({
+    async openDashboard(url) {
+      calls.openDashboard.push({ url })
+      return { opened: false }
+    },
+  })
+
+  await handlerFor(COMMAND_IDS.status)()
+
+  assert.equal(calls.ensureDashboard.length, 1)
+  assert.equal(notifyCalls.length, 2)
+  assert.equal(notifyCalls[0].title, 'Cache Keepalive')
+  assert.equal(notifyCalls[0].body, '상태 요약')
+  assert.ok(notifyCalls[1].body.includes('http://127.0.0.1:1234/#token=tok'))
+})
+
+test('status handler still sends the status notification when opening the dashboard throws', async () => {
+  const { notifyCalls, handlerFor } = setup({
+    async ensureDashboard() {
+      const error = new Error('runtime gone')
+      error.code = 'runtime_unavailable'
+      throw error
+    },
+  })
+
+  await assert.doesNotReject(() => handlerFor(COMMAND_IDS.status)())
+  assert.equal(notifyCalls[0].body, '상태 요약')
+  assert.equal(notifyCalls.length, 2)
+  assert.equal(notifyCalls[1].body, '명령 실패: runtime_unavailable')
+})
+
 // ---------------------------------------------------------------------------
 // error containment + timeout
 // ---------------------------------------------------------------------------

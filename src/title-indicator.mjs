@@ -5,6 +5,9 @@
  * Orca 런타임 RPC만 사용한다(주입된 `rpc`/`hostCall`). `terminal.rename`은 탭 전체의
  * customTitle을 바꾸고(영구 저장) `null`/`""`은 customTitle을 해제한다. 사용자 지정
  * 이름과 자동 이름을 구분하는 필드가 RPC에 없으므로 되돌릴 때는 `null`만 쓴다(한계).
+ *  - `session.tabs.list`의 title은 customTitle이 아니라 런타임 제목 투영값(OSC/PTY,
+ *    최신 갱신 우선)이라 applied와 비교할 수 없다. 그래서 off 해제는 제목 비교 없이
+ *    rename(null)을 시도하며, 사용자가 수동으로 바꾼 탭 제목도 off 시 해제될 수 있다(한계).
  *
  * 안전 규칙:
  *  - 기록(records)을 storage에 먼저 저장한 뒤 rename한다. 비정상 종료 시 prefix가
@@ -228,6 +231,8 @@ export function createTitleIndicator({
 
   /**
    * tabKey → { worktreeId, tabId, handle, applied, confirmed }. 삽입 순서가 곧 오래된 순서다.
+   * `applied`는 더 이상 제거/복원 판정에 쓰지 않는다(Orca `session.tabs.list` title이
+   * customTitle이 아니라 런타임 제목이라 비교할 수 없다). 저장 형식 호환·진단용으로만 유지한다.
    * @type {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>}
    */
   const records = new Map()
@@ -498,9 +503,12 @@ export function createTitleIndicator({
   }
 
   /**
-   * want=false이고 기록이 있을 때 prefix를 되돌린다. 현재 제목이 applied와 같을
-   * 때만 rename(null)하고, 사용자가 제목을 바꿨거나 탭이 없으면 rename 없이 기록을
-   * 정리한다. 조회/rename 실패면 기록을 보존하고 지수 백오프 후 재시도한다.
+   * want=false이고 기록이 있을 때 prefix를 되돌린다. `session.tabs.list`의 title은
+   * customTitle이 아니라 런타임 제목 투영값이라 applied와 비교할 수 없다. 탭이
+   * 존재하면(found !== null) 제목 비교 없이 항상 rename(null)을 시도하고, 탭이
+   * 없으면 rename 없이 기록만 정리한다. 이 때문에 사용자가 수동으로 바꾼 탭 제목도
+   * off 시 해제될 수 있다(한계). 조회/rename 실패면 기록을 보존하고 지수 백오프 후
+   * 재시도한다.
    * @param {string} tabKey
    * @param {{worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}} record
    */
@@ -517,7 +525,7 @@ export function createTitleIndicator({
       return
     }
 
-    if (found !== null && found.title === record.applied) {
+    if (found !== null) {
       try {
         await rpc.call(
           'terminal.rename',
@@ -562,11 +570,8 @@ export function createTitleIndicator({
       noteFailure(tabKey, 'tab_missing')
       return
     }
-    if (found.title !== record.applied) {
-      // 사용자가 이름을 바꿨다: 되돌리지 않고 기록만 지운다.
-      await deleteRecord(tabKey)
-      return
-    }
+    // title은 런타임 제목 투영값이라 applied와 비교할 수 없다. 사용자가 이름을
+    // 바꿨는지 판별할 수 없으므로 항상 rename(null)로 해제한 뒤 새 제목을 적용한다.
 
     const handle = record.handle
     try {
@@ -624,6 +629,8 @@ export function createTitleIndicator({
       diagnose('save_failed')
     }
     clearFailures(tabKey)
+    // 제거 재시도가 실패했던 탭도 refresh로 제목을 복구했으면 재시도 상태를 지운다.
+    clearRemoveFailure(tabKey)
   }
 
   /**
@@ -787,6 +794,8 @@ export function createTitleIndicator({
 
   /**
    * 모든 기록에 remove를 수행한다. 실패해도 계속하며 기록은 정리한다.
+   * title은 런타임 제목 투영값이라 applied와 비교할 수 없으므로, 탭이 존재하면
+   * 제목 비교 없이 rename(null)을 시도한다(사용자가 바꾼 제목도 해제될 수 있음, 한계).
    * @returns {Promise<void>}
    */
   function restoreAll() {
@@ -794,7 +803,7 @@ export function createTitleIndicator({
       for (const [tabKey, record] of [...records]) {
         try {
           const found = await readTab(record.worktreeId, record.tabId, null)
-          if (found !== null && found.title === record.applied) {
+          if (found !== null) {
             await rpc.call(
               'terminal.rename',
               { terminal: record.handle, title: null },

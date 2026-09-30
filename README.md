@@ -401,11 +401,13 @@ Known limitations (read before enabling):
   as `⚡ <your name>`, the post-turn refresh rebuilds it from Orca's automatic title,
   and turning ⚡ off clears the custom title, so the tab ends up with Orca's
   automatic name. Rename the tab again afterwards if you need that name.
-- A tab you rename **while** ⚡ is applied is left alone. The plugin only removes the
-  exact value it applied; if the current title differs, it just clears its record and
-  does not overwrite or clear your title. (Exception: if the previous rename failed or
-  was interrupted and has not been confirmed yet, the next retry prefixes whatever the
-  tab is called at that moment.)
+- Orca's `session.tabs.list` reports the terminal's runtime title (OSC/PTY), not the
+  custom title, so the plugin cannot tell whether a tab's current name is one you set
+  yourself. A tab you rename **while** ⚡ is applied can therefore have your name
+  cleared when ⚡ is turned off, when the post-turn refresh rebuilds the title (at most
+  once per 60 s), or when the plugin shuts down. The tab then gets Orca's automatic
+  name (or `⚡ <automatic name>` while ⚡ stays on); rename it again afterwards if you
+  need that name.
 - While ⚡ is applied, Orca's automatic tab-title generation stops. After a real user
   turn completes (at most once per 60 s), the plugin briefly clears the name, waits
   for the new automatic title, and re-applies ⚡. The tab title can flicker during

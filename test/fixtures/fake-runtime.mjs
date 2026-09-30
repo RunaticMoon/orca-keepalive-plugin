@@ -327,7 +327,11 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
         tabs.push({
           type: 'terminal',
           id: `${terminal.tabId}::${terminal.leafId}`,
-          title: terminal.customTitle ?? terminal.title,
+          // 실제 Orca의 title은 customTitle이 아니라 런타임 제목 투영값이다
+          // (orca src/main/runtime/runtime-mobile-session-projection.ts: trackerOnlyTitle
+          //  ?? leafTitle ?? ptyTitle ?? syncedTab.title ?? tab.title 순으로 normalize).
+          // terminal.rename이 바꾸는 customTitle은 반영하지 않는다.
+          title: terminal.title,
           parentTabId: terminal.tabId,
           leafId: terminal.leafId,
           worktreeId: terminal.worktreeId,
@@ -489,6 +493,15 @@ export async function startFakeRuntime({ socketPath, authToken, runtimeId }) {
     setLastOutputAt(handle, ms) {
       const terminal = terminals.get(handle)
       if (terminal) terminal.lastOutputAt = ms
+    },
+    /**
+     * 런타임 제목(OSC/PTY 등)을 바꾼다. session.tabs.list title에 그대로 반영된다.
+     * @param {string} handle
+     * @param {string|null} title
+     */
+    setTitle(handle, title) {
+      const terminal = terminals.get(handle)
+      if (terminal) terminal.title = title === null || title === undefined ? null : String(title)
     },
     setWritable(handle, writable) {
       const terminal = terminals.get(handle)

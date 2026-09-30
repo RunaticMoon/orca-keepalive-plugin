@@ -779,3 +779,76 @@ test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래�
     await h.cleanup()
   }
 })
+
+// ---------------------------------------------------------------------------
+// 시나리오 13. 런타임 제목이 바뀐 뒤 off — tabs.list title ≠ applied여도 해제
+// ---------------------------------------------------------------------------
+
+test('scenario 13: 런타임 제목이 ⚡ 적용 값과 달라져도 off면 customTitle을 해제한다', async () => {
+  const PREFIX = '⚡ '
+  const h = await createHarness({ enabled: true })
+  try {
+    await h.start()
+    const dashboard = await h.openDashboard()
+    assert.equal(dashboard.status, 200)
+
+    const on = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { tabTitleIndicator: true },
+        expectedRevision: dashboard.state.revision,
+      },
+    })
+    assert.equal(on.status, 200, '옵션 on POST 성공')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await waitFor(
+      () => h.runtime.getTerminal('h1').customTitle === PREFIX + 'W1 terminal',
+      { clock: h.clock },
+    )
+
+    // Claude Code가 OSC/PTY 제목을 계속 갱신해 session.tabs.list title이 applied와
+    // 달라진 상태를 만든다. 실제 Orca는 customTitle을 알려주지 않는다.
+    h.runtime.setTitle('h1', '⠂ Claude Code')
+    assert.notEqual(h.runtime.getTerminal('h1').title, PREFIX + 'W1 terminal')
+
+    const off = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { tabTitleIndicator: false },
+        expectedRevision: on.body.revision,
+      },
+    })
+    assert.equal(off.status, 200, '옵션 off POST 성공')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await waitFor(
+      () =>
+        h.runtime.frames.some(
+          (frame) =>
+            frame.method === 'terminal.rename' &&
+            frame.params &&
+            frame.params.terminal === 'h1' &&
+            (frame.params.title === null || frame.params.title === ''),
+        ),
+      { clock: h.clock },
+    )
+    assert.equal(
+      h.runtime.getTerminal('h1').customTitle,
+      null,
+      'tabs.list title이 applied와 달라도 customTitle은 해제된다',
+    )
+  } finally {
+    await h.cleanup()
+  }
+})

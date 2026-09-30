@@ -269,7 +269,7 @@ test('reconcile: want && 기록이 있고 handle이 바뀌면 기록만 갱신�
 // remove / load 복구
 // ---------------------------------------------------------------------------
 
-test('remove: 현재 제목이 applied와 같을 때만 null로 되돌린다', async () => {
+test('remove: 탭이 있으면 제목 비교 없이 null로 되돌린다', async () => {
   const storage = new Map([
     [
       KEY,
@@ -288,18 +288,45 @@ test('remove: 현재 제목이 applied와 같을 때만 null로 되돌린다', a
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
-test('remove: 사용자가 바꾼 제목이면 rename하지 않고 기록만 지운다', async () => {
+test('remove: 제목이 applied와 달라도 탭이 있으면 rename(null)로 해제한다', async () => {
+  // session.tabs.list title은 customTitle이 아니라 런타임 제목 투영값이라 applied와
+  // 비교할 수 없다. 다른 값이어도 customTitle(⚡)을 해제해야 한다.
   const storage = new Map([
     [
       KEY,
       { [TAB_KEY]: { worktreeId: WORKTREE, tabId: TAB, handle: HANDLE, applied: PREFIX + 'Claude' } },
     ],
   ])
-  const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: 'My Title' })), storage })
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: '⠂ Claude Code' })),
+    storage,
+  })
   await ti.load()
   await ti.reconcile([])
 
-  assert.equal(rpc.callsFor('terminal.rename').length, 0)
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: null },
+  ])
+  assert.deepEqual(store.get(KEY), {})
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
+})
+
+test('remove: 적용 후 title이 OSC 값으로 바뀌어도 off에서 rename(null)로 해제한다', async () => {
+  let title = 'Claude'
+  const { rpc, ti, storage } = setup({ tabsList: () => listOf(entry({ title })) })
+  await ti.load()
+  await ti.reconcile([pane()])
+  assert.equal(storage.get(KEY)[TAB_KEY].applied, PREFIX + 'Claude')
+
+  // Claude Code가 터미널 제목을 계속 갱신해 tabs.list title이 applied와 달라진다.
+  title = '⠂ Claude Code'
+  rpc.calls.length = 0
+  await ti.reconcile([pane({ on: false })])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.deepEqual(renames[0].params, { terminal: HANDLE, title: null })
+  assert.deepEqual(storage.get(KEY), {})
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
@@ -768,7 +795,7 @@ test('load: confirmed 없는 기록은 확정으로 간주해 재적용하지 �
   assert.equal(rpc.callsFor('terminal.rename').length, 0)
 })
 
-test('remove: 미확정 기록도 현재 제목이 applied와 같으면 되돌린다', async () => {
+test('remove: 미확정 기록도 탭이 있으면 되돌린다', async () => {
   const storage = new Map([
     [
       KEY,
@@ -795,7 +822,7 @@ test('remove: 미확정 기록도 현재 제목이 applied와 같으면 되돌�
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
-test('remove: 미확정 기록이고 제목이 applied와 다르면 rename 없이 기록만 지운다', async () => {
+test('remove: 미확정 기록도 제목 비교 없이 rename(null)로 해제한다', async () => {
   const storage = new Map([
     [
       KEY,
@@ -817,7 +844,9 @@ test('remove: 미확정 기록이고 제목이 applied와 다르면 rename 없�
   await ti.load()
   await ti.reconcile([])
 
-  assert.equal(rpc.callsFor('terminal.rename').length, 0)
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: null },
+  ])
   assert.deepEqual(store.get(KEY), {})
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
@@ -907,6 +936,27 @@ test('restoreAll: 모든 기록을 되돌리고 실패해도 계속한다', asyn
   assert.deepEqual(store.get(KEY), {})
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
   assert.ok(diagnostics.entries.some((e) => e.code === 'restore_failed'))
+})
+
+test('restoreAll: 제목이 applied와 달라도 탭이 있으면 rename(null)로 해제한다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      { [TAB_KEY]: { worktreeId: WORKTREE, tabId: TAB, handle: HANDLE, applied: PREFIX + 'Claude' } },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: '⠂ Claude Code' })),
+    storage,
+  })
+  await ti.load()
+  await ti.restoreAll()
+
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: null },
+  ])
+  assert.deepEqual(store.get(KEY), {})
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
 // ---------------------------------------------------------------------------

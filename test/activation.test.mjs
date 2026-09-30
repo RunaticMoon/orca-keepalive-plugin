@@ -372,16 +372,24 @@ test('keepalive-status는 런타임 없음 상태 문구를 알림으로 보낸�
   const plugin = createPlugin(orca, baseDeps({ orchestrator: coordinator }))
   plugin.activate()
 
-  const handler = commands.get('keepalive-status')
-  assert.equal(typeof handler, 'function')
-  await handler()
+  try {
+    const handler = commands.get('keepalive-status')
+    assert.equal(typeof handler, 'function')
+    await handler()
 
-  assert.equal(notifications.length, 1)
-  assert.equal(notifications[0].title, 'Cache Keepalive')
-  assert.equal(typeof notifications[0].body, 'string')
-  assert.ok(notifications[0].body.length > 0)
-
-  await plugin.deactivate()
+    // 상태 요약 알림 1건 + 브라우저 열기 실패로 인한 URL 안내 1건.
+    assert.equal(notifications.length, 2, '상태 요약 + URL 안내')
+    assert.equal(notifications[0].title, 'Cache Keepalive')
+    assert.equal(typeof notifications[0].body, 'string')
+    assert.ok(notifications[0].body.length > 0)
+    assert.equal(notifications[1].title, 'Cache Keepalive')
+    assert.ok(
+      notifications[1].body.includes('http://127.0.0.1:'),
+      `두 번째 알림은 대시보드 URL 안내여야 한다: ${notifications[1].body}`,
+    )
+  } finally {
+    await plugin.deactivate()
+  }
 })
 
 test('notify가 delivered:false를 반환하면 diagnostics에 not_delivered를 기록하고 예외는 없다', async () => {
@@ -393,14 +401,16 @@ test('notify가 delivered:false를 반환하면 diagnostics에 not_delivered를 
   })
   plugin.activate()
 
-  const handler = commands.get('keepalive-status')
-  await assert.doesNotReject(() => handler())
+  try {
+    const handler = commands.get('keepalive-status')
+    await assert.doesNotReject(() => handler())
 
-  const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
-  assert.equal(events.length, 1)
-  assert.equal(events[0].code, 'not_delivered')
-
-  await plugin.deactivate()
+    const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
+    assert.equal(events.length, 2, '상태 요약 + URL 안내 모두 not_delivered')
+    assert.ok(events.every((entry) => entry.code === 'not_delivered'))
+  } finally {
+    await plugin.deactivate()
+  }
 })
 
 test('notify가 throw하면 diagnostics에 host_call_failed를 기록하고 예외는 전파되지 않는다', async () => {
@@ -412,14 +422,16 @@ test('notify가 throw하면 diagnostics에 host_call_failed를 기록하고 예�
   })
   plugin.activate()
 
-  const handler = commands.get('keepalive-status')
-  await assert.doesNotReject(() => handler())
+  try {
+    const handler = commands.get('keepalive-status')
+    await assert.doesNotReject(() => handler())
 
-  const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
-  assert.equal(events.length, 1)
-  assert.equal(events[0].code, 'host_call_failed')
-
-  await plugin.deactivate()
+    const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
+    assert.equal(events.length, 2, '상태 요약 + URL 안내 모두 host_call_failed')
+    assert.ok(events.every((entry) => entry.code === 'host_call_failed'))
+  } finally {
+    await plugin.deactivate()
+  }
 })
 
 test('notify가 delivered:true를 반환하면 diagnostics에 notify_failed가 기록되지 않는다', async () => {
