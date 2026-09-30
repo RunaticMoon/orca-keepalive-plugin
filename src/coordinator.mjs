@@ -50,6 +50,7 @@ const UNKNOWN_SEND_REASON = 'PARTIAL_OR_UNKNOWN_SEND'
  * @typedef {Object} RuntimeWorktreeView
  * @property {string} worktreeId
  * @property {string|null} label
+ * @property {string|null} branch 표시용 짧은 branch 이름.
  * @property {RuntimeTerminalView[]} terminals
  *
  * @typedef {Object} RuntimeView
@@ -205,6 +206,8 @@ export function createCoordinator({
   let titleIndicatorCreated = false
   /** updateTitleIndicator 호출 순번. 늦게 끝난 이전 호출의 reconcile을 버린다. */
   let titleIndicatorSeq = 0
+  /** 마지막 catalog 조회 실패 여부. policy 변경 시에도 보수적 reconciliation을 유지한다. */
+  let titleIndicatorCatalogFailed = true
   /** @type {object|null} */
   let latestCatalog = null
   /** 마지막 catalog가 complete가 아니면 true. true인 동안 새 전송을 시작하지 않는다. */
@@ -433,8 +436,8 @@ export function createCoordinator({
   /**
    * 이번 tick의 desired를 만들어 표시기에 비동기로 반영한다(tick을 막지 않는다).
    * - 옵션이 꺼져 있으면 빈 목록으로 모든 기록을 제거한다.
-   * - catalog가 불완전하거나 읽기에 실패한 tick에는 호출하지 않는다(불완전 목록으로
-   *   ⚡를 지우지 않기 위함). 단 옵션 off는 목록과 무관하므로 항상 반영한다.
+   * - catalog가 불완전하거나 읽기에 실패하면 off 제거만 수행한다. 새 적용은 막고,
+   *   목록에서 빠진 기록은 지우지 않는다. 단 옵션 off는 목록과 무관하게 모두 제거한다.
    * - 실제 전송 게이트(runSend의 assertAllowed)와 같은 cwarm 확인을 반영한다.
    *   확인이 비동기이므로 tick을 막지 않게 내부 async 함수로 감싼다.
    * @param {object} config
@@ -450,10 +453,8 @@ export function createCoordinator({
       fireAndForget(titleIndicator.reconcile([]))
       return
     }
-    if (catalogIncomplete || catalogFailed) {
-      return
-    }
-    fireAndForget(reconcileTitleIndicator(config, seq))
+    const removeOnly = catalogIncomplete || catalogFailed
+    fireAndForget(reconcileTitleIndicator(config, seq, removeOnly))
   }
 
   /**
@@ -463,9 +464,10 @@ export function createCoordinator({
    * 무관하게 "이 탭이 keepalive 대상으로 켜져 있음"을 뜻한다.
    * @param {object} config
    * @param {number} seq updateTitleIndicator가 부여한 순번. 더 새 호출이 있으면 버린다.
+   * @param {boolean} removeOnly 불완전 catalog면 off 제거만 수행한다.
    * @returns {Promise<void>}
    */
-  async function reconcileTitleIndicator(config, seq) {
+  async function reconcileTitleIndicator(config, seq, removeOnly = false) {
     let cwarmBlocked = false
     if (config.respectCwarmDisabled === true) {
       try {
@@ -511,7 +513,7 @@ export function createCoordinator({
         on,
       })
     }
-    fireAndForget(titleIndicator.reconcile(desired))
+    fireAndForget(titleIndicator.reconcile(desired, removeOnly ? { removeOnly: true } : undefined))
   }
 
   /**
@@ -775,10 +777,10 @@ export function createCoordinator({
       latestCatalog = await observer.list()
       reconcileCatalog(latestCatalog)
     } catch {
-      // 읽기 실패: 기존 catalog/target을 유지한다. 제목 표시기도 이번 tick에는
-      // 손대지 않는다(불완전 목록으로 ⚡를 지우지 않게).
+      // 읽기 실패: 기존 catalog/target을 유지한다. 제목 표시기는 off 제거만 한다.
       catalogReadFailed = true
     }
+    titleIndicatorCatalogFailed = catalogReadFailed
 
     // d. 대기 중 이벤트 drain.
     await drainEvents()
@@ -971,7 +973,8 @@ export function createCoordinator({
       }
       const meta = {
         title: typeof row.title === 'string' ? row.title : null,
-        label: typeof row.branch === 'string' ? row.branch : null,
+        label: row.projectName ?? row.branchName ?? null,
+        branch: row.branchName ?? null,
         supported: row.supported === true,
         unsupportedReason: typeof row.unsupportedReason === 'string' ? row.unsupportedReason : null,
         tabId: typeof row.tabId === 'string' ? row.tabId : null,
@@ -1340,6 +1343,7 @@ export function createCoordinator({
     // 다음 tick을 앞당기지 않는다. 진행 중 전송은 assertAllowed가 막으며, paste 이후
     // abort로 uncertain을 만들지 않는다.
     diagnostics.record({ event: 'policy_changed' })
+    updateTitleIndicator(store.snapshot().config, titleIndicatorCatalogFailed)
   }
 
   function onWorktreeRemoved(payload) {
@@ -1409,11 +1413,19 @@ export function createCoordinator({
       const target = entry.state.target
       let group = groups.get(target.worktreeId)
       if (!group) {
-        group = { worktreeId: target.worktreeId, label: entry.meta.label ?? null, terminals: [] }
+        group = {
+          worktreeId: target.worktreeId,
+          label: entry.meta.label ?? null,
+          branch: entry.meta.branch ?? null,
+          terminals: [],
+        }
         groups.set(target.worktreeId, group)
       }
       if (group.label === null && entry.meta.label) {
         group.label = entry.meta.label
+      }
+      if (group.branch === null && entry.meta.branch) {
+        group.branch = entry.meta.branch
       }
       group.terminals.push({
         worktreeId: target.worktreeId,

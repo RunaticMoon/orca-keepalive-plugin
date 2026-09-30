@@ -720,6 +720,56 @@ test('statusSummary: 기본값이 켜짐이면 상속 워크트리는 ⚡ 켜짐
   assert.equal(lines[1], '⚡ main 켜짐(기본값)');
 });
 
+test('statusSummary: 프로젝트 이름을 제목으로, branch를 보조로 표시', async () => {
+  const { store } = await newStore();
+  await store.updateConfig({ defaultWorktreeEnabled: true });
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        worktreeId: 'w-proj',
+        label: 'route-dashboard',
+        branch: 'main',
+        terminals: [term({ worktreeId: 'w-proj' })],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
+
+  const lines = model.statusSummary().text.split('\n');
+  assert.equal(lines[1], '⚡ route-dashboard (main) 켜짐(기본값)');
+});
+
+test('statusSummary: branch가 없거나 label과 같으면 보조 표시를 생략', async () => {
+  const { store } = await newStore();
+  await store.updateConfig({ defaultWorktreeEnabled: true });
+  const runtime = runtimeView({
+    worktrees: [
+      wt({ worktreeId: 'w-same', label: 'main', branch: 'main', terminals: [term({ worktreeId: 'w-same' })] }),
+      wt({ worktreeId: 'w-nobranch', label: 'docs', branch: null, terminals: [term({ worktreeId: 'w-nobranch' })] }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
+
+  const lines = model.statusSummary().text.split('\n').slice(1);
+  assert.equal(lines[0], '⚡ main 켜짐(기본값)');
+  assert.equal(lines[1], '⚡ docs 켜짐(기본값)');
+});
+
+test('snapshot: worktree branch 필드를 전달하고 없으면 null', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({ worktreeId: 'w-branch', label: 'route-dashboard', branch: 'main' }),
+      wt({ worktreeId: 'w-nobranch', label: 'docs' }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const snap = model.snapshot();
+  assert.equal(snap.worktrees[0].branch, 'main');
+  assert.equal(snap.worktrees[1].branch, null);
+});
+
 test('statusSummary: 현재 워크트리를 ▶로 맨 앞에 표시하고 없으면 붙이지 않는다', async () => {
   const { store } = await newStore();
   const runtime = runtimeView({
@@ -835,7 +885,7 @@ test('statusSummary: 워크트리가 없으면 대상 워크트리 없음', asyn
   assert.equal(text, '켜짐 · 타이머 켜짐(5분) · 연결됨 · 워크트리 0개\n대상 워크트리 없음');
 });
 
-test('statusSummary: 900자를 넘으면 뒤 워크트리를 잘라 … 외 N개로 끝낸다', async () => {
+test('statusSummary: 480자를 넘으면 뒤 워크트리를 잘라 … 외 N개로 끝낸다', async () => {
   const { store } = await newStore();
   const worktrees = Array.from({ length: 40 }, (_, i) =>
     wt({ worktreeId: `w-${i}`, label: `worktree-${i}-${'x'.repeat(20)}`, terminals: [] }),
@@ -844,7 +894,7 @@ test('statusSummary: 900자를 넘으면 뒤 워크트리를 잘라 … 외 N개
 
   const { text } = model.statusSummary({ currentWorktreeId: 'w-0' });
   const lines = text.split('\n');
-  assert.ok(text.length <= 900, `text length ${text.length} <= 900`);
+  assert.ok(text.length <= 480, `text length ${text.length} <= 480`);
   assert.match(lines.at(-1), /^… 외 \d+개$/);
   assert.ok(lines[1].startsWith('▶ '), '현재 워크트리는 맨 앞에 유지된다');
 });

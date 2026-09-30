@@ -34,6 +34,9 @@ const BROWSER_CALL_TIMEOUT_MS = 10000
 /** 기본 handler 전체 deadline(ms). Orca 커맨드 제한 30초 안에 끝내기 위함. */
 const DEFAULT_HANDLER_TIMEOUT_MS = 25000
 
+/** status 알림의 현재 워크트리 조회 상한(ms). 알림이 늦어지지 않게 한다. */
+const STATUS_CURRENT_WORKTREE_TIMEOUT_MS = 2000
+
 /** reason/오류 코드로 반영해도 안전한 값의 형식. */
 const SAFE_CODE_RE = /^[a-z_]{1,40}$/
 
@@ -112,15 +115,43 @@ export async function openInOrcaBrowser({ rpc, url, worktreeId = null, signal } 
 }
 
 /**
+ * currentWorktreeId 조회를 짧은 상한으로 제한한다. 상한을 넘기거나 실패하면 null로
+ * 간주한다. 타이머는 항상 해제하고, 조회 promise는 절대 reject하지 않으므로
+ * 늦게 끝난 rejection이 unhandled가 되지 않는다.
+ *
+ * @param {() => Promise<string|null|undefined>} lookup
+ * @param {number} timeoutMs
+ * @returns {Promise<string|null>}
+ */
+async function withWorktreeTimeout(lookup, timeoutMs = STATUS_CURRENT_WORKTREE_TIMEOUT_MS) {
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null
+  const lookupPromise = Promise.resolve()
+    .then(() => lookup())
+    .catch(() => null)
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs)
+  })
+  try {
+    return (await Promise.race([lookupPromise, timeoutPromise])) ?? null
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer)
+    }
+  }
+}
+
+/**
  * controller 동작에 연결된 커맨드 handler를 만든다(등록은 registerCommands가 한다).
  *
  * @param {Object} options
  * @param {() => Promise<void>} options.notifySafe 실패를 삼킨 알림 함수.
  * @param {number} options.timeoutMs handler 전체 deadline(ms).
+ * @param {number} options.statusWorktreeTimeoutMs status 알림의 현재 워크트리 조회 상한(ms).
  * @param {Object} options.controller
  * @returns {Record<string, () => Promise<void>>}
  */
-function createHandlers({ notifySafe, timeoutMs, controller }) {
+function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, controller }) {
   /**
    * handler 본문을 deadline 안에서 실행하고, 예외/타임아웃은 알림 후 정상 종료한다.
    * @param {() => Promise<void>} work
@@ -243,10 +274,12 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
     /** 상태 요약 알림. 토큰/원시 화면 없음. 현재 워크트리 특정 실패는 무시한다. */
     [COMMAND_IDS.status]: () =>
       withGuard(async () => {
-        // 현재 워크트리를 못 찾거나 조회가 실패해도 목록은 그대로 알린다.
-        const currentWorktreeId = await Promise.resolve()
-          .then(() => controller.currentWorktreeId())
-          .catch(() => null)
+        // 현재 워크트리 조회는 짧은 상한만 기다린다. 넘기거나 실패해도 null로
+        // 간주하고 즉시 요약을 알린다(알림이 늦어지지 않게 한다).
+        const currentWorktreeId = await withWorktreeTimeout(
+          () => controller.currentWorktreeId(),
+          statusWorktreeTimeoutMs,
+        )
         const { text } = await controller.statusSummary({ currentWorktreeId: currentWorktreeId ?? null })
         await notifySafe(NOTIFICATION_TITLE, text)
       }),
@@ -263,9 +296,17 @@ function createHandlers({ notifySafe, timeoutMs, controller }) {
  * @param {Object} options.controller
  * @param {(title: string, body?: string) => Promise<void>|void} options.notify
  * @param {number} [options.timeoutMs] handler 전체 deadline(ms). 기본 25000.
+ * @param {number} [options.statusWorktreeTimeoutMs] status 알림의 현재 워크트리 조회
+ *   상한(ms). 기본 2000.
  * @returns {void}
  */
-export function registerCommands({ orca, controller, notify, timeoutMs = DEFAULT_HANDLER_TIMEOUT_MS }) {
+export function registerCommands({
+  orca,
+  controller,
+  notify,
+  timeoutMs = DEFAULT_HANDLER_TIMEOUT_MS,
+  statusWorktreeTimeoutMs = STATUS_CURRENT_WORKTREE_TIMEOUT_MS,
+}) {
   /**
    * 알림 실패를 삼키는 wrapper.
    * @param {string} title
@@ -280,7 +321,7 @@ export function registerCommands({ orca, controller, notify, timeoutMs = DEFAULT
     }
   }
 
-  const handlers = createHandlers({ notifySafe, timeoutMs, controller })
+  const handlers = createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, controller })
   for (const id of Object.values(COMMAND_IDS)) {
     orca.commands.register(id, handlers[id])
   }

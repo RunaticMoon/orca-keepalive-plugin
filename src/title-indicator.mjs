@@ -37,6 +37,8 @@ const DEFAULT_REFRESH_MIN_INTERVAL_MS = 60_000
 const DEFAULT_SETTLE_MS = 1_500
 const DEFAULT_RPC_TIMEOUT_MS = 3_000
 const DEFAULT_MAX_FAILURES = 3
+const REMOVE_RETRY_BASE_MS = 10_000
+const REMOVE_RETRY_MAX_MS = 5 * 60_000
 
 /** 제목이 비었을 때 넣는 대체 base. */
 const FALLBACK_BASE = 'Claude'
@@ -174,7 +176,7 @@ function aggregateDesired(desired) {
  * @param {number} [deps.maxFailures]
  * @returns {{
  *   load: () => Promise<void>,
- *   reconcile: (desired: unknown) => Promise<void>,
+ *   reconcile: (desired: unknown, options?: {removeOnly?: boolean}) => Promise<void>,
  *   onTurnCompleted: (tabKey: string) => Promise<void>,
  *   restoreAll: () => Promise<void>,
  *   snapshot: () => {tabs: number, disabledTabs: number},
@@ -235,12 +237,16 @@ export function createTitleIndicator({
   const lastRefreshAt = new Map()
   /** @type {Map<string, number>} tabKey → 연속 실패 횟수. */
   const failures = new Map()
+  /** @type {Map<string, number>} tabKey → 제거 작업 연속 실패 횟수. apply 실패와 분리한다. */
+  const removeFailures = new Map()
+  /** @type {Map<string, number>} tabKey → 다음 제거 재시도 가능 시각(ms). */
+  const removeRetryAt = new Map()
   /** @type {Set<string>} 이 인스턴스에서 건너뛸 탭. */
   const disabled = new Set()
 
   let queueTail = Promise.resolve()
   let reconcileBusy = false
-  /** @type {unknown[]|null} */
+  /** @type {{list: unknown[], removeOnly: boolean}|null} */
   let pendingDesired = null
   let reconcileTail = Promise.resolve()
 
@@ -292,6 +298,26 @@ export function createTitleIndicator({
    */
   function clearFailures(tabKey) {
     failures.delete(tabKey)
+  }
+
+  /**
+   * 제거 실패를 기록하고 지수 백오프를 예약한다. apply용 disabled/failures는 건드리지 않는다.
+   * @param {string} tabKey
+   * @param {string} code
+   */
+  function noteRemoveFailure(tabKey, code) {
+    diagnose(code)
+    const count = (removeFailures.get(tabKey) ?? 0) + 1
+    removeFailures.set(tabKey, count)
+    const exponent = Math.min(count - 1, 5)
+    const delay = Math.min(REMOVE_RETRY_BASE_MS * 2 ** exponent, REMOVE_RETRY_MAX_MS)
+    removeRetryAt.set(tabKey, now() + delay)
+  }
+
+  /** @param {string} tabKey */
+  function clearRemoveFailure(tabKey) {
+    removeFailures.delete(tabKey)
+    removeRetryAt.delete(tabKey)
   }
 
   /**
@@ -451,6 +477,7 @@ export function createTitleIndicator({
       diagnose('save_failed')
     }
     clearFailures(tabKey)
+    clearRemoveFailure(tabKey)
   }
 
   /**
@@ -462,6 +489,7 @@ export function createTitleIndicator({
     wantByTab.delete(tabKey)
     lastRefreshAt.delete(tabKey)
     failures.delete(tabKey)
+    clearRemoveFailure(tabKey)
     try {
       await persistRecords()
     } catch {
@@ -471,17 +499,21 @@ export function createTitleIndicator({
 
   /**
    * want=false이고 기록이 있을 때 prefix를 되돌린다. 현재 제목이 applied와 같을
-   * 때만 rename(null)하고, 다르면(사용자 변경/탭 없음) rename하지 않는다. 어느
-   * 경우든 기록을 삭제·저장한다. 단 목록 조회 자체가 실패하면 기록을 남긴다.
+   * 때만 rename(null)하고, 사용자가 제목을 바꿨거나 탭이 없으면 rename 없이 기록을
+   * 정리한다. 조회/rename 실패면 기록을 보존하고 지수 백오프 후 재시도한다.
    * @param {string} tabKey
    * @param {{worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}} record
    */
   async function removeTab(tabKey, record) {
+    if (now() < (removeRetryAt.get(tabKey) ?? 0)) {
+      return
+    }
+
     let found
     try {
       found = await readTab(record.worktreeId, record.tabId, null)
     } catch {
-      noteFailure(tabKey, 'list_failed')
+      noteRemoveFailure(tabKey, 'list_failed')
       return
     }
 
@@ -493,20 +525,13 @@ export function createTitleIndicator({
           { timeoutMs: timeout },
         )
       } catch {
-        // stale handle/탭 없음: 기록만 삭제한다.
-        noteFailure(tabKey, 'rename_failed')
+        // 실패했을 수 있으므로 기록을 보존해 다음 reconcile에서 재시도한다.
+        noteRemoveFailure(tabKey, 'rename_failed')
+        return
       }
     }
 
-    records.delete(tabKey)
-    wantByTab.delete(tabKey)
-    lastRefreshAt.delete(tabKey)
-    failures.delete(tabKey)
-    try {
-      await persistRecords()
-    } catch {
-      diagnose('save_failed')
-    }
+    await deleteRecord(tabKey)
   }
 
   /**
@@ -522,7 +547,7 @@ export function createTitleIndicator({
       return
     }
     if (wantByTab.get(tabKey) === false) {
-      await deleteRecord(tabKey)
+      await removeTab(tabKey, record)
       return
     }
 
@@ -604,23 +629,37 @@ export function createTitleIndicator({
   /**
    * desired 하나를 모든 탭에 대해 반영한다.
    * @param {unknown[]} desired
+   * @param {boolean} removeOnly
    */
-  async function doReconcile(desired) {
+  async function doReconcile(desired, removeOnly) {
     const byTab = aggregateDesired(desired)
     const tabKeys = new Set([...byTab.keys(), ...records.keys()])
     for (const tabKey of tabKeys) {
       const agg = byTab.get(tabKey) ?? null
       const record = records.get(tabKey) ?? null
+      // 불완전 catalog에서는 명시적으로 알려진 off만 제거한다. 누락된 기록은
+      // 목록에서 사라졌다고 단정할 수 없고, on target도 새로 적용하지 않는다.
+      if (removeOnly && agg === null) {
+        continue
+      }
       const want = agg !== null && agg.want === true
       wantByTab.set(tabKey, want)
+
+      if (removeOnly) {
+        if (!want && record !== null) {
+          await removeTab(tabKey, record)
+        }
+        continue
+      }
 
       if (want) {
         if (record === null) {
           if (agg !== null && !disabled.has(tabKey)) {
             await applyTab(agg)
           }
-        } else if (record.confirmed !== true) {
+        } else if (record.confirmed !== true || removeFailures.has(tabKey)) {
           // 저장만 되고 rename이 확인되지 않은 기록은 다시 적용을 시도한다.
+          // 제거 재시도가 실패했던 탭도 on 전환 시 다시 적용해 표시기를 복구한다.
           // (crash로 이미 prefix가 붙어 있어도 base 계산이 중복 접두어를 막는다.)
           if (agg !== null && !disabled.has(tabKey)) {
             await applyTab(agg)
@@ -650,15 +689,18 @@ export function createTitleIndicator({
    * 최근 reconcile의 want 상태를 동기적으로 갱신한다. refresh가 "도중 off"를
    * 판단할 때 최신 호출을 즉시 볼 수 있게 한다.
    * @param {unknown[]} desired
+   * @param {boolean} removeOnly
    */
-  function applyWantState(desired) {
+  function applyWantState(desired, removeOnly) {
     const byTab = aggregateDesired(desired)
     for (const [tabKey, agg] of byTab) {
       wantByTab.set(tabKey, agg.want)
     }
-    for (const tabKey of records.keys()) {
-      if (!byTab.has(tabKey)) {
-        wantByTab.set(tabKey, false)
+    if (!removeOnly) {
+      for (const tabKey of records.keys()) {
+        if (!byTab.has(tabKey)) {
+          wantByTab.set(tabKey, false)
+        }
       }
     }
   }
@@ -666,12 +708,14 @@ export function createTitleIndicator({
   /**
    * desired를 반영한다. 진행 중이면 다음 호출은 최신 desired 하나로 합쳐진다.
    * @param {unknown} desired
+   * @param {{removeOnly?: boolean}} [options] 불완전 목록에서 off 제거만 수행한다.
    * @returns {Promise<void>}
    */
-  function reconcile(desired) {
+  function reconcile(desired, options = {}) {
     const list = Array.isArray(desired) ? desired : []
-    applyWantState(list)
-    pendingDesired = list
+    const removeOnly = options !== null && options.removeOnly === true
+    applyWantState(list, removeOnly)
+    pendingDesired = { list, removeOnly }
     if (!reconcileBusy) {
       reconcileBusy = true
       reconcileTail = enqueue(async () => {
@@ -679,7 +723,7 @@ export function createTitleIndicator({
           while (pendingDesired !== null) {
             const next = pendingDesired
             pendingDesired = null
-            await doReconcile(next)
+            await doReconcile(next.list, next.removeOnly)
           }
         } finally {
           reconcileBusy = false
@@ -707,6 +751,8 @@ export function createTitleIndicator({
       const parsed = parseStoredRecords(raw)
       records.clear()
       failures.clear()
+      removeFailures.clear()
+      removeRetryAt.clear()
       disabled.clear()
       if (parsed === null) {
         if (raw !== undefined && raw !== null) {
@@ -762,6 +808,7 @@ export function createTitleIndicator({
           wantByTab.delete(tabKey)
           lastRefreshAt.delete(tabKey)
           failures.delete(tabKey)
+          clearRemoveFailure(tabKey)
         }
       }
       try {

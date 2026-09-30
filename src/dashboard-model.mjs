@@ -148,13 +148,16 @@ function relativeFutureText(remainingMs) {
  * 상태 알림의 워크트리 한 줄. 현재 워크트리는 `▶ `, 실제 켜짐은 `⚡ `를 앞에
  * 붙이고 다음 전송/확인 필요를 덧붙인다. 원시 worktreeId·경로는 넣지 않는다.
  *
- * @param {object} worktree 스냅숏 worktree(`label`, `enabled`, `effectiveEnabled`, `terminals`).
+ * @param {object} worktree 스냅숏 worktree(`label`, `branch`, `enabled`, `effectiveEnabled`, `terminals`).
  * @param {{current: boolean, paused: boolean, defaultWorktreeEnabled: boolean, serverNow: number}} context
  * @returns {string}
  */
 function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled, serverNow }) {
   const wt = isPlainObject(worktree) ? worktree : {};
   const label = nonEmptyStringOrNull(wt.label) ?? '(이름 없음)';
+  const branch = nonEmptyStringOrNull(wt.branch);
+  // 제목은 프로젝트 이름(label)을 쓰고, branch가 있으면 보조로 덧붙인다.
+  const displayLabel = branch !== null && branch !== label ? `${label} (${branch})` : label;
   const override = typeof wt.enabled === 'boolean' ? wt.enabled : null;
   const scopeOn = override === null ? defaultWorktreeEnabled : override;
   const effective = wt.effectiveEnabled === true;
@@ -171,7 +174,7 @@ function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled,
   if (displayOn) {
     head += '⚡ ';
   }
-  head += label;
+  head += displayLabel;
   if (displayOn && paused) {
     head += ' 켜짐(일시정지 중)';
   } else {
@@ -537,6 +540,7 @@ export function createDashboardModel({
           id: wtId,
           worktreeHash: worktreeHashOf(worktreeId),
           label: nonEmptyStringOrNull(rawWorktree.label) ?? '(이름 없음)',
+          branch: nonEmptyStringOrNull(rawWorktree.branch),
           enabled,
           effectiveEnabled: gate.effectiveEnabled,
           reason: gate.reason,
@@ -871,10 +875,10 @@ export function createDashboardModel({
   }
 
   /** 상태 알림 본문 상한(문자). main.mjs의 알림 본문 상한 1000자보다 짧게 잡는다. */
-  const STATUS_MAX_CHARS = 900;
+  const STATUS_MAX_CHARS = 480;
 
   /**
-   * 커맨드/알림용 한국어 요약(비밀·경로·원시 worktreeId 없음, 900자 이하).
+   * 커맨드/알림용 한국어 요약(비밀·경로·원시 worktreeId 없음, 480자 이하).
    *
    * 1행은 전역 상태(켜짐/꺼짐(일시정지) · 타이머 · 연결)를, 이후에는 워크트리별
    * 켜짐/꺼짐 목록을 한 줄씩 보여준다. `options.currentWorktreeId`(원시 Orca
@@ -929,7 +933,7 @@ export function createDashboardModel({
       return { text: fullText };
     }
 
-    // 900자를 넘으면 뒤쪽 워크트리를 잘라 `… 외 N개`로 끝낸다.
+    // 480자를 넘으면 뒤쪽 워크트리를 잘라 `… 외 N개`로 끝낸다.
     let kept = 0;
     for (let k = lines.length - 1; k >= 0; k -= 1) {
       const candidate = [header, ...lines.slice(0, k), `… 외 ${lines.length - k}개`].join('\n');

@@ -391,6 +391,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     'policy_changed',
     'shutdown',
     'title_indicator',
+    'notify_failed',
   ]);
   assert.deepEqual(contracts.PUBLIC_SNAPSHOT_FORBIDDEN_KEYS, [
     'authToken',

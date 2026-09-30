@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import { createCoordinator } from '../src/coordinator.mjs'
 import { createStateStore } from '../src/state-store.mjs'
+import { createTitleIndicator } from '../src/title-indicator.mjs'
 import { sendKeepalive } from '../src/guarded-send.mjs'
 import { createDashboardModel } from '../src/dashboard-model.mjs'
 import { TIMING } from '../src/contracts.mjs'
@@ -144,6 +145,8 @@ function makeRow(overrides = {}) {
     incarnationId: 'inc1',
     title: 'Terminal 1',
     branch: 'main',
+    branchName: 'main',
+    projectName: null,
     connected: true,
     writable: true,
     lastOutputAt: 0,
@@ -219,7 +222,7 @@ function createObserverFake({ rows = [makeRow()] } = {}) {
  * @param {{onLoad?:Function, onReconcile?:Function, onTurnCompleted?:Function, onRestoreAll?:Function}} [overrides]
  */
 function createFakeTitleIndicator(overrides = {}) {
-  const calls = { load: 0, reconcile: [], onTurnCompleted: [], restoreAll: 0 }
+  const calls = { load: 0, reconcile: [], reconcileOptions: [], onTurnCompleted: [], restoreAll: 0 }
   return {
     calls,
     async load() {
@@ -228,10 +231,11 @@ function createFakeTitleIndicator(overrides = {}) {
         await overrides.onLoad()
       }
     },
-    reconcile(desired) {
+    reconcile(desired, options) {
       calls.reconcile.push(desired)
+      calls.reconcileOptions.push(options)
       if (typeof overrides.onReconcile === 'function') {
-        return overrides.onReconcile(desired)
+        return overrides.onReconcile(desired, options)
       }
       return undefined
     },
@@ -249,6 +253,39 @@ function createFakeTitleIndicator(overrides = {}) {
     },
     snapshot() {
       return { tabs: 0, disabledTabs: 0 }
+    },
+  }
+}
+
+function createTitleIndicatorRpc(rows) {
+  const originalTitles = new Map(rows.map((row) => [row.handle, row.title]))
+  const titles = new Map(originalTitles)
+  const renames = []
+  return {
+    titles,
+    renames,
+    rpc: {
+      async call(method, params) {
+        if (method === 'session.tabs.list') {
+          const worktreeId = params.worktree.slice('id:'.length)
+          return {
+            tabs: rows
+              .filter((row) => row.worktreeId === worktreeId)
+              .map((row) => ({
+                type: 'terminal',
+                parentTabId: row.tabId,
+                leafId: row.leafId,
+                title: titles.get(row.handle),
+              })),
+          }
+        }
+        if (method === 'terminal.rename') {
+          renames.push({ ...params })
+          titles.set(params.terminal, params.title === null ? originalTitles.get(params.terminal) : params.title)
+          return {}
+        }
+        throw new Error('unexpected RPC method')
+      },
     },
   }
 }
@@ -947,6 +984,48 @@ test('getRuntimeView: 계약 shape과 dueAt/expiresAt', async () => {
   assert.equal(term.expiresAt, t0 + 1000 + TTL_5M)
 })
 
+test('getRuntimeView: label은 projectName, branch는 branchName을 쓴다', async () => {
+  const h = createHarness({
+    terminals: [
+      makeRow({
+        projectName: 'route-dashboard',
+        branch: 'refs/heads/main',
+        branchName: 'main',
+      }),
+    ],
+  })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees.length, 1)
+  assert.equal(view.worktrees[0].label, 'route-dashboard')
+  assert.equal(view.worktrees[0].branch, 'main')
+})
+
+test('getRuntimeView: projectName이 없으면 branchName을 label로 쓴다', async () => {
+  const h = createHarness({
+    terminals: [
+      makeRow({ projectName: null, branch: 'refs/heads/main', branchName: 'main' }),
+    ],
+  })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].label, 'main')
+  assert.equal(view.worktrees[0].branch, 'main')
+})
+
+test('getRuntimeView: 둘 다 없으면 label/branch는 null', async () => {
+  const h = createHarness({
+    terminals: [makeRow({ projectName: null, branchName: null, branch: null })],
+  })
+  await startHarness(h)
+
+  const view = h.coordinator.getRuntimeView()
+  assert.equal(view.worktrees[0].label, null)
+  assert.equal(view.worktrees[0].branch, null)
+})
+
 test('getRuntimeView: 지원되지 않는 행도 이유와 함께 포함한다', async () => {
   const h = createHarness({
     terminals: [makeRow({ supported: false, unsupportedReason: 'UNSUPPORTED_AGENT', agentIdentity: null })],
@@ -1459,7 +1538,7 @@ test('title indicator: paused이거나 앱 타이머가 off면 on=false', async 
   assert.equal(desired[0].on, false)
 })
 
-test('title indicator: catalog 불완전/읽기 실패 tick에는 reconcile을 호출하지 않는다', async () => {
+test('title indicator: catalog 불완전/읽기 실패 tick은 off 제거만 수행한다', async () => {
   const h = createHarness()
   await startHarness(h)
   await h.store.updateConfig({ tabTitleIndicator: true })
@@ -1469,17 +1548,82 @@ test('title indicator: catalog 불완전/읽기 실패 tick에는 reconcile을 �
   assert.ok(before >= 1, '정상 tick에서는 reconcile을 호출한다')
   assert.equal(indicator.calls.reconcile.at(-1)[0].on, true)
 
-  // catalog가 불완전하면 호출하지 않는다.
+  // catalog가 불완전하면 명시적 off 제거 전용 reconcile을 요청한다.
   h.observer.state.complete = false
   await h.clock.advance(h.tickMs)
-  assert.equal(indicator.calls.reconcile.length, before)
+  assert.equal(indicator.calls.reconcile.length, before + 1)
+  assert.deepEqual(indicator.calls.reconcileOptions.at(-1), { removeOnly: true })
+  assert.equal(indicator.calls.reconcile.at(-1)[0].on, true)
 
-  // catalog 읽기 자체가 실패해도 호출하지 않는다.
+  // catalog 읽기 실패도 제거 전용 동작을 유지한다.
   h.observer.state.onList = () => {
     throw new Error('catalog down')
   }
   await h.clock.advance(h.tickMs)
-  assert.equal(indicator.calls.reconcile.length, before)
+  assert.equal(indicator.calls.reconcile.length, before + 2)
+  assert.deepEqual(indicator.calls.reconcileOptions.at(-1), { removeOnly: true })
+})
+
+test('title indicator: worktree off는 onPolicyChanged만으로 즉시 표시기를 끈다', async () => {
+  const rows = [makeRow()]
+  const titleRpc = createTitleIndicatorRpc(rows)
+  const h = createHarness({
+    terminals: rows,
+    rpc: titleRpc.rpc,
+    createTitleIndicator: (deps) => createTitleIndicator({ ...deps, settleMs: 0 }),
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await h.clock.advance(h.tickMs)
+  await h.clock.settle(5)
+  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
+
+  const catalogCalls = h.observer.listCalls.length
+  await h.store.setWorktree({ userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1' }, false)
+  h.coordinator.onPolicyChanged()
+  await h.clock.settle(8)
+
+  assert.equal(h.observer.listCalls.length, catalogCalls, 'policy 변경은 tick/catalog 조회를 앞당기지 않는다')
+  assert.deepEqual(titleRpc.renames.at(-1), { terminal: 'h1', title: null })
+  assert.equal(titleRpc.titles.get('h1'), 'Terminal 1')
+})
+
+test('title indicator: 전역 pause는 onPolicyChanged 즉시 모든 target을 off로 보낸다', async () => {
+  const rows = [
+    makeRow(),
+    makeRow({
+      handle: 'h2',
+      worktreeId: 'w2',
+      tabId: 'tab2',
+      leafId: 'leaf2',
+      paneKey: 'tab2:leaf2',
+      ptyId: 'pty2',
+      incarnationId: 'inc2',
+    }),
+  ]
+  const titleRpc = createTitleIndicatorRpc(rows)
+  const h = createHarness({
+    terminals: rows,
+    rpc: titleRpc.rpc,
+    createTitleIndicator: (deps) => createTitleIndicator({ ...deps, settleMs: 0 }),
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await h.clock.advance(h.tickMs)
+  await h.clock.settle(5)
+  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
+  assert.equal(titleRpc.titles.get('h2'), '⚡ Terminal 1')
+
+  await h.store.setPaused(true)
+  h.coordinator.onPolicyChanged()
+  await h.clock.settle(8)
+
+  assert.deepEqual(
+    titleRpc.renames.filter((rename) => rename.title === null).map((rename) => rename.terminal).sort(),
+    ['h1', 'h2'],
+  )
+  assert.equal(titleRpc.titles.get('h1'), 'Terminal 1')
+  assert.equal(titleRpc.titles.get('h2'), 'Terminal 1')
 })
 
 test('title indicator: 실제 턴 완료에 1회 호출, 자체 keepalive 턴에는 호출하지 않는다', async () => {

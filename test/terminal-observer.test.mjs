@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createObserver } from '../src/terminal-observer.mjs'
+import { createObserver, projectNameFromPath, branchNameFromRef } from '../src/terminal-observer.mjs'
 import { RpcError } from '../src/rpc-client.mjs'
 import { REASON_CODES } from '../src/contracts.mjs'
 
@@ -144,6 +144,8 @@ test('list: 정상 row를 TerminalRow로 변환하고 사용하지 않는 필드
   assert.equal(row.incarnationId, 'inc-1')
   assert.equal(row.title.length, 200)
   assert.equal(row.branch, 'main')
+  assert.equal(row.branchName, 'main')
+  assert.equal(row.projectName, 'repo')
   assert.equal(row.connected, true)
   assert.equal(row.writable, true)
   assert.equal(row.lastOutputAt, 1000)
@@ -219,9 +221,71 @@ test('list: ptyId/incarnationId/title/branch 누락은 null로 유지', async ()
   assert.equal(row.incarnationId, null)
   assert.equal(row.title, null)
   assert.equal(row.branch, null)
+  assert.equal(row.branchName, null)
+  assert.equal(row.projectName, null)
   assert.equal(row.lastOutputAt, null)
   assert.equal(row.agentIdentity, null)
   assert.equal(row.executionHostId, null)
+})
+
+test('projectNameFromPath: /와 \\ 구분자, 끝 구분자 무시, 빈 값은 null', () => {
+  assert.equal(projectNameFromPath('/Users/me/dev/route-dashboard'), 'route-dashboard')
+  assert.equal(projectNameFromPath('C:\\Users\\me\\route-dashboard'), 'route-dashboard')
+  assert.equal(projectNameFromPath('/Users/me/dev/route-dashboard/'), 'route-dashboard')
+  assert.equal(projectNameFromPath('route-dashboard'), 'route-dashboard')
+  assert.equal(projectNameFromPath('/'), null)
+  assert.equal(projectNameFromPath(''), null)
+  assert.equal(projectNameFromPath(null), null)
+  assert.equal(projectNameFromPath(42), null)
+})
+
+test('branchNameFromRef: refs/heads 제거, 없으면 원문, 빈 값은 null', () => {
+  assert.equal(branchNameFromRef('refs/heads/main'), 'main')
+  assert.equal(branchNameFromRef('refs/heads/feature/x'), 'feature/x')
+  assert.equal(branchNameFromRef('main'), 'main')
+  assert.equal(branchNameFromRef('refs/heads/'), null)
+  assert.equal(branchNameFromRef(''), null)
+  assert.equal(branchNameFromRef(null), null)
+  assert.equal(branchNameFromRef(42), null)
+})
+
+test('branchNameFromRef: refs/remotes와 refs/tags도 짧게 정리한다', () => {
+  assert.equal(branchNameFromRef('refs/remotes/origin/x'), 'origin/x')
+  assert.equal(branchNameFromRef('refs/remotes/upstream/feature/y'), 'upstream/feature/y')
+  assert.equal(branchNameFromRef('refs/tags/v1'), 'v1')
+  assert.equal(branchNameFromRef('refs/tags/release/2.0'), 'release/2.0')
+})
+
+test('branchNameFromRef: 그 외 refs/ 접두어는 첫 구성요소를 뺀 나머지, 비면 null', () => {
+  assert.equal(branchNameFromRef('refs/notes/commits'), 'commits')
+  assert.equal(branchNameFromRef('refs/pull/123/head'), '123/head')
+  // `refs/` 뒤 첫 구성요소만 있고 나머지가 비면 원문 대신 null.
+  assert.equal(branchNameFromRef('refs/stash'), null)
+  assert.equal(branchNameFromRef('refs/'), null)
+  assert.equal(branchNameFromRef('refs/heads/'), null)
+})
+
+test('list: worktreePath와 branch ref로 projectName/branchName을 만든다', async () => {
+  const { observer } = observerFor({
+    'terminal.list': listResult([
+      summary({
+        handle: 'h-proj',
+        worktreePath: '/Users/me/dev/route-dashboard',
+        branch: 'refs/heads/main',
+      }),
+      summary({ handle: 'h-nopath', worktreePath: undefined, branch: 'refs/heads/feature/x' }),
+      summary({ handle: 'h-none', worktreePath: undefined, branch: undefined }),
+    ]),
+  })
+  const catalog = await observer.list()
+  const byHandle = Object.fromEntries(catalog.terminals.map((row) => [row.handle, row]))
+  assert.equal(byHandle['h-proj'].projectName, 'route-dashboard')
+  assert.equal(byHandle['h-proj'].branchName, 'main')
+  assert.equal(byHandle['h-nopath'].projectName, null)
+  assert.equal(byHandle['h-nopath'].branchName, 'feature/x')
+  assert.equal(byHandle['h-none'].projectName, null)
+  assert.equal(byHandle['h-none'].branchName, null)
+  assert.ok(!('worktreePath' in byHandle['h-proj']))
 })
 
 test('list: unsupportedReason 우선순위(agent → host → 연결)', async () => {

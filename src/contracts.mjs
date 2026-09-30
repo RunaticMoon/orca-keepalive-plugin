@@ -164,7 +164,8 @@
  * @typedef {Object} DashboardWorktree
  * @property {string} id opaque worktreeId.
  * @property {string} worktreeHash 원시 worktreeId의 sha256 앞 16 hex(원시 id 미노출).
- * @property {string} label 표시용 label(branch/title에서 생성).
+ * @property {string} label 표시용 label(프로젝트 이름).
+ * @property {string|null} branch 표시용 짧은 branch 이름(없으면 null).
  * @property {boolean} enabled
  * @property {boolean} effectiveEnabled
  * @property {string} reason
@@ -326,6 +327,7 @@ export const DIAGNOSTIC_EVENTS = deepFreeze([
   'policy_changed',
   'shutdown',
   'title_indicator',
+  'notify_failed',
 ]);
 
 /**

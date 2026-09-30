@@ -149,6 +149,7 @@ export function createPlugin(orca, deps = {}) {
 
   /**
    * 호스트 알림을 보낸다. 실패는 삼킨다(알림 오류가 흐름을 깨지 않게).
+   * 전달 실패(예외 또는 delivered:false)는 안전한 코드만 진단에 남긴다.
    *
    * @param {string} title
    * @param {string} [body]
@@ -156,12 +157,24 @@ export function createPlugin(orca, deps = {}) {
    */
   async function notify(title, body) {
     try {
-      await orca.host.call(
+      const result = await orca.host.call(
         'notifications.show',
         body ? { title, body: String(body).slice(0, NOTIFICATION_BODY_MAX_CHARS) } : { title },
       )
+      // 호출이 성공해도 알림이 실제로 전달되지 않을 수 있다. 안전한 코드만 남긴다.
+      if (
+        diagnostics !== null &&
+        result !== null &&
+        typeof result === 'object' &&
+        /** @type {Record<string, unknown>} */ (result).delivered === false
+      ) {
+        diagnostics.record({ event: 'notify_failed', code: 'not_delivered' })
+      }
     } catch {
-      // 알림 실패는 명령을 실패로 만들지 않는다.
+      // 알림 실패는 명령을 실패로 만들지 않는다. 안전한 코드만 남긴다.
+      if (diagnostics !== null) {
+        diagnostics.record({ event: 'notify_failed', code: 'host_call_failed' })
+      }
     }
   }
 

@@ -23,7 +23,9 @@ import { REASON_CODES } from './contracts.mjs'
  * @property {string|null} ptyId
  * @property {string|null} incarnationId
  * @property {string|null} title 최대 200자로 자른 값.
- * @property {string|null} branch
+ * @property {string|null} branch 원시 branch ref.
+ * @property {string|null} branchName 표시용 짧은 branch 이름(`refs/heads/` 제거).
+ * @property {string|null} projectName worktreePath의 마지막 경로 요소(전체 경로 미노출).
  * @property {boolean} connected
  * @property {boolean} writable
  * @property {number|null} lastOutputAt
@@ -104,6 +106,47 @@ function finiteNumberOrNull(value) {
 }
 
 /**
+ * worktreePath에서 마지막 경로 요소(프로젝트 이름)만 뽑는다. `/`와 `\`를 모두
+ * 구분자로 보고 끝 구분자는 무시한다. 경로가 없거나 이름이 비면 null이다.
+ * 원시 전체 경로는 반환/저장하지 않는다.
+ * @param {unknown} worktreePath
+ * @returns {string|null}
+ */
+export function projectNameFromPath(worktreePath) {
+  if (typeof worktreePath !== 'string' || worktreePath.length === 0) {
+    return null
+  }
+  const segments = worktreePath.split(/[\\/]+/).filter((segment) => segment.length > 0)
+  if (segments.length === 0) {
+    return null
+  }
+  return segments[segments.length - 1]
+}
+
+/**
+ * branch ref에서 짧은 branch/태그 이름을 뽑는다. `refs/` 접두어가 있으면 `refs/`와
+ * 그 뒤 첫 구성요소(헤드 종류/remote)를 떼고 나머지를 쓴다(예: `refs/heads/main` →
+ * `main`, `refs/remotes/origin/x` → `origin/x`, `refs/tags/v1` → `v1`). 나머지가
+ * 비면 null이다. `refs/` 접두어가 없으면 원문을 쓰고, 비어 있으면 null이다.
+ * @param {unknown} branch
+ * @returns {string|null}
+ */
+export function branchNameFromRef(branch) {
+  const value = stringOrNull(branch)
+  if (value === null) {
+    return null
+  }
+  const prefix = 'refs/'
+  if (!value.startsWith(prefix)) {
+    return value
+  }
+  const parts = value.slice(prefix.length).split('/')
+  // `refs/heads/feature/x`처럼 첫 구성요소 뒤에 여러 단계가 남을 수 있다.
+  const name = parts.slice(1).join('/')
+  return name.length > 0 ? name : null
+}
+
+/**
  * row의 지원 여부와 unsupportedReason을 계산한다. §5.1.
  * @param {{agentIdentity:string|null, executionHostId:string|null, connected:boolean, writable:boolean, ptyId:string|null}} row
  * @returns {string|null} 지원되면 null, 아니면 reason 코드.
@@ -156,6 +199,8 @@ function parseRow(raw) {
     incarnationId,
     title,
     branch: stringOrNull(raw.branch),
+    branchName: branchNameFromRef(raw.branch),
+    projectName: projectNameFromPath(raw.worktreePath),
     connected: raw.connected,
     writable: raw.writable,
     lastOutputAt: finiteNumberOrNull(raw.lastOutputAt),

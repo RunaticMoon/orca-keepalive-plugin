@@ -519,6 +519,24 @@ test('status handler notifies with a null id when currentWorktreeId fails', asyn
   assert.equal(notifyCalls[0].body, '상태 요약')
 })
 
+test('status handler notifies promptly even when currentWorktreeId never resolves', async () => {
+  const { notifyCalls, handlerFor } = setup(
+    {
+      async currentWorktreeId() {
+        return await new Promise(() => {})
+      },
+    },
+    { statusWorktreeTimeoutMs: 50 },
+  )
+  const started = Date.now()
+  await handlerFor(COMMAND_IDS.status)()
+  const elapsed = Date.now() - started
+
+  assert.ok(elapsed < 2000, `handler resolved promptly (took ${elapsed}ms)`)
+  assert.equal(notifyCalls.length, 1)
+  assert.equal(notifyCalls[0].body, '상태 요약')
+})
+
 // ---------------------------------------------------------------------------
 // error containment + timeout
 // ---------------------------------------------------------------------------

@@ -303,6 +303,135 @@ test('remove: 사용자가 바꾼 제목이면 rename하지 않고 기록만 지
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
+test('removeOnly: 명시된 off만 제거하고 on 적용이나 누락 기록 정리는 하지 않는다', async () => {
+  const missingKey = 'wt-missing:tab-missing'
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+        },
+        [missingKey]: {
+          worktreeId: 'wt-missing',
+          tabId: 'tab-missing',
+          handle: 'h-missing',
+          applied: PREFIX + 'Other',
+        },
+      },
+    ],
+  ])
+  const { rpc, ti } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile(
+    [
+      pane({ on: false }),
+      pane({ worktreeId: 'wt-new', tabId: 'tab-new', leafId: 'leaf-new', handle: 'h-new', on: true }),
+    ],
+    { removeOnly: true },
+  )
+
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: null },
+  ])
+  assert.deepEqual(Object.keys(storage.get(KEY)), [missingKey])
+  assert.deepEqual(ti.snapshot(), { tabs: 1, disabledTabs: 0 })
+})
+
+test('remove: 실패 재시도는 지수 백오프를 따르고 성공 시 기록을 정리한다', async () => {
+  let failRemoval = true
+  const { rpc, ti, clock } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
+    rename: (params) => {
+      if (params.title === null && failRemoval) {
+        throw new Error('rename down')
+      }
+      return {}
+    },
+  })
+  await ti.load()
+  await ti.reconcile([pane()])
+
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 2)
+  assert.equal(rpc.callsFor('terminal.rename').filter((call) => call.params.title === null).length, 1)
+
+  // 첫 지연 10초 전에는 일반 reconcile이 RPC를 반복하지 않는다.
+  await ti.reconcile([pane({ on: false })])
+  clock.advance(9_999)
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 2)
+
+  // 첫 재시도 실패 뒤에는 20초로 늘어나며, 만료 전 호출은 다시 건너뛴다.
+  clock.advance(1)
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 3)
+  assert.equal(rpc.callsFor('terminal.rename').filter((call) => call.params.title === null).length, 2)
+  failRemoval = false
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 3)
+  clock.advance(19_999)
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 3)
+
+  clock.advance(1)
+  await ti.reconcile([pane({ on: false })])
+  assert.equal(rpc.callsFor('session.tabs.list').length, 4)
+  assert.equal(rpc.callsFor('terminal.rename').filter((call) => call.params.title === null).length, 3)
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
+  assert.deepEqual(rpc.callsFor('terminal.rename').at(-1).params, { terminal: HANDLE, title: null })
+})
+
+test('remove 실패는 apply disabled를 만들지 않고 on 전환 후 재적용할 수 있다', async () => {
+  let failRemoval = true
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: false,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, clock } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
+    rename: (params) => {
+      if (params.title === null && failRemoval) {
+        throw new Error('rename down')
+      }
+      return {}
+    },
+    storage,
+  })
+  await ti.load()
+
+  await ti.reconcile([pane({ on: false })])
+  clock.advance(10_000)
+  await ti.reconcile([pane({ on: false })])
+  clock.advance(20_000)
+  await ti.reconcile([pane({ on: false })])
+  assert.deepEqual(ti.snapshot(), { tabs: 1, disabledTabs: 0 })
+
+  failRemoval = false
+  await ti.reconcile([pane()])
+  assert.deepEqual(ti.snapshot(), { tabs: 1, disabledTabs: 0 })
+  assert.deepEqual(rpc.callsFor('terminal.rename').at(-1).params, {
+    terminal: HANDLE,
+    title: PREFIX + 'Claude',
+  })
+})
+
 test('load 후 원치 않는 기록은 reconcile에서 정리한다(비정상 종료 복구)', async () => {
   const storage = new Map([
     [
@@ -354,6 +483,23 @@ test('onTurnCompleted: refresh 순서(null → settle → 새 applied)와 간격
   const before = rpc.callsFor('terminal.rename').length
   await ti.onTurnCompleted(TAB_KEY)
   assert.equal(rpc.callsFor('terminal.rename').length, before)
+})
+
+test('onTurnCompleted: refresh 실행 전 off면 remove 경로로 제목을 되돌린다', async () => {
+  const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })) })
+  await ti.load()
+  await ti.reconcile([pane()])
+
+  // refresh를 queue에 먼저 올리고, 다음 동기 desired 갱신에서 off 상태를 먼저 알린다.
+  const refresh = ti.onTurnCompleted(TAB_KEY)
+  const off = ti.reconcile([pane({ on: false })])
+  await Promise.all([refresh, off])
+
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: PREFIX + 'Claude' },
+    { terminal: HANDLE, title: null },
+  ])
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
 test('onTurnCompleted: refresh 도중 want가 false면 재적용하지 않고 기록을 지운다', async () => {
@@ -448,14 +594,14 @@ test('연속 실패가 maxFailures회면 그 탭을 건너뛴다', async () => {
   assert.equal(rpc.callsFor('session.tabs.list').length, 3)
 })
 
-test('비활성 탭도 기록이 있으면 remove는 시도한다', async () => {
+test('remove 실패는 apply disabled를 만들지 않고 백오프 후 계속 시도한다', async () => {
   let mode = 'ok'
   const storage = new Map()
   const tabsList = () => {
     if (mode === 'fail') throw new Error('down')
     return listOf(entry({ title: PREFIX + 'Claude' }))
   }
-  const { rpc, ti, storage: store } = setup({ tabsList, storage })
+  const { rpc, ti, clock, storage: store } = setup({ tabsList, storage })
   await ti.load()
   await ti.reconcile([pane()])
   assert.equal(store.get(KEY)[TAB_KEY].applied, PREFIX + 'Claude')
@@ -464,13 +610,15 @@ test('비활성 탭도 기록이 있으면 remove는 시도한다', async () => 
   await ti.reconcile([])
   await ti.reconcile([])
   await ti.reconcile([])
-  assert.deepEqual(ti.snapshot(), { tabs: 1, disabledTabs: 1 })
+  assert.deepEqual(ti.snapshot(), { tabs: 1, disabledTabs: 0 })
+  assert.equal(rpc.callsFor('session.tabs.list').length, 2, '백오프 전에는 조회를 반복하지 않는다')
 
   mode = 'ok'
   const before = rpc.callsFor('session.tabs.list').length
+  clock.advance(10_000)
   await ti.reconcile([])
   assert.ok(rpc.callsFor('session.tabs.list').length > before)
-  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 1 })
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
 // ---------------------------------------------------------------------------

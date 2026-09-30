@@ -81,6 +81,17 @@ test('title_indicator는 DIAGNOSTIC_EVENTS에 정식 등록되어 유지된다',
   assert.equal(diag.snapshot()[0].event, 'title_indicator')
 })
 
+test('notify_failed는 DIAGNOSTIC_EVENTS에 정식 등록되어 유지된다', () => {
+  assert.ok(DIAGNOSTIC_EVENTS.includes('notify_failed'))
+  const diag = createDiagnostics({ now: fixedNow })
+  diag.record({ event: 'notify_failed', code: 'not_delivered' })
+  const entries = diag.snapshot()
+  assert.equal(entries[0].event, 'notify_failed')
+  assert.equal(entries[0].code, 'not_delivered')
+  // 신규 event가 unknown_event로 뭉개지지 않는다.
+  assert.equal(diag.snapshot()[0].event, 'notify_failed')
+})
+
 test('code는 REASON_CODES 값과 lower_snake_case만 유지하고 나머지는 other', () => {
   const diag = createDiagnostics({ now: fixedNow })
 

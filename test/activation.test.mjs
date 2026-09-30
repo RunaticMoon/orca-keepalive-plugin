@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import activateDefault, { createPlugin, deactivate } from '../main.mjs'
 import { LocationError } from '../src/runtime-location.mjs'
 import { createCoordinator as realCreateCoordinator } from '../src/coordinator.mjs'
+import { createDiagnostics } from '../src/diagnostics.mjs'
 
 const ALL_CAPABILITIES = [
   'workspace:read',
@@ -41,9 +42,13 @@ const noopClock = {
 /**
  * fake orca worker API. host.call은 storage와 notifications만 메모리에 기록한다.
  *
- * @param {{grantedCapabilities?: string[], failNotifications?: boolean}} [options]
+ * @param {{grantedCapabilities?: string[], failNotifications?: boolean, delivered?: boolean}} [options]
  */
-function createFakeOrca({ grantedCapabilities = ALL_CAPABILITIES, failNotifications = false } = {}) {
+function createFakeOrca({
+  grantedCapabilities = ALL_CAPABILITIES,
+  failNotifications = false,
+  delivered = true,
+} = {}) {
   /** @type {string[]} */
   const registeredCommandOrder = []
   /** @type {Map<string, () => unknown>} */
@@ -84,7 +89,7 @@ function createFakeOrca({ grantedCapabilities = ALL_CAPABILITIES, failNotificati
             throw Object.assign(new Error('notification failed'), { code: 'notification_failed' })
           }
           notifications.push(params)
-          return { ok: true }
+          return { ok: true, delivered }
         }
         throw Object.assign(new Error('unsupported host method: ' + method), {
           code: 'unsupported_method',
@@ -375,6 +380,62 @@ test('keepalive-status는 런타임 없음 상태 문구를 알림으로 보낸�
   assert.equal(notifications[0].title, 'Cache Keepalive')
   assert.equal(typeof notifications[0].body, 'string')
   assert.ok(notifications[0].body.length > 0)
+
+  await plugin.deactivate()
+})
+
+test('notify가 delivered:false를 반환하면 diagnostics에 not_delivered를 기록하고 예외는 없다', async () => {
+  const { orca, commands } = createFakeOrca({ delivered: false })
+  const diag = createDiagnostics({ log: () => {} })
+  const plugin = createPlugin(orca, {
+    ...baseDeps(),
+    createDiagnostics: () => diag,
+  })
+  plugin.activate()
+
+  const handler = commands.get('keepalive-status')
+  await assert.doesNotReject(() => handler())
+
+  const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
+  assert.equal(events.length, 1)
+  assert.equal(events[0].code, 'not_delivered')
+
+  await plugin.deactivate()
+})
+
+test('notify가 throw하면 diagnostics에 host_call_failed를 기록하고 예외는 전파되지 않는다', async () => {
+  const { orca, commands } = createFakeOrca({ failNotifications: true })
+  const diag = createDiagnostics({ log: () => {} })
+  const plugin = createPlugin(orca, {
+    ...baseDeps(),
+    createDiagnostics: () => diag,
+  })
+  plugin.activate()
+
+  const handler = commands.get('keepalive-status')
+  await assert.doesNotReject(() => handler())
+
+  const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
+  assert.equal(events.length, 1)
+  assert.equal(events[0].code, 'host_call_failed')
+
+  await plugin.deactivate()
+})
+
+test('notify가 delivered:true를 반환하면 diagnostics에 notify_failed가 기록되지 않는다', async () => {
+  const { orca, commands } = createFakeOrca()
+  const diag = createDiagnostics({ log: () => {} })
+  const plugin = createPlugin(orca, {
+    ...baseDeps(),
+    createDiagnostics: () => diag,
+  })
+  plugin.activate()
+
+  const handler = commands.get('keepalive-status')
+  await handler()
+
+  const events = diag.snapshot().filter((entry) => entry.event === 'notify_failed')
+  assert.equal(events.length, 0)
 
   await plugin.deactivate()
 })

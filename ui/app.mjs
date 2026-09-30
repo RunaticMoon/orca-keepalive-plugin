@@ -284,6 +284,7 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
         return {
           id: typeof wt.id === 'string' ? wt.id : '',
           label: typeof wt.label === 'string' ? wt.label : '',
+          branch: typeof wt.branch === 'string' ? wt.branch : '',
           enabled,
           inherited: enabled === null,
           scopeOn,
@@ -686,7 +687,11 @@ function boot() {
       const section = el('section', 'worktree');
 
       const head = el('div', 'worktree-head');
-      head.appendChild(el('h3', null, worktree.label || '워크트리'));
+      const titleEl = el('h3', null, worktree.label || '워크트리');
+      if (worktree.branch && worktree.branch !== worktree.label) {
+        titleEl.appendChild(el('span', 'worktree-branch', ` (${worktree.branch})`));
+      }
+      head.appendChild(titleEl);
       const toggle = el(
         'button',
         'btn',

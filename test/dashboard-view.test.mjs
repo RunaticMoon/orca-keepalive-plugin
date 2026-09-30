@@ -164,6 +164,7 @@ test('toViewModel: base snapshot flattens worktrees, terminals and timers', () =
   assert.match(vm.appTimer.text, /5분/);
   assert.equal(vm.worktrees.length, 1);
   assert.equal(vm.worktrees[0].label, 'main');
+  assert.equal(vm.worktrees[0].branch, '');
   assert.equal(vm.worktrees[0].terminals.length, 3);
 
   const t1 = vm.worktrees[0].terminals[0];
@@ -175,6 +176,22 @@ test('toViewModel: base snapshot flattens worktrees, terminals and timers', () =
   assert.equal(t1.expired, false);
   assert.equal(t1.reasonText, reasonText('BUSY'));
   assert.equal(vm.maxConsecutiveText, '3');
+});
+
+test('toViewModel: worktree branch를 보조 텍스트로 전달', () => {
+  const snap = makeSnapshot();
+  snap.worktrees = [{ ...snap.worktrees[0], label: 'route-dashboard', branch: 'main' }];
+  const vm = toViewModel(snap, 0);
+  assert.equal(vm.worktrees[0].label, 'route-dashboard');
+  assert.equal(vm.worktrees[0].branch, 'main');
+});
+
+test('toViewModel: branch가 없으면 빈 문자열', () => {
+  const snap = makeSnapshot();
+  snap.worktrees = [{ ...snap.worktrees[0] }];
+  delete snap.worktrees[0].branch;
+  const vm = toViewModel(snap, 0);
+  assert.equal(vm.worktrees[0].branch, '');
 });
 
 test('toViewModel: client elapsed time advances the countdown', () => {
