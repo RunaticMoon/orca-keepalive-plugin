@@ -123,8 +123,28 @@ the file is only read, never written.
 ## Installation
 
 There is no build or install command. The repository root *is* the plugin
-(`orca-plugin.json`, `main.mjs`, `src/`, `ui/`). This community plugin is not listed
-in any marketplace; install it directly from Git or from a local folder.
+(`orca-plugin.json`, `main.mjs`, `src/`, `ui/`). This repository also provides a
+community marketplace through `orca-marketplace.json`.
+
+### From the marketplace (recommended)
+
+1. Open **Settings > Plugins > Manage sources** and add a marketplace:
+   - **Git URL:** `https://github.com/RunaticMoon/orca-keepalive-plugin.git`
+   - **Git ref:** `main`
+2. Find **Cache Keepalive** in the marketplace and click **Install**.
+3. Review and approve the requested permissions.
+
+For subsequent updates, click **Refresh**, then **Check for update** on the plugin,
+review the preview, and confirm the update. Refresh only reloads the marketplace
+listings; it does not install code automatically. The listing follows `main`, so
+updates use the latest published commit without entering the Git URL again.
+This is a community source, not an official Orca marketplace listing.
+
+Existing Git URL/local-folder installs do not automatically become marketplace
+installs when the source is added. Orca currently only shows **Check for update**
+for marketplace installs. Back up existing settings before any removal/reinstall
+needed to switch installation source; migration has not been verified in Orca.
+The marketplace UI requires an Orca version that provides **Manage sources**.
 
 ### From the Git URL
 
@@ -538,13 +558,14 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   `완료+TTL-120초`. 캐시 epoch당 최대 1회만 보내고, 마감이 지나면 따라잡지 않습니다.
 - **상한:** 연속 keepalive 기본 3회(0=무제한). 자체 전송이 아닌 새 working 턴이
   관측되면 카운터가 자동 초기화됩니다. `~/.claude/cwarm.disabled`를 존중합니다.
-- **설치:** 마켓플레이스에는 등록하지 않는 커뮤니티 플러그인입니다. Orca 설정 >
-  Plugins > "Install plugin" > "Git URL" 탭에
-  `https://github.com/RunaticMoon/orca-keepalive-plugin#main`을 넣어 설치합니다.
-  `#ref`는 필수이며 브랜치(`#main`, 최신 코드)·태그(`#v0.1.0`, 고정)·커밋 모두
-  됩니다. 자동 업데이트는 없고 같은 URL로 다시 설치하면 최신 커밋으로 교체되며
-  설정은 유지됩니다. 개발 중에는 Plugins > Development에서 폴더 절대 경로를 넣고
-  "Add path". 어느 방식이든 권한 검토가 필요하며 빌드/설치 명령은 없습니다.
+- **설치/업데이트:** 이 저장소 자체가 커뮤니티 marketplace입니다. Orca 설정 >
+  Plugins > Manage sources에서 Git URL에
+  `https://github.com/RunaticMoon/orca-keepalive-plugin.git`, Git ref에 `main`을
+  넣고 추가한 뒤 Cache Keepalive를 설치합니다. 이후 **Refresh → Check for update →
+  변경 확인 및 적용**으로 업데이트합니다. 새로고침만으로 자동 설치되지는 않습니다.
+  기존 Git URL/로컬 설치는 자동 전환되지 않으며, 전환을 위해 삭제·재설치할 경우
+  먼저 설정을 백업하세요(실제 전환은 미검증). Git URL 직접 설치와 Development 폴더
+  등록도 계속 지원합니다.
 - **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
   events:subscribe.
 - **명령 8개 + 단축키:** 팔레트는 ⌘J(macOS)/Ctrl+Shift+J(Linux/Windows)로 열고

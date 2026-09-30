@@ -4,8 +4,8 @@ This document covers the release inputs, how users install the plugin, and the
 release checklist.
 
 Cache Keepalive is a **community plugin distributed directly from its public Git
-repository**. It is **not registered in any Orca marketplace index**, and no
-marketplace registration is planned.
+repository**. The root `orca-marketplace.json` makes the same repository a custom
+Orca marketplace. It is not part of the official Orca marketplace.
 
 The repository root is the plugin. There is no build step and no `npm install` at
 install time. A release is a git tag whose commit contains `orca-plugin.json`,
@@ -43,6 +43,21 @@ official or Stably-published.
 ---
 
 ## 2. How users install it
+
+### Marketplace (recommended)
+
+Add `https://github.com/RunaticMoon/orca-keepalive-plugin.git` with Git ref `main`
+in **Settings > Plugins > Manage sources**, then install Cache Keepalive from its
+listing. See the [README](../README.md#from-the-marketplace-recommended) for the
+update flow and existing-install migration caveat.
+
+The index lists `runaticmoon.cache-keepalive` and points to this repository's `main`.
+Publish code changes to `main` (bumping the plugin version when code changes).
+Users then choose **Refresh → Check for update → review and confirm**. No separate
+marketplace repository, npm package, or index edit is needed for each release as
+long as the identity and source stay the same. Refresh does not auto-install.
+
+### Direct installation
 
 Orca's **Settings > Plugins > "Install plugin"** dialog offers two tabs that do not
 go through a marketplace:
@@ -87,7 +102,12 @@ permission change is shown for review again.
 5. [ ] Optional: tag a fixed release and push the tag
        (`git tag v0.1.0 && git push origin v0.1.0`). Users on `#main` do not need
        tags; tags are for users who want a pinned version.
-6. [ ] Smoke-test the Git URL install in Orca (`#main` and, if tagged, the tag):
+6. [ ] Ensure `orca-marketplace.json` is present on remote `main` and its plugin id
+       matches `<publisher>.<id>` in `orca-plugin.json`.
+7. [ ] Smoke-test marketplace source registration, install, Refresh, Check for
+       update, and confirmation in Orca. Actual Orca marketplace E2E and migration
+       from a direct install have not yet been verified.
+8. [ ] Smoke-test the Git URL install in Orca (`#main` and, if tagged, the tag):
        install, permission review, enable, reinstall to update, disable, remove.
 
 ---

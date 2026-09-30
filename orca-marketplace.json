@@ -1,0 +1,18 @@
+{
+  "name": "RunaticMoon Plugins",
+  "owner": "RunaticMoon",
+  "plugins": [
+    {
+      "id": "runaticmoon.cache-keepalive",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/RunaticMoon/orca-keepalive-plugin.git",
+        "ref": "main"
+      },
+      "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",
+      "categories": [
+        "utilities"
+      ]
+    }
+  ]
+}
