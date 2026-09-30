@@ -67,6 +67,15 @@ test('keepalive toggle shortcuts are documented in the panel', async () => {
   assert.deepEqual(kbdIds, referencedIds)
 })
 
+test('panel explains all three tab symbols and title refresh behavior', async () => {
+  const html = await readFile(panelPath, 'utf8')
+  assert.match(html, /탭 이름에 캐시 상태 표시/)
+  for (const label of ['⚡ 유지 중', '💤 유지 중인 캐시 없음', '⚠️ 확인 필요']) {
+    assert.ok(html.includes(label), label)
+  }
+  assert.match(html, /같은 기호가 유지되면 제목을 다시 쓰지 않습니다/)
+})
+
 test('inline action script parses and fits Orca shell prelude', async () => {
   const html = await readFile(panelPath, 'utf8')
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1])

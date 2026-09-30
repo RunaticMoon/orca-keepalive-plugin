@@ -13,9 +13,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { DIAGNOSTIC_EVENTS, REASON_CODES } from '../src/contracts.mjs';
+import { DIAGNOSTIC_EVENTS, REASON_CODES, EXPIRE_CAUSE_REASONS } from '../src/contracts.mjs';
 import {
   DIAGNOSTIC_EVENT_TEXT,
+  EXPIRE_CAUSE_TEXT,
+  cacheStatusDisplay,
+  formatCacheTime,
   formatRemaining,
   reasonText,
   toViewModel,
@@ -149,6 +152,69 @@ test('reasonText: unknown and empty codes are handled safely', () => {
   assert.equal(reasonText(null), '');
   assert.equal(reasonText(undefined), '');
   assert.equal(reasonText(42), '');
+});
+
+test('expiry cause: every allowed reason has separate past-tense Korean text', () => {
+  assert.deepEqual(Object.keys(EXPIRE_CAUSE_TEXT).sort(), [...EXPIRE_CAUSE_REASONS].sort());
+  for (const code of EXPIRE_CAUSE_REASONS) {
+    assert.match(EXPIRE_CAUSE_TEXT[code], /[가-힣]/, code);
+    assert.match(EXPIRE_CAUSE_TEXT[code], /못함$/, code);
+  }
+});
+
+test('cache statuses: all user-facing states come from cacheStatus, including no reservation variants', () => {
+  const now = new Date(2026, 8, 30, 12, 0).getTime();
+  const future = now + 60_000;
+  const base = { phase: 'ARMED', reason: 'NO_FRESH_TURN', expiresAt: future, expiredAt: null, expireCause: null };
+  const cases = [
+    ['working', '캐시 유지 중 · 작업 진행 중'],
+    ['scheduled', `캐시 유지 중 · 만료 예정 ${formatCacheTime(future, now)}`],
+    ['sending', '캐시 유지 중 · 유지 메시지 전송 중'],
+    ['awaiting-turn', '캐시 유지 중 · 작업 시작 확인 중'],
+    ['interactive-wait', '유지 중단 · 권한·입력 응답 대기'],
+    ['suspended', `유지 중단 · ${reasonText('NO_FRESH_TURN')}`],
+    ['review', '확인 필요 · 전송 결과를 확인하세요'],
+  ];
+  for (const [cacheStatus, expected] of cases) {
+    assert.equal(cacheStatusDisplay({ ...base, cacheStatus }, now).text, expected, cacheStatus);
+  }
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'expired', expiredAt: now, expireCause: 'DRAFT_PRESENT' }, now).text,
+    `캐시 만료됨 · ${formatCacheTime(now, now)} · 입력창 초안이 감지되어 전송하지 못함`);
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'expired', expiredAt: now, expireCause: null }, now).text,
+    `캐시 만료됨 · ${formatCacheTime(now, now)} · 전송 차단 사유 기록 없음`);
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation' }, now).text,
+    `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 ${formatCacheTime(future, now)}`);
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', phase: 'UNKNOWN', expiresAt: null }, now).text,
+    '예약 없음 · 플러그인 시작 후 아직 작업의 시작과 완료를 관측하지 못함');
+  assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', expiresAt: null }, now).text,
+    '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다');
+});
+
+test('cache times: same day is compact; previous day includes date', () => {
+  const now = new Date(2026, 8, 30, 1, 0).getTime();
+  assert.equal(formatCacheTime(new Date(2026, 8, 30, 0, 59).getTime(), now), '00:59');
+  assert.equal(formatCacheTime(new Date(2026, 8, 29, 23, 59).getTime(), now), '09/29 23:59');
+});
+
+test('toViewModel: cache fields pass through safely and missing fields become no reservation', () => {
+  const snap = makeSnapshot();
+  const first = snap.worktrees[0].terminals[0];
+  first.cacheState = 'kept';
+  first.cacheStatus = 'scheduled';
+  first.indicatorOn = true;
+  first.expiredAt = null;
+  first.expireCause = 'DRAFT_PRESENT';
+  first.blockedReason = 'DRAFT_PRESENT';
+  const vm = toViewModel(snap, 0);
+  assert.equal(vm.worktrees[0].terminals[0].cacheStatus, 'scheduled');
+  assert.equal(vm.worktrees[0].terminals[0].indicatorOn, true);
+  assert.equal(vm.worktrees[0].terminals[0].expireCause, 'DRAFT_PRESENT');
+  assert.equal(vm.worktrees[0].terminals[2].cacheStatus, 'no-reservation');
+  first.cacheStatus = 'not-a-status';
+  first.expireCause = 'private arbitrary value';
+  const invalid = toViewModel(snap, 0).worktrees[0].terminals[0];
+  assert.equal(invalid.cacheStatus, 'no-reservation');
+  assert.equal(invalid.expireCause, null);
 });
 
 /* ------------------------------------------------------------------ */
@@ -582,14 +648,14 @@ test('index.html: tab title indicator has a checkbox, visible label, and linked 
   assert.match(input, /\baria-describedby="cfg-tab-title-indicator-description"/);
   assert.match(
     indexHtml,
-    /<label\s+for="cfg-tab-title-indicator">탭 이름에 ⚡ 표시<\/label>/,
+    /<label\s+for="cfg-tab-title-indicator">탭 이름에 캐시 상태 표시<\/label>/,
   );
   const description = indexHtml.match(
     /<p\s+id="cfg-tab-title-indicator-description"[^>]*>([\s\S]*?)<\/p>/,
   )?.[1].trim();
   assert.equal(
     description,
-    'keepalive가 적용되는 Claude 터미널의 탭 이름 앞에 ⚡를 붙여 칸반·워크트리 카드에서 보이게 합니다. Orca에는 사용자가 직접 바꾼 탭 이름으로 저장되므로, 켜져 있는 동안 자동 탭 이름 갱신이 멈추고(작업이 끝날 때 다시 맞춤), 끄면 자동 이름으로 돌아갑니다. 직접 붙인 탭 이름은 유지되지 않을 수 있습니다.',
+    '⚡ 유지 중 · 💤 유지 중인 캐시 없음 · ⚠️ 확인 필요. Claude 탭 이름 앞에 상태를 표시합니다. 같은 기호가 유지되면 제목을 다시 쓰지 않습니다. 끄면 Orca 자동 이름으로 돌아갑니다. 직접 붙인 탭 이름은 유지되지 않을 수 있습니다.',
   );
 });
 
@@ -739,6 +805,17 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
       supported: false,
     },
   ];
+  for (const cacheStatus of ['working', 'scheduled', 'sending', 'awaiting-turn', 'expired', 'no-reservation', 'interactive-wait', 'suspended', 'review']) {
+    terminals.push({
+      id: `t-${cacheStatus}`, title: cacheStatus, phase: 'UNKNOWN',
+      cacheState: cacheStatus === 'review' ? 'review' : 'none', cacheStatus,
+      enabledOverride: null, effectiveEnabled: true, reason: 'GLOBAL_PAUSED',
+      dueAt: null, expiresAt: cacheStatus === 'no-reservation' ? null : SERVER_NOW + 60_000,
+      expiredAt: cacheStatus === 'expired' ? SERVER_NOW - 60_000 : null,
+      expireCause: cacheStatus === 'expired' ? 'DRAFT_PRESENT' : null,
+      charged: 0, confirmed: 0, needsReview: false, supported: true,
+    });
+  }
   const worktree = { ...makeSnapshot().worktrees[0], terminals };
   const state = makeSnapshot({ worktrees: [worktree], diagnostics: [] });
 
@@ -791,7 +868,7 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     await settle();
 
     const rows = findAllByClass(nodes.get('worktrees'), 'terminal');
-    assert.equal(rows.length, 2, '두 터미널 행이 렌더링되어야 한다');
+    assert.equal(rows.length, terminals.length, '모든 캐시 상태 행이 렌더링되어야 한다');
 
     const titleOf = (row) => findAllByClass(row, 'terminal-title')[0]?.textContent;
     const noAgentRow = rows.find((row) => titleOf(row) === 'bash');
@@ -810,6 +887,18 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     assert.equal(readonlyNode.length, 1);
     assert.equal(readonlyNode[0].textContent, '읽기 전용 · 미지원');
     assert.equal(reasonNode[0].textContent, '이 터미널의 에이전트는 지원하지 않습니다.');
+    for (const source of terminals.slice(2)) {
+      const row = rows.find((candidate) => titleOf(candidate) === source.title);
+      assert.ok(row, source.cacheStatus);
+      const vmTerminal = toViewModel(state, 0).worktrees[0].terminals.find((item) => item.id === source.id);
+      assert.equal(findAllByClass(row, 'terminal-cache-text')[0]?.textContent,
+        cacheStatusDisplay(vmTerminal, SERVER_NOW).text, source.cacheStatus);
+    }
+    for (const row of rows) {
+      assert.equal(findAllByClass(row, 'badge-phase').length, 0, '내부 phase 배지는 표시하지 않음');
+      assert.equal(findAllByClass(row, 'badge-cache').length, 1);
+      assert.match(findAllByClass(row, 'terminal-applied')[0]?.textContent ?? '', /^유지 설정 (켜짐|꺼짐)$/);
+    }
   } finally {
     for (const [key, value] of Object.entries(globals)) {
       if (value === undefined) delete globalThis[key];
