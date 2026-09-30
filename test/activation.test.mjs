@@ -876,12 +876,16 @@ test('orca-plugin.json은 스키마 필수 필드와 참조 일관성을 만족�
   const eventNames = manifest.contributes.events.map((event) => event.on)
   assert.deepEqual(eventNames, ['agent.status.changed', 'worktree.removed'])
 
-  assert.equal(manifest.contributes.keybindings.length, 1)
-  const keybinding = manifest.contributes.keybindings[0]
-  assert.equal(keybinding.command, 'keepalive-open')
-  assert.ok(commandIds.includes(keybinding.command), 'keybinding은 존재하는 command를 참조한다')
-  assert.equal(keybinding.key, 'Mod+Alt+Shift+J')
-  assert.equal(keybinding.when, 'global')
+  assert.deepEqual(manifest.contributes.keybindings, [
+    { command: 'keepalive-open', key: 'Mod+Alt+Shift+J', when: 'global' },
+    { command: 'keepalive-toggle-pause', key: 'Mod+Alt+P', when: 'global' },
+    { command: 'keepalive-toggle-worktree', key: 'Mod+Alt+O', when: 'worktree' },
+  ])
+  const commandContexts = new Map(manifest.contributes.commands.map((command) => [command.id, command.context]))
+  for (const keybinding of manifest.contributes.keybindings) {
+    assert.ok(commandIds.includes(keybinding.command), 'keybinding은 존재하는 command를 참조한다')
+    assert.equal(keybinding.when, commandContexts.get(keybinding.command) || 'global')
+  }
 
   const capabilityKinds = manifest.capabilities.map((capability) => capability.kind)
   assert.deepEqual(capabilityKinds.sort(), ALL_CAPABILITIES.slice().sort())

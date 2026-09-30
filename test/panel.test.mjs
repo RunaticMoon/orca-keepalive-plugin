@@ -47,6 +47,13 @@ test('all eight Orca commands and terminal alternatives are discoverable', async
   assert.ok(html.includes('%USERPROFILE%\\.orca-cache-keepalive\\keepalive.mjs status'))
 })
 
+test('keepalive toggle shortcuts are documented in the panel', async () => {
+  const html = await readFile(panelPath, 'utf8')
+  for (const shortcut of ['⌘⌥P', '⌘⌥O', 'Ctrl+Alt+P', 'Ctrl+Alt+O']) {
+    assert.ok(html.includes(shortcut), shortcut)
+  }
+})
+
 test('inline action script parses and fits Orca shell prelude', async () => {
   const html = await readFile(panelPath, 'utf8')
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1])

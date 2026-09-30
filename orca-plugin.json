@@ -27,7 +27,9 @@
       { "on": "worktree.removed" }
     ],
     "keybindings": [
-      { "command": "keepalive-open", "key": "Mod+Alt+Shift+J", "when": "global" }
+      { "command": "keepalive-open", "key": "Mod+Alt+Shift+J", "when": "global" },
+      { "command": "keepalive-toggle-pause", "key": "Mod+Alt+P", "when": "global" },
+      { "command": "keepalive-toggle-worktree", "key": "Mod+Alt+O", "when": "worktree" }
     ]
   },
   "capabilities": [

@@ -226,7 +226,7 @@ Notes:
 `terminal:send` is a declaration, not a sandbox: the plugin's direct filesystem/socket
 access is not mediated by it. See [Limits and risks](#limits-and-risks).
 
-### Commands and keybinding
+### Commands and keybindings
 
 Open the command palette with **⌘J** on macOS or **Ctrl+Shift+J** on
 Linux/Windows, then type `Cache Keepalive`. The manifest contributes eight
@@ -243,9 +243,13 @@ commands:
 | `keepalive-worktree-off` | Cache Keepalive: Turn Off for Current Worktree | worktree |
 | `keepalive-status` | Cache Keepalive: Show Status | global |
 
-Keybinding declared in the manifest:
+Keybindings declared in the manifest:
 
 - **Mod+Alt+Shift+J** → `keepalive-open` (opens the dashboard).
+- **Mod+Alt+P** → `keepalive-toggle-pause` (pause/resume all).
+- **Mod+Alt+O** → `keepalive-toggle-worktree` (toggle the current worktree).
+
+Orca runs plugin keybindings only when focus is outside a terminal; click the sidebar or another panel first if the cursor is in a terminal.
 
 The three `context: worktree` commands are inactive while no worktree is active.
 They only change the current worktree when the plugin workspace context resolves
@@ -645,8 +649,9 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
 - **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
   events:subscribe.
 - **명령 8개 + 단축키:** 팔레트는 ⌘J(macOS)/Ctrl+Shift+J(Linux/Windows)로 열고
-  "Cache Keepalive" 입력. keepalive-open(Mod+Alt+Shift+J), keepalive-toggle-pause,
-  keepalive-pause, keepalive-resume, keepalive-toggle-worktree, keepalive-worktree-on,
+  "Cache Keepalive" 입력. keepalive-open(Mod+Alt+Shift+J),
+  keepalive-toggle-pause(Mod+Alt+P), keepalive-pause, keepalive-resume,
+  keepalive-toggle-worktree(Mod+Alt+O), keepalive-worktree-on,
   keepalive-worktree-off, keepalive-status. worktree 명령은 활성 워크트리가 없으면
   비활성입니다.
 - **UI 진입점:** 오른쪽 사이드바 activity bar의 번개(zap) 아이콘 패널(읽기 전용),
