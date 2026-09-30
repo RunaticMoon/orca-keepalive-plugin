@@ -1085,12 +1085,12 @@ test('getRuntimeView: 둘 다 없으면 label/branch는 null', async () => {
 
 test('getRuntimeView: 지원되지 않는 행도 이유와 함께 포함한다', async () => {
   const h = createHarness({
-    terminals: [makeRow({ supported: false, unsupportedReason: 'UNSUPPORTED_AGENT', agentIdentity: null })],
+    terminals: [makeRow({ supported: false, unsupportedReason: 'NO_AGENT', agentIdentity: null })],
   })
   await startHarness(h)
   const term = viewTerminal(h)
   assert.equal(term.supported, false)
-  assert.equal(term.unsupportedReason, 'UNSUPPORTED_AGENT')
+  assert.equal(term.unsupportedReason, 'NO_AGENT')
 
   await arm(h, h.clock.now())
   await h.clock.advance(TTL_5M)

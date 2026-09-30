@@ -332,7 +332,7 @@ test('list: unsupportedReason 우선순위(agent → host → 연결)', async ()
   const { observer } = observerFor({ 'terminal.list': listResult(rows) })
   const catalog = await observer.list()
   const byHandle = Object.fromEntries(catalog.terminals.map((row) => [row.handle, row]))
-  assert.equal(byHandle['h-agent'].unsupportedReason, REASON_CODES.UNSUPPORTED_AGENT)
+  assert.equal(byHandle['h-agent'].unsupportedReason, REASON_CODES.NO_AGENT)
   assert.equal(byHandle['h-codex'].unsupportedReason, REASON_CODES.UNSUPPORTED_AGENT)
   assert.equal(byHandle['h-host'].unsupportedReason, REASON_CODES.UNSUPPORTED_HOST)
   assert.equal(byHandle['h-host-missing'].unsupportedReason, REASON_CODES.UNSUPPORTED_HOST)
@@ -636,13 +636,20 @@ test('inspect: runtime_mismatch는 WRONG_RUNTIME', async () => {
   assert.equal((await observer.inspect(TARGET)).reason, REASON_CODES.WRONG_RUNTIME)
 })
 
-test('inspect: identity/host 불일치는 UNSUPPORTED_AGENT/UNSUPPORTED_HOST', async () => {
+test('inspect: identity/host 불일치는 NO_AGENT/UNSUPPORTED_AGENT/UNSUPPORTED_HOST', async () => {
   const noAgent = observerFor({
     'terminal.show': showResult({ agentWait: null }, { agentIdentity: undefined }),
     'terminal.agentStatus': agentStatusResult(),
     'terminal.read': readResult(),
   })
-  assert.equal((await noAgent.observer.inspect(TARGET)).reason, REASON_CODES.UNSUPPORTED_AGENT)
+  assert.equal((await noAgent.observer.inspect(TARGET)).reason, REASON_CODES.NO_AGENT)
+
+  const codex = observerFor({
+    'terminal.show': showResult({ agentWait: null }, { agentIdentity: 'codex' }),
+    'terminal.agentStatus': agentStatusResult(),
+    'terminal.read': readResult(),
+  })
+  assert.equal((await codex.observer.inspect(TARGET)).reason, REASON_CODES.UNSUPPORTED_AGENT)
 
   const ssh = observerFor({
     'terminal.show': showResult({ agentWait: null }, { executionHostId: 'ssh:box' }),

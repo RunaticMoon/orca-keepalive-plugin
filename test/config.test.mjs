@@ -280,9 +280,9 @@ test('contracts 상수는 모두 frozen이다', () => {
   }
 });
 
-test('REASON_CODES는 24개이며 값이 key와 같다', () => {
+test('REASON_CODES는 25개이며 값이 key와 같다', () => {
   const codes = Object.keys(contracts.REASON_CODES);
-  assert.equal(codes.length, 24);
+  assert.equal(codes.length, 25);
   for (const code of codes) {
     assert.equal(contracts.REASON_CODES[code], code);
   }
@@ -292,6 +292,7 @@ test('REASON_CODES는 24개이며 값이 key와 같다', () => {
     'RUNTIME_UNAVAILABLE',
     'WRONG_RUNTIME',
     'NO_FRESH_TURN',
+    'NO_AGENT',
     'UNSUPPORTED_AGENT',
     'UNSUPPORTED_HOST',
     'NOT_CONNECTED',

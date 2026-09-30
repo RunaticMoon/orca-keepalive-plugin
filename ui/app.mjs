@@ -46,6 +46,8 @@ export const REASON_TEXT = Object.freeze({
     '다른 Orca 런타임에 연결되어 있습니다. 이 창에서 대시보드를 다시 여세요.',
   NO_FRESH_TURN:
     '최근에 완료된 작업이 없어 캐시 만료 시점을 알 수 없습니다.',
+  NO_AGENT:
+    '에이전트가 실행되지 않은 일반 터미널입니다.',
   UNSUPPORTED_AGENT:
     '이 터미널의 에이전트는 지원하지 않습니다.',
   UNSUPPORTED_HOST:
@@ -286,7 +288,10 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
       scopeValue: override === null ? 'inherit' : override ? 'on' : 'off',
       effectiveEnabled: terminal.effectiveEnabled === true,
       reason: typeof terminal.reason === 'string' ? terminal.reason : null,
-      reasonText: typeof terminal.reason === 'string' ? reasonText(terminal.reason) : '',
+      reasonText:
+        typeof terminal.reason === 'string' && terminal.reason !== 'NO_AGENT'
+          ? reasonText(terminal.reason)
+          : '',
       expiresAt,
       dueAt,
       remainingMs,
@@ -839,7 +844,7 @@ function boot() {
         `${terminal.effectiveEnabled ? '●' : '○'} 적용 ${terminal.effectiveEnabled ? '켜짐' : '꺼짐'}`,
       ),
     );
-    if (!terminal.supported) {
+    if (!terminal.supported && terminal.reason !== 'NO_AGENT') {
       const readonly = el('span', 'readonly-note', '읽기 전용 · 미지원');
       readonly.title = `지원하지 않는 대상이라 읽기 전용입니다.${terminal.reasonText ? ` ${terminal.reasonText}` : ''}`;
       status.appendChild(readonly);

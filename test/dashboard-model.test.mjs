@@ -345,19 +345,21 @@ test('게이트: 연결 끊김/wrong runtime 사유', async () => {
 
 test('게이트: unsupported terminal은 unsupportedReason을 우선 표시', async () => {
   const { store } = await newStore();
-  const runtime = runtimeView({
-    worktrees: [
-      wt({
-        terminals: [term({ supported: false, unsupportedReason: 'UNSUPPORTED_AGENT', reason: 'BUSY' })],
-      }),
-    ],
-  });
-  const { model } = makeModel({ store, runtime });
-  const snap = model.snapshot();
-  const terminal = snap.worktrees[0].terminals[0];
-  assert.equal(terminal.supported, false);
-  assert.equal(terminal.effectiveEnabled, false);
-  assert.equal(terminal.reason, 'UNSUPPORTED_AGENT');
+  for (const unsupportedReason of ['NO_AGENT', 'UNSUPPORTED_AGENT']) {
+    const runtime = runtimeView({
+      worktrees: [
+        wt({
+          terminals: [term({ supported: false, unsupportedReason, reason: 'BUSY' })],
+        }),
+      ],
+    });
+    const { model } = makeModel({ store, runtime });
+    const snap = model.snapshot();
+    const terminal = snap.worktrees[0].terminals[0];
+    assert.equal(terminal.supported, false);
+    assert.equal(terminal.effectiveEnabled, false);
+    assert.equal(terminal.reason, unsupportedReason);
+  }
 });
 
 test('게이트: 정책 사유(GLOBAL_PAUSED/SCOPE_DISABLED)와 worktree의 budget 사유 무시', async () => {

@@ -172,6 +172,9 @@ export function branchNameFromRef(branch) {
  * @returns {string|null} 지원되면 null, 아니면 reason 코드.
  */
 function computeUnsupportedReason(row) {
+  if (row.agentIdentity === null) {
+    return REASON_CODES.NO_AGENT
+  }
   if (row.agentIdentity !== 'claude') {
     return REASON_CODES.UNSUPPORTED_AGENT
   }
@@ -300,6 +303,9 @@ function computeReason(observation, failure) {
   }
   if (failure !== null) {
     return failure
+  }
+  if (observation.identity === null) {
+    return REASON_CODES.NO_AGENT
   }
   if (observation.identity !== 'claude') {
     return REASON_CODES.UNSUPPORTED_AGENT

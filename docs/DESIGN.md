@@ -423,7 +423,7 @@ DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readA
 
 host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cache-keepalive/logs/events.jsonl`에 plugin 전용 파일 기록(1 MiB×3, chmod 0600·디렉터리 0700 best effort). 앱 프로필/설정 파일에는 쓰지 않는다. Windows ACL은 chmod로 보장되지 않으므로 기존 사용자 data 디렉터리 경계를 따른다. 파일 logger 실패는 ring/host log로 대체하고 전송 상태 저장 실패와 구별한다. 알림은 동일 reason당 5분에 1회, 큰 상태 전환에만 발생; 매 tick 알림 금지.
 
-중요 reason 코드: APP_TIMER_OFF, SETTINGS_UNKNOWN, RUNTIME_UNAVAILABLE, WRONG_RUNTIME, NO_FRESH_TURN, UNSUPPORTED_AGENT, UNSUPPORTED_HOST, NOT_CONNECTED, BUSY, INTERACTIVE_WAIT, UNKNOWN_WAIT, OUTPUT_ACTIVE, DRAFT_PRESENT, SCREEN_UNKNOWN, INPUT_QUIET_WINDOW, SCOPE_DISABLED, GLOBAL_PAUSED, CWARM_DISABLED, LIMIT_REACHED, EXPIRED, STALE_TARGET, STORAGE_FAILED, PARTIAL_OR_UNKNOWN_SEND. reason별 UI 문구는 사용자가 취할 행동을 한 문장으로 설명한다.
+중요 reason 코드: APP_TIMER_OFF, SETTINGS_UNKNOWN, RUNTIME_UNAVAILABLE, WRONG_RUNTIME, NO_FRESH_TURN, NO_AGENT, UNSUPPORTED_AGENT, UNSUPPORTED_HOST, NOT_CONNECTED, BUSY, INTERACTIVE_WAIT, UNKNOWN_WAIT, OUTPUT_ACTIVE, DRAFT_PRESENT, SCREEN_UNKNOWN, INPUT_QUIET_WINDOW, SCOPE_DISABLED, GLOBAL_PAUSED, CWARM_DISABLED, LIMIT_REACHED, EXPIRED, STALE_TARGET, STORAGE_FAILED, PARTIAL_OR_UNKNOWN_SEND. reason별 UI 문구는 사용자가 취할 행동을 한 문장으로 설명한다.
 
 최소 사용 권한 미허용/SQLite 미지원이어도 명령 등록과 diagnostics는 살아 있어야 한다. unhandled promise rejection을 남기지 않으며 한 대상 오류로 다른 상태 조회까지 멈추지 않는다. 단 runtime/profile 설정 신뢰 실패는 전체 전송을 중단한다.
 
