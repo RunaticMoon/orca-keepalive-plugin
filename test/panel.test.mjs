@@ -49,9 +49,13 @@ test('all eight Orca commands and terminal alternatives are discoverable', async
 
 test('keepalive toggle shortcuts are documented in the panel', async () => {
   const html = await readFile(panelPath, 'utf8')
-  for (const shortcut of ['⌘⌥P', '⌘⌥O', 'Ctrl+Alt+P', 'Ctrl+Alt+O']) {
+  for (const shortcut of ['⌘⌥O', '⌘⌥P', '⌘⌥K', 'Ctrl+Alt+O', 'Ctrl+Alt+P', 'Ctrl+Alt+K']) {
     assert.ok(html.includes(shortcut), shortcut)
   }
+  for (const removed of ['⌘⌥⇧J', 'Alt+Shift+J']) {
+    assert.ok(!html.includes(removed), removed)
+  }
+  assert.ok(html.includes('터미널 밖'), '터미널 포커스 안내 문구가 있다')
 })
 
 test('inline action script parses and fits Orca shell prelude', async () => {

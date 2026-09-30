@@ -877,9 +877,9 @@ test('orca-plugin.json은 스키마 필수 필드와 참조 일관성을 만족�
   assert.deepEqual(eventNames, ['agent.status.changed', 'worktree.removed'])
 
   assert.deepEqual(manifest.contributes.keybindings, [
-    { command: 'keepalive-open', key: 'Mod+Alt+Shift+J', when: 'global' },
+    { command: 'keepalive-open', key: 'Mod+Alt+O', when: 'global' },
     { command: 'keepalive-toggle-pause', key: 'Mod+Alt+P', when: 'global' },
-    { command: 'keepalive-toggle-worktree', key: 'Mod+Alt+O', when: 'worktree' },
+    { command: 'keepalive-toggle-worktree', key: 'Mod+Alt+K', when: 'worktree' },
   ])
   const commandContexts = new Map(manifest.contributes.commands.map((command) => [command.id, command.context]))
   for (const keybinding of manifest.contributes.keybindings) {

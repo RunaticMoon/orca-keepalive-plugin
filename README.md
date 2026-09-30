@@ -245,9 +245,9 @@ commands:
 
 Keybindings declared in the manifest:
 
-- **Mod+Alt+Shift+J** → `keepalive-open` (opens the dashboard).
+- **Mod+Alt+O** → `keepalive-open` (opens the dashboard).
 - **Mod+Alt+P** → `keepalive-toggle-pause` (pause/resume all).
-- **Mod+Alt+O** → `keepalive-toggle-worktree` (toggle the current worktree).
+- **Mod+Alt+K** → `keepalive-toggle-worktree` (toggle the current worktree).
 
 Orca runs plugin keybindings only when focus is outside a terminal; click the sidebar or another panel first if the cursor is in a terminal.
 
@@ -284,7 +284,7 @@ you set yourself is shown as-is).
 |---|---|---|
 | Sidebar panel | Orca right sidebar activity bar → **zap** icon (panel `keepalive-panel`, entry `panel/index.html`) | Read-only orientation: current worktree name and terminal count, plus the command and terminal-command cheat sheets. See [Sidebar panel](#sidebar-panel) for why it cannot show live state. |
 | Command palette | **⌘J** (macOS) / **Ctrl+Shift+J** (Linux/Windows), then type `Cache Keepalive` | All eight commands above: open dashboard, toggle/pause/resume, per-worktree on/off, show status. |
-| Dashboard | **Cache Keepalive: Open Dashboard** (or **Mod+Alt+Shift+J**) | Worktree/terminal toggles, global pause, reset budget, clear "needs review", settings form. |
+| Dashboard | **Cache Keepalive: Open Dashboard** (or **Mod+Alt+O**) | Worktree/terminal toggles, global pause, reset budget, clear "needs review", settings form. |
 | Terminal CLI | `node ~/.orca-cache-keepalive/keepalive.mjs <command>` | Scriptable status and toggles from any Orca terminal, including per-worktree `here`. |
 | Settings switch | **Settings > Plugins > Cache Keepalive** | Turn the whole plugin (worker) on/off. |
 
@@ -649,9 +649,9 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
 - **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
   events:subscribe.
 - **명령 8개 + 단축키:** 팔레트는 ⌘J(macOS)/Ctrl+Shift+J(Linux/Windows)로 열고
-  "Cache Keepalive" 입력. keepalive-open(Mod+Alt+Shift+J),
+  "Cache Keepalive" 입력. keepalive-open(Mod+Alt+O),
   keepalive-toggle-pause(Mod+Alt+P), keepalive-pause, keepalive-resume,
-  keepalive-toggle-worktree(Mod+Alt+O), keepalive-worktree-on,
+  keepalive-toggle-worktree(Mod+Alt+K), keepalive-worktree-on,
   keepalive-worktree-off, keepalive-status. worktree 명령은 활성 워크트리가 없으면
   비활성입니다.
 - **UI 진입점:** 오른쪽 사이드바 activity bar의 번개(zap) 아이콘 패널(읽기 전용),
