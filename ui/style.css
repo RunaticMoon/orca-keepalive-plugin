@@ -348,7 +348,7 @@ input[type="checkbox"] {
 .terminal-title {
   font-weight: 600;
   flex: 0 1 auto;
-  min-width: 6.5rem;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -473,14 +473,11 @@ input[type="checkbox"] {
   }
 
   .project-cell {
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .project-cell {
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
     border-radius: 7px 7px 0 0;
   }
 

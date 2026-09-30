@@ -766,7 +766,7 @@ function boot() {
         );
         toggle.type = 'button';
         toggle.setAttribute('aria-pressed', String(worktree.scopeOn));
-        toggle.setAttribute('aria-label', `워크트리 keepalive ${toggle.textContent}: ${worktree.label || worktree.id}`);
+        toggle.setAttribute('aria-label', `워크트리 keepalive 토글: ${worktree.label || worktree.id}`);
         toggle.disabled = !connected;
         toggle.addEventListener('click', () => {
           postAction(
