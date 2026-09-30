@@ -214,7 +214,7 @@ commands:
 | Command id | Title | Context |
 |---|---|---|
 | `keepalive-open` | Cache Keepalive: Open Dashboard | global |
-| `keepalive-toggle-pause` | Cache Keepalive: Toggle On/Off (All) | global |
+| `keepalive-toggle-pause` | Cache Keepalive: Pause/Resume All | global |
 | `keepalive-pause` | Cache Keepalive: Pause All | global |
 | `keepalive-resume` | Cache Keepalive: Resume | global |
 | `keepalive-toggle-worktree` | Cache Keepalive: Toggle Current Worktree | worktree |

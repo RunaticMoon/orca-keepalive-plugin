@@ -11,7 +11,7 @@
   "contributes": {
     "commands": [
       { "id": "keepalive-open", "title": "Cache Keepalive: Open Dashboard", "context": "global" },
-      { "id": "keepalive-toggle-pause", "title": "Cache Keepalive: Toggle On/Off (All)", "context": "global" },
+      { "id": "keepalive-toggle-pause", "title": "Cache Keepalive: Pause/Resume All", "context": "global" },
       { "id": "keepalive-pause", "title": "Cache Keepalive: Pause All", "context": "global" },
       { "id": "keepalive-resume", "title": "Cache Keepalive: Resume", "context": "global" },
       { "id": "keepalive-toggle-worktree", "title": "Cache Keepalive: Toggle Current Worktree", "context": "worktree" },

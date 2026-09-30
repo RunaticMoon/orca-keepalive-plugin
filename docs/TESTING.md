@@ -211,7 +211,7 @@ DESIGN.md §10 기반. 실제 Orca 데스크톱과 disposable Claude 세션에�
       각각 다른 안내 문구가 나온다. 복사 버튼은 clipboard를 못 쓰는 환경에서 명령
       텍스트 선택으로 fallback 하고 그 사실을 안내한다.
     - [ ] 명령 팔레트(⌘J / Ctrl+Shift+J)에 "Cache Keepalive"를 입력하면 새 명령 3개
-      (Toggle On/Off (All), Turn On for Current Worktree, Turn Off for Current
+      (Pause/Resume All, Turn On for Current Worktree, Turn Off for Current
       Worktree)가 보인다. worktree 명령은 활성 워크트리가 없으면 비활성이다.
     - [ ] 플러그인 활성화 직후 `~/.orca-cache-keepalive/`(0700)에 `control.json`
       (0600)과 `keepalive.mjs`가 생기고, `control.json`에 pid·127.0.0.1 포트·

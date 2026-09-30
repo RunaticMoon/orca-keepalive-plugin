@@ -32,7 +32,7 @@ test('all eight Orca commands and terminal alternatives are discoverable', async
   const html = await readFile(panelPath, 'utf8')
   const titles = [
     'Open Dashboard',
-    'Toggle On/Off (All)',
+    'Pause/Resume All',
     'Pause All',
     'Resume',
     'Toggle Current Worktree',
