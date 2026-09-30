@@ -11,7 +11,7 @@ This is a **community, experimental** plugin. It is not an official Stably plugi
 - Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
 - License: MIT (see [LICENSE](LICENSE))
 - Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
-- Version: `0.1.0`
+- Version: `0.1.1`
 - Minimum Orca engine declared: `>=1.4.214`
 - Plugin API: `pluginApi 1` (`contributes` is strict)
 - Runtime: Node >=22.5 (development has been done on Node 24); no build step, no npm dependencies
