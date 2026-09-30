@@ -601,3 +601,121 @@ test('deepFreeze한 state로 reduce/decide해도 throw하지 않는다', () => {
     decide(frozen, { now: 100000, settings: settings(), policy: policy(), config: CONFIG }),
   );
 });
+
+// ---------------------------------------------------------------------------
+// RESTORE_EPOCH: 리로드 후 저장 doneAt으로 예약 복원
+// ---------------------------------------------------------------------------
+
+/** RESTORE_EPOCH 입력을 만든다. */
+function restore(doneAt, now) {
+  return { type: 'RESTORE_EPOCH', doneAt, now };
+}
+
+test('RESTORE_EPOCH: 초기 상태에서 복원하면 ARMED epoch를 만들고 dueAt을 계산한다', () => {
+  const done = 1_000_000;
+  const state = reduce(initialTargetState(TARGET), restore(done, done + 1000));
+  assert.equal(state.phase, 'ARMED');
+  assert.deepEqual(state.epoch, { id: 1, doneAt: done, attempted: false });
+  assert.equal(state.epochSeq, 1);
+  assert.equal(state.seenWorking, true);
+  assert.equal(state.lastHook, 'done');
+  assert.equal(state.lastHookAt, done);
+  assert.equal(state.reason, null);
+
+  const expiresAt = done + TTL_5M;
+  const dueAt = expiresAt - 60000; // done + 240000
+  const result = decideWith(state, done);
+  assert.equal(result.kind, 'wait');
+  assert.equal(result.reason, null);
+  assert.equal(result.nextAt, dueAt);
+  assert.equal(result.dueAt, dueAt);
+  assert.equal(result.expiresAt, expiresAt);
+});
+
+test('RESTORE_EPOCH: 경계(now + clockSkewMs)까지 허용, 초과 미래는 거부', () => {
+  const done = 20000;
+  const boundary = reduce(
+    initialTargetState(TARGET),
+    restore(done, done - TIMING.clockSkewMs),
+  );
+  assert.equal(boundary.phase, 'ARMED');
+
+  const base = initialTargetState(TARGET);
+  const rejected = reduce(base, restore(done, done - TIMING.clockSkewMs - 1));
+  assert.deepEqual(rejected, base);
+});
+
+test('RESTORE_EPOCH: 비유한 doneAt/now는 거부한다', () => {
+  const base = initialTargetState(TARGET);
+  assert.deepEqual(reduce(base, restore(NaN, 1000)), base);
+  assert.deepEqual(reduce(base, restore(1000, NaN)), base);
+  assert.deepEqual(reduce(base, restore(undefined, 1000)), base);
+  assert.deepEqual(reduce(base, restore('1000', 1000)), base);
+});
+
+test('RESTORE_EPOCH: phase가 BUSY/ARMED/NEEDS_REVIEW이면 거부한다', () => {
+  const busy = reduce(initialTargetState(TARGET), hook('working', 1000));
+  assert.equal(busy.phase, 'BUSY');
+  assert.deepEqual(reduce(busy, restore(2000, 3000)), busy);
+
+  const armedState = armed(2000);
+  assert.equal(armedState.phase, 'ARMED');
+  assert.deepEqual(reduce(armedState, restore(3000, 4000)), armedState);
+
+  const review = reduce(awaitingTurn(3100), {
+    type: 'TICK',
+    now: 3100 + TIMING.turnStartConfirmMs + 1,
+  });
+  assert.equal(review.phase, 'NEEDS_REVIEW');
+  assert.deepEqual(reduce(review, restore(4000, 5000)), review);
+});
+
+test('RESTORE_EPOCH: seenWorking/attempt/lastHook=working이면 거부한다', () => {
+  const base = initialTargetState(TARGET);
+  const seen = { ...base, seenWorking: true };
+  assert.deepEqual(reduce(seen, restore(2000, 3000)), seen);
+
+  const withAttemptState = { ...base, attempt: { id: 'a1' } };
+  assert.deepEqual(reduce(withAttemptState, restore(2000, 3000)), withAttemptState);
+
+  const lastWorking = { ...base, lastHook: 'working' };
+  assert.deepEqual(reduce(lastWorking, restore(2000, 3000)), lastWorking);
+});
+
+test('RESTORE_EPOCH 복원 뒤 working HOOK은 BUSY', () => {
+  const done = 5000;
+  let state = reduce(initialTargetState(TARGET), restore(done, done + 100));
+  const budget = state.budgetResetSeq;
+  state = reduce(state, hook('working', done + 1000));
+  assert.equal(state.phase, 'BUSY');
+  assert.equal(state.epoch, null);
+  assert.equal(state.reason, 'BUSY');
+  assert.equal(state.budgetResetSeq, budget + 1);
+});
+
+test('RESTORE_EPOCH 복원 뒤 중복 done HOOK은 epoch를 바꾸지 않는다', () => {
+  const done = 5000;
+  let state = reduce(initialTargetState(TARGET), restore(done, done + 100));
+  const epoch = state.epoch;
+  state = reduce(state, hook('done', done + 9000));
+  assert.equal(state.phase, 'ARMED');
+  assert.deepEqual(state.epoch, epoch);
+  assert.equal(state.epoch.doneAt, done);
+  assert.equal(state.lastHookAt, done + 9000);
+});
+
+test('RESTORE_EPOCH는 입력 state와 중첩 객체를 변경하지 않는다', () => {
+  const state = initialTargetState(TARGET);
+  const before = JSON.stringify(state);
+  reduce(state, restore(2000, 3000));
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(state.epoch, null);
+  assert.equal(state.seenWorking, false);
+});
+
+test('deepFreeze한 state에 RESTORE_EPOCH를 적용해도 throw하지 않는다', () => {
+  const frozen = deepFreeze(initialTargetState(TARGET));
+  assert.doesNotThrow(() => reduce(frozen, restore(2000, 3000)));
+  const rejected = deepFreeze(armed(2000));
+  assert.doesNotThrow(() => reduce(rejected, restore(3000, 4000)));
+});

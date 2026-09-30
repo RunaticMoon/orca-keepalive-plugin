@@ -179,7 +179,7 @@ hooks를 통한 fresh working→done 관측을 예약 기준으로 삼는다. �
 - quietOutputMs=2500..60000; observedInputQuietMs=10000..300000; maxConsecutiveKeepalives=0..1000 정수(0 무제한). message 계약은 §3. 사용자 UI에는 상한을 “직접 초기화 전 최대 유지 메시지 횟수”로 정확히 표현한다.
 - poll=2000ms, hostHeartbeat=60000ms, preflight 최대 5000ms, minimumRemaining=10000ms, paste 확인 deadline=5000ms, turn-start 확인=15000ms, 송신 concurrency=1은 내부 상수다. 초 단위 빠른 TTL은 테스트 의존성 주입으로만 지원하고 사용자 설정에는 넣지 않는다.
 - runtimeUserDataPath 변경은 모든 epoch를 취소하고 새 binding을 확인한 뒤 다음 fresh turn을 기다린다.
-- 플러그인 설정은 host `storage.get/set`의 단일 key `state-v1`에 저장. `settings:own`은 필요 없다. 앱 timer 설정은 읽기 전용이며 dashboard에서 변경하는 값은 플러그인 자체 설정뿐이다.
+- 플러그인 설정은 host `storage.get/set`의 key `state-v1`에 저장. `settings:own`은 필요 없다. 앱 timer 설정은 읽기 전용이며 dashboard에서 변경하는 값은 플러그인 자체 설정뿐이다. 리로드 복원용 epoch 완료시각 메모리는 `state-v1`과 분리된 key `epochs-v1`에 저장하며(§5.6), revision/409 충돌 검사는 `state-v1`에만 적용된다.
 
 ### 5.3 영속 상태 계약
 
@@ -219,6 +219,7 @@ target key는 `[binding.runtimeId, profileId, worktreeId, paneKey, ptyId]`의 tu
 
 ```text
 UNKNOWN -- fresh working --> BUSY
+UNKNOWN -- 리로드 복원(저장한 doneAt, §5.6 조건) --> ARMED
 BUSY -- fresh combined done + main done/absent --> ARMED
 ARMED -- due + 모든 safety 조건 --> CHECKING
 CHECKING -- 예약 저장 성공 --> PASTING
@@ -260,7 +261,16 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 9. **guarded Enter** 1회. desktop client id=`cache-keepalive:<randomUUID>`는 worker 수명 내 고정. mobile driver를 가장하거나 viewport 소유권을 탈취하지 않는다. expectedIncarnationId는 있을 때만 전달하며 이것만으로 보호를 보장하지 않는다.
 10. Enter accepted 후 15초 이내 fresh working 관측을 기다린다. 관측이 요청 응답보다 먼저 올 수 있으므로 reservation 이후 이벤트를 버리지 않고 순서대로 반영한다. working 미관측/응답 유실/permission이면 needsReview. 15초 내 working→done 전체가 지나가도 두 이벤트를 처리해 새 epoch가 생겨야 한다.
 
-실제 모델의 cache hit는 확인하지 않으며 성공 문구는 “유지 메시지 전송/작업 시작 관측”까지만 표시한다. 다른 자동화(cwarm 등)가 같은 PTY를 동시에 제어하는 구성은 지원하지 않는다.
+실제 모델의 cache hit는 확인하지 않으며 성공 문구는 "유지 메시지 전송/작업 시작 관측"까지만 표시한다. 다른 자동화(cwarm 등)가 같은 PTY를 동시에 제어하는 구성은 지원하지 않는다.
+
+### 5.6 리로드 epoch 메모리(epochs-v1)
+
+리로드(플러그인 on/off, worker 재기동)는 메모리의 epoch 예약을 잃는다. `src/epoch-memory.mjs`가 ARMED이고 아직 전송하지 않은 epoch의 `doneAt`을 host storage의 key `epochs-v1`에 저장하고, 다시 시작할 때 복원 후보로 제공한다. `state-v1`(설정·budget journal)과 다른 key이며 revision/409 검사와 무관하다.
+
+- 저장 형식 `{version:1, entries:{[key]: {worktreeId,paneKey,userDataKey,profileId,ptyId,incarnationId,doneAt,savedAt}}}`. key는 `worktreeId + "\u0000" + paneKey`이고, 나머지 식별자(userDataKey·profileId·ptyId·incarnationId)는 레코드 필드로 비교한다. 최대 200개이며 `doneAt`이 오래된 항목부터 제거한다.
+- 시작 시 `now - doneAt >= 1시간`인 항목을 버린다. load 실패/형식 오류/항목 오류는 빈 상태로 시작하며 throw하지 않는다.
+- 저장은 변경 시 직렬 coalesce이고 `storage.set` 실패는 삼킨 뒤 다음 변경 때 재시도한다. 자동 전송 상태(`state-v1`) 저장과 독립이며 복원 실패가 전송을 막지 않는다.
+- coordinator는 epoch가 ARMED이고 아직 전송 전일 때만 `remember`하고, 작업중 관측·전송 시도(attempt 예약)·만료·대상 변경 등 ARMED가 아니게 되면 `forget`한다. 복원 시 catalog에서 같은 `userDataKey`·`profileId`·`worktreeId`·`paneKey`이고 `doneAt`이 1시간 이내인 터미널을 찾는다. `ptyId`는 같아야 하고, `incarnationId`는 저장값과 현재값이 모두 null이면 `ptyId` 일치로 복원하며 한쪽만 있거나 다르면 복원하지 않는다. 해당 scope가 needsReview(열린 attempt·불확실 전송)이면 복원하지 않고 기록을 삭제하며, 검토 해제 시에도 그 기록을 삭제해 중복 전송을 막는다. 조건을 만족하면 scheduler `RESTORE_EPOCH` 입력으로 ARMED 예약을 되살리고 `epoch_restored` 진단을 남긴다. 그 외(예: Orca 재시작으로 incarnation이 바뀐 터미널)는 다음 완료를 기다린다.
 
 ## 6. 모듈과 인터페이스
 
@@ -274,6 +284,7 @@ src/runtime-location.mjs        경로 후보·metadata·인스턴스 binding
 src/rpc-client.mjs              net transport/envelope/timeout
 src/orca-settings.mjs           활성 profile와 timer 설정 read-only 읽기
 src/state-store.mjs             plugin storage 직렬 journal·정책·budget
+src/epoch-memory.mjs            리로드 epoch 완료시각 메모리(epochs-v1)
 src/diagnostics.mjs             redaction·bounded ring·JSONL 회전
 src/terminal-observer.mjs       RPC typed wrappers·목록·pane join·preflight facts
 src/scheduler.mjs               순수 target reducer와 due 결정
@@ -298,6 +309,7 @@ README.md docs/TESTING.md docs/PUBLISHING.md LICENSE(소유자 선택 후)
 | rpc-client | `createRpcClient({getBinding,connect,clock,limits}):{call(method,params,{signal,timeoutMs}?):Promise<unknown>,close():void}`. Typed RpcError={code,phase:'connect'|'write'|'response',mayHaveWritten:boolean}. low-level call은 재시도 없음. |
 | orca-settings | `readTimerSettings({userDataPath,readFile,openSqlite,now}):Promise<SettingsSnapshot>`. `{known:true,profileId,enabled,ttlMs,revision,source:'sqlite'|'json',readAt}` 또는 `{known:false,reason,readAt}`. reader만 작성; 자체 timer 없음. |
 | state-store | `createStateStore({hostCall}):{load(),snapshot(),subscribe(fn),updateConfig(patch),setWorktree(scope,enabled),setTerminal(scope,enabled),reserveAttempt(target,epochId,at),recordAttempt(id,phase),confirmAttempt(id),markReview(id,reason),clearReview(scope),resetBudget(scope),flush()}`. async mutation은 저장 후 snapshot 반환. reserveAttempt는 attemptId 반환. |
+| epoch-memory | `EPOCH_MEMORY_KEY='epochs-v1'`; `createEpochMemory({hostCall,now}):{load():Promise<void>,get(key):EpochRecord\|null,remember(key,record):void,forget(key):void,prune(maxAgeMs):void,flush():Promise<void>}`. `state-v1`과 분리된 key에 ARMED epoch의 `doneAt`을 직렬 coalesce로 저장하고 시작 시 1시간 지난 항목을 정리한다. import 시 I/O·타이머 없음. |
 | diagnostics | `createDiagnostics({log,dir?,fs,now,maxBytes}):{record(event),snapshot(),close()}`. event allowlist만 기록; caller가 raw response를 넣어도 redaction. dir 불가 시 host log+ring 유지. |
 | terminal-observer | `createObserver({rpc,hostCall,now}):{list():Promise<Catalog>,resolveEvent(event,catalog):Target|null,inspect(target):Promise<Observation>,currentWorktree(catalog):Promise<string|null>}`. inspect는 show+agentStatus+read를 읽기만 한다. currentWorktree는 context handles join 결과가 정확히 하나일 때만 ID 반환. |
 | scheduler | `initialTargetState(target):TargetState`; `reduceTarget(state,input):TargetState`; `decide(state,{now,settings,policy,observation}):Decision`. Decision={kind:'wait'|'inspect'|'send'|'expire',reason,nextAt?}. clock/fs/RPC 없음. |
@@ -309,7 +321,7 @@ README.md docs/TESTING.md docs/PUBLISHING.md LICENSE(소유자 선택 후)
 
 Observation={target,observedAt,agentStatus,agentWait,connected,writable,identity,executionHostId,lastOutputAt,screenSource,screenTruncated,draft,settingsGeneration}. `draft`와 raw screen은 공개 snapshot에 포함하지 않는다. inspection 사이 값이 충돌하면 unknown.
 
-TargetState={target,phase,lastHook,lastHookAt,seenWorking,epoch:null|{id,doneAt,dueAt,expiresAt,attempted},attempt:null|{id,phase,startedAt},lastObservedInputAt,reason,generation}. 순수 reducer의 input 종류는 HOOK, POLICY_INVALIDATED, TARGET_CHANGED, CLOCK_GAP, ATTEMPT_RESERVED, PASTE_ACCEPTED, SUBMIT_ACCEPTED, SEND_REFUSED, SEND_UNCERTAIN, TURN_CONFIRMED, TICK이다. operation completion은 시작 때의 generation과 다르면 새 상태를 덮어쓰지 않는다.
+TargetState={target,phase,lastHook,lastHookAt,seenWorking,epoch:null|{id,doneAt,dueAt,expiresAt,attempted},attempt:null|{id,phase,startedAt},lastObservedInputAt,reason,generation}. 순수 reducer의 input 종류는 HOOK, POLICY_INVALIDATED, TARGET_CHANGED, CLOCK_GAP, ATTEMPT_RESERVED, PASTE_ACCEPTED, SUBMIT_ACCEPTED, SEND_REFUSED, SEND_UNCERTAIN, TURN_CONFIRMED, TICK, RESTORE_EPOCH(§5.6 리로드 복원 입력)이다. 내부 전용 REVIEW_CLEARED·EXPIRE는 `contracts.MACHINE_INPUT_TYPES`에 넣지 않고 scheduler가 직접 처리한다. operation completion은 시작 때의 generation과 다르면 새 상태를 덮어쓰지 않는다.
 
 coordinator는 2초 tick을 setInterval async 중첩으로 구현하지 않는다. 한 tick이 끝난 후 다음 timer를 잡고 hook queue를 drain한다. inspection read concurrency 최대 3, send concurrency 1, 타깃 간 최소 2초 간격. storage heartbeat는 60초마다 `host.call('storage.get',{key:'state-v1'})`; direct socket traffic은 host worker 활동으로 집계되지 않기 때문이다. stop은 timer 해제, generation 증가, abort, 서버/socket close, store flush. shutdown 이후 callback은 새 I/O를 예약하지 않는다.
 
@@ -402,11 +414,11 @@ POST /api/action -> Action -> DashboardSnapshot
 
 targetId는 worker가 발급한 opaque random ID로 snapshot에 노출, 현재 catalog에 속한 것만 허용한다. 브라우저가 보낸 worktreeId/terminalHandle을 RPC로 직접 넘기지 않는다. 오래된 revision은 409, unknown target 404, invalid payload 400, unauthorized 401, storage/unavailable 503. config edit에는 runtimeUserDataPath만 입력 가능하며 arbitrary file read endpoint는 없다.
 
-DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readAt,reason?},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시),worktrees:[{id,worktreeHash,projectId,projectLabel,label,branch,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,dueAt,expiresAt,charged,confirmed,needsReview}]}],diagnostics:[{at,level,code,targetId?}]}. 원시 authToken·binding·draft·screen·전체 settings·repoId·worktree 경로는 금지. worktree는 worktreeId의 repoId(`${repoId}::${path}`)를 기준으로 프로젝트로 묶는다. 프로젝트 이름은 런타임 `repo.list`의 `displayName`을 사용하고, 조회 실패 시 같은 저장소 worktree의 label 중 사전순 최솟값을 쓴다. 화면은 `프로젝트 | 워크트리 | 세션` 3열 compact 행으로 표시하며 원시 repoId와 경로는 노출하지 않는다.
+DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readAt,reason?},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시),worktrees:[{id,worktreeHash,projectId,projectLabel,label,branch,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,dueAt,expiresAt,charged,confirmed,needsReview}]}],diagnostics:[{at,level,event,code?,target?,targetLabel?}]}. 원시 authToken·binding·draft·screen·전체 settings·repoId·worktree 경로는 금지. 진단의 저장 로그는 target을 hashed ID(12 hex)로만 가진다. 스냅숏 생성 시 현재 catalog의 터미널로 해시를 되돌려 `targetLabel`(`워크트리 / 터미널 제목`)을 붙이고, 되돌릴 수 없으면 `targetLabel:null`이며 UI는 `#해시6자리`로 표시한다. 원문 targetId는 노출하지 않고, UI는 event를 한국어 설명으로 매핑한다. worktree는 worktreeId의 repoId(`${repoId}::${path}`)를 기준으로 프로젝트로 묶는다. 프로젝트 이름은 런타임 `repo.list`의 `displayName`을 사용하고, 조회 실패 시 같은 저장소 worktree의 label 중 사전순 최솟값을 쓴다. 화면은 `프로젝트 | 워크트리 | 세션` 3열 compact 행으로 표시하며 원시 repoId와 경로는 노출하지 않는다.
 
 ## 8. 로그·진단과 장애 처리
 
-진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown, title_indicator. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
+진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown, title_indicator, notify_failed, event_unresolved, target_reset, first_done_ignored, epoch_restored. 신규 진단의 code는 `event_unresolved`(invalid_payload | catalog_failed | no_match | no_target; 같은 (target,code)는 60초에 1회만 기록하고 dedupe Map 상한 256), `target_reset`(incarnation_changed | pty_changed | handle_changed), `first_done_ignored`(NO_FRESH_TURN — working을 보지 못한 채 받은 첫 done), `epoch_restored`(§5.6 리로드 복원)이다. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
 
 host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cache-keepalive/logs/events.jsonl`에 plugin 전용 파일 기록(1 MiB×3, chmod 0600·디렉터리 0700 best effort). 앱 프로필/설정 파일에는 쓰지 않는다. Windows ACL은 chmod로 보장되지 않으므로 기존 사용자 data 디렉터리 경계를 따른다. 파일 logger 실패는 ring/host log로 대체하고 전송 상태 저장 실패와 구별한다. 알림은 동일 reason당 5분에 1회, 큰 상태 전환에만 발생; 매 tick 알림 금지.
 

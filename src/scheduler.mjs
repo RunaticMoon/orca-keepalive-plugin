@@ -14,6 +14,7 @@
  * 내부 전용 입력 type(contracts.MACHINE_INPUT_TYPES에는 없지만 여기서 허용):
  * - `REVIEW_CLEARED`: NEEDS_REVIEW를 해제한다.
  * - `EXPIRE`: 'expire' 결정 뒤 epoch를 닫는다.
+ * - `RESTORE_EPOCH`: 리로드 전 저장한 doneAt으로 초기 상태에 epoch를 복원한다.
  *
  * @module scheduler
  */
@@ -491,6 +492,39 @@ function reduceExpire(state, input) {
 }
 
 /**
+ * 리로드 복원: 저장해 둔 마지막 done 시각으로 epoch를 되살린다.
+ * 예약 이력이 전혀 없는 초기 상태에서만 적용하며, 조건이 맞지 않으면 그대로 반환한다.
+ * @param {SchedulerState} state
+ * @param {{doneAt?:number, now?:number}} input
+ * @returns {SchedulerState}
+ */
+function reduceRestoreEpoch(state, input) {
+  const { doneAt, now } = input;
+  const eligible =
+    isFiniteNumber(doneAt) &&
+    isFiniteNumber(now) &&
+    doneAt <= now + TIMING.clockSkewMs &&
+    state.phase === 'UNKNOWN' &&
+    state.epoch === null &&
+    state.seenWorking === false &&
+    state.lastHook !== 'working' &&
+    state.attempt === null;
+  if (!eligible) {
+    return copyState(state);
+  }
+  const next = copyState(state);
+  next.seenWorking = true;
+  next.lastHook = 'done';
+  next.lastHookAt = Math.max(state.lastHookAt ?? -Infinity, doneAt);
+  const epochSeq = state.epochSeq + 1;
+  next.epochSeq = epochSeq;
+  next.epoch = { id: epochSeq, doneAt, attempted: false };
+  next.phase = 'ARMED';
+  next.reason = null;
+  return next;
+}
+
+/**
  * target 상태 머신 reducer. 알 수 없는 type은 조용히 무시한다(throw 금지).
  * 어떤 경우에도 입력 state를 변경하지 않고 새 객체를 반환한다.
  * @param {SchedulerState} state
@@ -528,6 +562,8 @@ export function reduceTarget(state, input) {
       return reduceTick(state, input);
     case 'EXPIRE':
       return reduceExpire(state, input);
+    case 'RESTORE_EPOCH':
+      return reduceRestoreEpoch(state, input);
     default:
       return copyState(state);
   }

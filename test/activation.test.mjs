@@ -366,6 +366,48 @@ test('createPlugin은 coordinator에 hostCall과 실제 title indicator 팩토�
   await plugin.deactivate()
 })
 
+test('createPlugin은 epochMemory를 만들어 coordinator에 전달하고 dashboard model에 hashTarget을 준다', async () => {
+  const { coordinator } = createFakeCoordinator()
+  const { orca } = createFakeOrca()
+  let epochOptions = null
+  let coordinatorOptions = null
+  let modelOptions = null
+  const fakeEpochMemory = {
+    load: async () => {},
+    get: () => null,
+    remember() {},
+    forget() {},
+    prune() {},
+    flush: async () => {},
+  }
+  const plugin = createPlugin(orca, {
+    ...baseDeps({ orchestrator: coordinator }),
+    createEpochMemory: (options) => {
+      epochOptions = options
+      return fakeEpochMemory
+    },
+    createCoordinator: (options) => {
+      coordinatorOptions = options
+      return coordinator
+    },
+    createDashboardModel: (options) => {
+      modelOptions = options
+      return createFakeModel()
+    },
+  })
+  plugin.activate()
+
+  assert.ok(epochOptions, 'createEpochMemory가 호출된다')
+  assert.equal(typeof epochOptions.hostCall, 'function')
+  assert.equal(coordinatorOptions.epochMemory, fakeEpochMemory, '만든 epochMemory를 coordinator에 전달한다')
+
+  assert.ok(modelOptions, 'createDashboardModel이 호출된다')
+  assert.equal(typeof modelOptions.hashTarget, 'function', 'dashboard model에 hashTarget을 전달한다')
+  assert.match(modelOptions.hashTarget('w1', 'tab:leaf'), /^[0-9a-f]{12}$/)
+
+  await plugin.deactivate()
+})
+
 test('keepalive-status는 런타임 없음 상태 문구를 알림으로 보낸다', async () => {
   const { coordinator } = createFakeCoordinator()
   const { orca, commands, notifications } = createFakeOrca()

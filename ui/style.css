@@ -570,9 +570,10 @@ input[type="checkbox"] {
 }
 
 .diagnostics li {
-  display: grid;
-  grid-template-columns: auto auto 1fr;
-  gap: 0.25rem 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.65rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -583,12 +584,35 @@ input[type="checkbox"] {
 .diag-time {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .diag-level {
   font-weight: 600;
   text-transform: uppercase;
   font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.diag-target {
+  min-width: 0;
+  max-width: min(14rem, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.diag-message {
+  flex: 1 1 18rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.diag-detail {
+  margin-left: 0.5rem;
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 .diag-error {

@@ -35,6 +35,12 @@ const UNKNOWN_SEND_REASON = 'PARTIAL_OR_UNKNOWN_SEND'
 const REPO_NAME_REFRESH_MS = 300000
 /** repo 이름 조회 재시도 최소 간격(ms). 성공/실패와 무관하게 이 간격 안에는 다시 시도하지 않는다. */
 const REPO_NAME_RETRY_MS = 30000
+/** event_unresolved 폭주 방지: 같은 (targetId, code) 조합을 이 간격 안에는 1회만 기록한다. */
+const UNRESOLVED_DEDUPE_MS = 60000
+/** event_unresolved dedupe Map 상한. 넘으면 삽입이 오래된 항목부터 정리한다. */
+const UNRESOLVED_DEDUPE_MAX = 256
+/** epoch 메모리로 저장/복원하는 예약의 최대 수명(ms). 허용 최대 TTL인 1시간과 같다. */
+const EPOCH_MEMORY_MAX_AGE_MS = 3600000
 
 /**
  * @typedef {Object} RuntimeConnection
@@ -161,6 +167,7 @@ function scopeOf(target) {
  * @param {{initialTargetState:Function, reduceTarget:Function, decide:Function}} options.scheduler
  * @param {{record:Function}} options.diagnostics
  * @param {(options:{rpc:object, hostCall:Function, clock:object, diagnostics:object}) => object} [options.createTitleIndicator] 탭 제목 ⚡ 표시기 팩토리(선택). rpc 준비 후 1회 생성한다.
+ * @param {{load:Function, get:Function, remember:Function, forget:Function, prune:Function, flush:Function}} [options.epochMemory] keepalive 예약(epoch) 영속 메모리(선택). null이면 저장/복원을 생략한다.
  * @param {() => Promise<boolean>} [options.cwarmDisabled]
  * @param {string} options.clientId
  * @param {Object} [options.clock]
@@ -179,6 +186,7 @@ export function createCoordinator({
   scheduler,
   diagnostics,
   createTitleIndicator = null,
+  epochMemory = null,
   cwarmDisabled = async () => false,
   clientId,
   clock = { now: Date.now, monoNow: () => performance.now(), setTimeout, clearTimeout, sleep },
@@ -238,6 +246,8 @@ export function createCoordinator({
   const skipUntil = new Map()
   /** 실제(사람/기타) 턴의 working을 관측한 target key. 그 done에서 탭 제목을 새로 고친다. @type {Set<string>} */
   const pendingRealTurn = new Set()
+  /** `${targetId ?? ''}\u0000${code}` → 마지막 event_unresolved 기록 시각(clock.now). @type {Map<string, number>} */
+  const unresolvedRecordedAt = new Map()
 
   /** repoId → displayName 캐시. observer.listRepoNames 성공 결과만 반영한다. @type {Map<string, string>} */
   const repoNames = new Map()
@@ -311,8 +321,147 @@ export function createCoordinator({
       return null
     }
     entry.state = scheduler.reduceTarget(entry.state, input)
+    syncEpochMemory(key, entry.state)
     refreshDecision(key, config)
     return entry.state
+  }
+
+  /**
+   * epoch 메모리 연동(선택). 렐로드 대비 규칙:
+   * - ARMED이고 epoch가 아직 attempted=false이며 target 식별자가 유효하면
+   *   현재 예약을 remember한다. userDataKey/profileId/worktreeId/paneKey/ptyId는
+   *   비어 있지 않은 문자열이어야 하고, incarnationId는 비어 있지 않은 문자열 또는
+   *   null을 허용한다(epoch-memory 계약).
+   * - 그 밖의 모든 phase는 forget한다(없는 key는 no-op).
+   * epochMemory가 null이면 모두 생략하고, 어떤 예외도 밖으로 내보내지 않는다.
+   * @param {string} key
+   * @param {any} state
+   * @returns {void}
+   */
+  function syncEpochMemory(key, state) {
+    if (epochMemory === null) {
+      return
+    }
+    try {
+      if (state.phase === 'ARMED' && state.epoch !== null && state.epoch.attempted === false) {
+        const target = state.target
+        const record = {
+          userDataKey: target.userDataKey,
+          profileId: target.profileId,
+          worktreeId: target.worktreeId,
+          paneKey: target.paneKey,
+          ptyId: target.ptyId,
+          incarnationId: target.incarnationId,
+          doneAt: state.epoch.doneAt,
+        }
+        const hasIdentifiers =
+          typeof record.userDataKey === 'string' && record.userDataKey.length > 0 &&
+          typeof record.profileId === 'string' && record.profileId.length > 0 &&
+          typeof record.worktreeId === 'string' && record.worktreeId.length > 0 &&
+          typeof record.paneKey === 'string' && record.paneKey.length > 0 &&
+          typeof record.ptyId === 'string' && record.ptyId.length > 0 &&
+          (record.incarnationId === null ||
+            (typeof record.incarnationId === 'string' && record.incarnationId.length > 0))
+        if (hasIdentifiers && typeof record.doneAt === 'number' && Number.isFinite(record.doneAt)) {
+          epochMemory.remember(key, record)
+          return
+        }
+      }
+      epochMemory.forget(key)
+    } catch {
+      // 저장/삭제 실패는 coordinator 동작에 영향을 주지 않는다.
+    }
+  }
+
+  /**
+   * 새로 만든 target에 대해 저장된 예약을 복원한다(선택). target 식별자가 일치하고
+   * 1시간 이내의 doneAt이며 scope에 검토 필요/열린 attempt가 없으면 RESTORE_EPOCH를
+   * 적용하고, ARMED가 되면 진단을 남긴다. 조건이 맞지 않으면 저장된 항목을 정리한다.
+   * @param {string} key
+   * @param {Record<string, any>} target
+   * @returns {void}
+   */
+  function restoreEpochMemory(key, target) {
+    if (epochMemory === null) {
+      return
+    }
+    let record
+    try {
+      record = epochMemory.get(key)
+    } catch {
+      record = null
+    }
+    if (record === null || record === undefined) {
+      return
+    }
+    const matches =
+      record.userDataKey === target.userDataKey &&
+      record.profileId === target.profileId &&
+      record.ptyId === target.ptyId &&
+      record.incarnationId === target.incarnationId
+    const fresh = clock.now() - record.doneAt < EPOCH_MEMORY_MAX_AGE_MS
+    // 검토 필요/열린 attempt가 있으면 과거 예약을 되살리지 않는다(중복 전송 방지).
+    if (!matches || !fresh || budgetBlocksRestore(target)) {
+      try {
+        epochMemory.forget(key)
+      } catch {
+        // 정리 실패는 무시한다.
+      }
+      return
+    }
+    const state = applyReduce(key, {
+      type: 'RESTORE_EPOCH',
+      doneAt: record.doneAt,
+      now: clock.now(),
+    })
+    if (state !== null && state.phase === 'ARMED') {
+      diagnostics.record({ event: 'epoch_restored', targetId: key })
+    }
+  }
+
+  /**
+   * scope의 store 예산이 검토 필요(needsReview)이거나 열린 attempt
+   * (reserved/pasted/submitted)를 들고 있으면 true를 돌려준다. 이때는 저장된 예약을
+   * 복원하지 않는다. getBudget 호출이 실패하면 보수적으로 true(복원 보류)를 돌려준다.
+   * @param {Record<string, any>} target
+   * @returns {boolean}
+   */
+  function budgetBlocksRestore(target) {
+    try {
+      if (typeof store.getBudget !== 'function') {
+        return false
+      }
+      const budget = store.getBudget(scopeOf(target))
+      if (!isObject(budget)) {
+        return false
+      }
+      if (budget.needsReview === true) {
+        return true
+      }
+      const last = budget.lastAttempt
+      return (
+        isObject(last) &&
+        (last.phase === 'reserved' || last.phase === 'pasted' || last.phase === 'submitted')
+      )
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * target이 사라질 때 저장된 예약을 지운다(선택). epochMemory가 없으면 no-op.
+   * @param {string} key
+   * @returns {void}
+   */
+  function forgetEpochMemory(key) {
+    if (epochMemory === null) {
+      return
+    }
+    try {
+      epochMemory.forget(key)
+    } catch {
+      // 삭제 실패는 무시한다.
+    }
   }
 
   /**
@@ -593,6 +742,19 @@ export function createCoordinator({
       } catch {
         // store가 자체적으로 memoryPaused/lastSaveError를 기록한다.
       }
+      if (epochMemory !== null) {
+        // 렐로드 전 저장한 예약을 복원하기 전에 읽어 들이고 오래된 항목을 정리한다.
+        try {
+          await epochMemory.load()
+        } catch {
+          // load 실패는 무시한다(복원 없이 진행).
+        }
+        try {
+          epochMemory.prune(EPOCH_MEMORY_MAX_AGE_MS)
+        } catch {
+          // prune 실패는 무시한다.
+        }
+      }
       if (stopped) {
         return
       }
@@ -696,6 +858,8 @@ export function createCoordinator({
    */
   async function handleBindingChanged(next) {
     binding = next
+    // 다른 런타임/프로필의 target일 수 있어 여기서는 epoch 메모리를 forget하지 않는다.
+    // 다음 reconcile의 식별자 불일치 forget과 bootstrap의 prune이 정리한다.
     targets.clear()
     skipUntil.clear()
     pendingRealTurn.clear()
@@ -933,6 +1097,8 @@ export function createCoordinator({
       // known 프로필로 승격되는 전환도 포함한다. 이때 비우지 않으면 target.profileId가
       // null로 남아 assertAllowed/safePolicy가 영구히 거절한다. clear 뒤 같은 tick의
       // reconcileCatalog가 올바른 profileId로 재생성한다.
+      // epoch 메모리는 여기서 forget하지 않는다(다른 프로필일 수 있음). 재생성 시
+      // profileId 불일치로 forget되고, 시작 시 prune도 정리한다.
       targets.clear()
       skipUntil.clear()
       pendingRealTurn.clear()
@@ -1013,6 +1179,8 @@ export function createCoordinator({
       const entry = targets.get(key)
       if (!entry) {
         targets.set(key, { state: scheduler.initialTargetState(target), decision: null, meta })
+        // 새 target을 만들었을 때만 저장된 예약을 복원한다(전환/삭제 후 재생성 포함).
+        restoreEpochMemory(key, target)
       } else {
         const prev = entry.state.target
         if (
@@ -1020,6 +1188,13 @@ export function createCoordinator({
           prev.ptyId !== target.ptyId ||
           prev.incarnationId !== target.incarnationId
         ) {
+          const code =
+            prev.incarnationId !== target.incarnationId
+              ? 'incarnation_changed'
+              : prev.ptyId !== target.ptyId
+                ? 'pty_changed'
+                : 'handle_changed'
+          diagnostics.record({ event: 'target_reset', code, targetId: key })
           applyReduce(key, { type: 'TARGET_CHANGED', target })
         }
         entry.meta = meta
@@ -1030,6 +1205,7 @@ export function createCoordinator({
         if (!seen.has(key)) {
           targets.delete(key)
           pendingRealTurn.delete(key)
+          forgetEpochMemory(key)
         }
       }
     }
@@ -1369,19 +1545,68 @@ export function createCoordinator({
   }
 
   /**
+   * event_unresolved 진단을 폭주 방지와 함께 기록한다. 같은 (targetId, code)는
+   * 60초 안에 1회만 남기고, Map이 256개를 넘으면 삽입이 오래된 항목부터 정리한다.
+   * 진단 기록 실패는 이벤트 처리 흐름을 막지 않는다.
+   * @param {string|null} code
+   * @param {string|undefined} targetId
+   */
+  function recordUnresolved(code, targetId) {
+    try {
+      if (typeof code !== 'string' || code.length === 0) {
+        return
+      }
+      const dedupeKey = `${targetId ?? ''}${KEY_SEP}${code}`
+      const now = clock.now()
+      const last = unresolvedRecordedAt.get(dedupeKey)
+      if (typeof last === 'number' && now - last < UNRESOLVED_DEDUPE_MS) {
+        return
+      }
+      // 최근 기록을 Map 뒤쪽으로 옮겨 삽입 순서를 최신순으로 유지한다.
+      unresolvedRecordedAt.delete(dedupeKey)
+      unresolvedRecordedAt.set(dedupeKey, now)
+      while (unresolvedRecordedAt.size > UNRESOLVED_DEDUPE_MAX) {
+        const oldest = unresolvedRecordedAt.keys().next().value
+        if (oldest === undefined) {
+          break
+        }
+        unresolvedRecordedAt.delete(oldest)
+      }
+      const entry = { event: 'event_unresolved', code }
+      if (typeof targetId === 'string') {
+        entry.targetId = targetId
+      }
+      diagnostics.record(entry)
+    } catch {
+      // 진단 기록 실패는 무시한다.
+    }
+  }
+
+  /**
    * @param {unknown} payload
    * @returns {Promise<void>}
    */
   async function handleAgentEvent(payload) {
-    const key = await resolveKeyForEvent(payload)
+    const resolved = await resolveKeyForEvent(payload)
+    const key = resolved.key
     if (key === null) {
+      recordUnresolved(resolved.code, resolved.targetId)
       return
     }
     let entry = targets.get(key)
     if (!entry) {
+      recordUnresolved('no_target', resolved.targetId)
       return
     }
     const before = entry.state
+    const hookState = isObject(payload) && typeof payload.state === 'string' ? payload.state : null
+    if (hookState === 'done' && before.lastHook !== 'done' && before.seenWorking === false) {
+      diagnostics.record({
+        event: 'first_done_ignored',
+        code: REASON_CODES.NO_FRESH_TURN,
+        targetId: key,
+      })
+    }
     const mainAgentState =
       isObject(payload) && isObject(payload.mainAgent) && typeof payload.mainAgent.state === 'string'
         ? payload.mainAgent.state
@@ -1420,7 +1645,6 @@ export function createCoordinator({
     }
 
     // 탭 제목 ⚡ 표시: 자체 keepalive 턴이 아닌 실제 턴이 done이 되면 1회 새로 고친다.
-    const hookState = isObject(payload) && typeof payload.state === 'string' ? payload.state : null
     if (hookState === 'working') {
       if (after.selfTurnSeq > before.selfTurnSeq) {
         // 자체 keepalive 턴은 실제 턴 완료로 보지 않는다.
@@ -1446,10 +1670,24 @@ export function createCoordinator({
 
   /**
    * payload를 catalog의 유일한 row로 join한다. 없으면 catalog를 1회 재조회한다.
+   * 버린 경우 code에 이유를 담아 돌려준다(내부 전용, 외부 API 불변).
    * @param {unknown} payload
-   * @returns {Promise<string|null>}
+   * @returns {Promise<{key: string|null, code: string|null, targetId: string|undefined}>}
    */
   async function resolveKeyForEvent(payload) {
+    const event = isObject(payload) ? payload : null
+    const inner = event && isObject(event.payload) ? event.payload : event
+    const worktreeId = isObject(inner) ? inner.worktreeId : undefined
+    const paneKey = isObject(inner) ? inner.paneKey : undefined
+    const hasIds =
+      typeof worktreeId === 'string' &&
+      worktreeId.length > 0 &&
+      typeof paneKey === 'string' &&
+      paneKey.length > 0
+    const targetId = hasIds ? keyFor(worktreeId, paneKey) : undefined
+    if (!hasIds) {
+      return { key: null, code: 'invalid_payload', targetId }
+    }
     let catalog = latestCatalog
     let target = catalog ? observer.resolveEvent(payload, catalog) : null
     if (!target) {
@@ -1457,18 +1695,21 @@ export function createCoordinator({
         catalog = await observer.list()
         latestCatalog = catalog
       } catch {
-        return null
+        return { key: null, code: 'catalog_failed', targetId }
       }
       target = observer.resolveEvent(payload, catalog)
     }
     if (!target || typeof target.worktreeId !== 'string' || typeof target.paneKey !== 'string') {
-      return null
+      return { key: null, code: 'no_match', targetId }
     }
     const key = keyFor(target.worktreeId, target.paneKey)
     if (!targets.has(key) && catalog) {
       reconcileCatalog(catalog)
     }
-    return key
+    if (!targets.has(key)) {
+      return { key: null, code: 'no_target', targetId }
+    }
+    return { key, code: null, targetId }
   }
 
   // -------------------------------------------------------------------------
@@ -1498,6 +1739,7 @@ export function createCoordinator({
       if (entry && entry.state.target.worktreeId === worktreeId) {
         targets.delete(key)
         pendingRealTurn.delete(key)
+        forgetEpochMemory(key)
       }
     }
   }
@@ -1515,6 +1757,8 @@ export function createCoordinator({
     if (targets.has(key)) {
       applyReduce(key, { type: 'REVIEW_CLEARED' })
     }
+    // 검토가 해제됐으므로 이전 예약을 복원 후보로 남기지 않는다.
+    forgetEpochMemory(key)
   }
 
   async function currentWorktreeId() {
@@ -1726,6 +1970,14 @@ export function createCoordinator({
           // flush 미지원/실패는 무시한다.
         }
       }
+      // 예약 메모리의 대기 중 저장을 best-effort로 마무리한다(실패 무시).
+      if (epochMemory !== null && typeof epochMemory.flush === 'function') {
+        try {
+          await epochMemory.flush()
+        } catch {
+          // flush 실패는 무시한다.
+        }
+      }
     })()
     return stopPromise
   }
@@ -1742,3 +1994,9 @@ export function createCoordinator({
     getRpc,
   }
 }
+
+/**
+ * targets Map key를 만든다. main.mjs의 진단 hashTarget 연결과 테스트가 쓴다.
+ * 동작은 내부 keyFor와 같다.
+ */
+export { keyFor as targetKeyFor }

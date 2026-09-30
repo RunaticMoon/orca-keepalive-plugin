@@ -88,12 +88,13 @@ function runtimeView(over = {}) {
   };
 }
 
-function makeModel({ store, runtime, diagnostics, randomId, now } = {}) {
+function makeModel({ store, runtime, diagnostics, randomId, now, hashTarget } = {}) {
   const calls = { policy: 0, review: [] };
   const model = createDashboardModel({
     store,
     getRuntimeView: () => runtime,
     getDiagnostics: diagnostics === undefined ? () => [] : () => diagnostics,
+    hashTarget,
     onPolicyChanged: () => {
       calls.policy += 1;
     },
@@ -970,4 +971,146 @@ test('statusSummary: 원시 worktreeId·비밀·경로를 넣지 않는다', asy
   assert.equal(text.includes('raw-secret-wt'), false);
   assert.equal(text.includes(USER), false);
   assert.equal(text.includes(PANE), false);
+});
+
+/* ------------------------------------------------------------------ */
+/* diagnostics — target/targetLabel                                    */
+/* ------------------------------------------------------------------ */
+
+/** coordinator/diagnostics와 같은 12 hex target 해시. */
+function targetHash(worktreeId, paneKey) {
+  return crypto
+    .createHash('sha256')
+    .update(`${worktreeId}\u0000${paneKey}`, 'utf8')
+    .digest('hex')
+    .slice(0, 12);
+}
+
+test('diagnostics: 해시가 현재 터미널과 매칭되면 target/targetLabel을 붙인다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [wt({ worktreeId: WORKTREE, label: 'main', terminals: [term({ title: 'claude #1' })] })],
+  });
+  const diagnostics = [{ at: 5, level: 'info', event: 'epoch_armed', target: targetHash(WORKTREE, PANE) }];
+  const { model } = makeModel({ store, runtime, diagnostics, hashTarget: targetHash });
+
+  const [diag] = model.snapshot().diagnostics;
+  assert.equal(diag.target, targetHash(WORKTREE, PANE));
+  assert.equal(diag.targetLabel, 'main / claude #1');
+});
+
+test('diagnostics: terminal title이 없으면 targetLabel은 "터미널"', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [wt({ worktreeId: WORKTREE, label: 'main', terminals: [term({ title: null })] })],
+  });
+  const diagnostics = [{ at: 1, level: 'info', event: 'e', target: targetHash(WORKTREE, PANE) }];
+  const { model } = makeModel({ store, runtime, diagnostics, hashTarget: targetHash });
+
+  assert.equal(model.snapshot().diagnostics[0].targetLabel, 'main / 터미널');
+});
+
+test('diagnostics: worktree label이 없으면 branch로, 둘 다 없으면 "워크트리"로 대체', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({ worktreeId: 'w-branch', label: null, branch: 'feature/x', terminals: [term({ worktreeId: 'w-branch', title: 't' })] }),
+      wt({ worktreeId: 'w-none', label: null, branch: null, terminals: [term({ worktreeId: 'w-none', title: 't' })] }),
+    ],
+  });
+  const diagnostics = [
+    { at: 1, level: 'info', event: 'e1', target: targetHash('w-branch', PANE) },
+    { at: 2, level: 'info', event: 'e2', target: targetHash('w-none', PANE) },
+  ];
+  const { model } = makeModel({ store, runtime, diagnostics, hashTarget: targetHash });
+
+  const [branchDiag, noneDiag] = model.snapshot().diagnostics;
+  assert.equal(branchDiag.targetLabel, 'feature/x / t');
+  assert.equal(noneDiag.targetLabel, '워크트리 / t');
+});
+
+test('diagnostics: 매칭되는 터미널이 없으면 target은 있고 targetLabel은 null', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView(),
+    diagnostics: [{ at: 1, level: 'info', event: 'e', target: '0123456789ab' }],
+    hashTarget: targetHash,
+  });
+
+  const [diag] = model.snapshot().diagnostics;
+  assert.equal(diag.target, '0123456789ab');
+  assert.equal(diag.targetLabel, null);
+});
+
+test('diagnostics: target이 없거나 12자리 hex가 아니면 두 필드를 생략', async () => {
+  const { store } = await newStore();
+  const diagnostics = [
+    { at: 1, level: 'info', event: 'no-target' },
+    { at: 2, level: 'info', event: 'bad-target', target: 'XYZ' },
+    { at: 3, level: 'info', event: 'uppercase', target: '0123456789AB' },
+    { at: 4, level: 'info', event: 'too-long', target: '0123456789abcd' },
+  ];
+  const { model } = makeModel({ store, runtime: runtimeView(), diagnostics, hashTarget: targetHash });
+
+  for (const diag of model.snapshot().diagnostics) {
+    assert.equal('target' in diag, false, `${diag.event} target 생략`);
+    assert.equal('targetLabel' in diag, false, `${diag.event} targetLabel 생략`);
+  }
+});
+
+test('diagnostics: hashTarget 미제공이면 target만 붙고 targetLabel은 null', async () => {
+  const { store } = await newStore();
+  const diagnostics = [{ at: 1, level: 'info', event: 'e', target: targetHash(WORKTREE, PANE) }];
+  const { model } = makeModel({ store, runtime: runtimeView(), diagnostics });
+
+  const [diag] = model.snapshot().diagnostics;
+  assert.equal(diag.target, targetHash(WORKTREE, PANE));
+  assert.equal(diag.targetLabel, null);
+});
+
+test('diagnostics: hashTarget이 함수가 아니면 null로 취급해 targetLabel은 null', async () => {
+  const { store } = await newStore();
+  const diagnostics = [{ at: 1, level: 'info', event: 'e', target: targetHash(WORKTREE, PANE) }];
+  const { model } = makeModel({ store, runtime: runtimeView(), diagnostics, hashTarget: 'not-a-function' });
+
+  const [diag] = model.snapshot().diagnostics;
+  assert.equal(diag.target, targetHash(WORKTREE, PANE));
+  assert.equal(diag.targetLabel, null);
+});
+
+test('diagnostics: hashTarget이 던지는 터미널만 targetLabel이 null', async () => {
+  const { store } = await newStore();
+  const good = { worktreeId: 'w-good', paneKey: 'p-good', title: 'good', phase: 'ARMED', reason: null, dueAt: null, expiresAt: null, supported: true, unsupportedReason: null };
+  const bad = { worktreeId: 'w-bad', paneKey: 'p-bad', title: 'bad', phase: 'ARMED', reason: null, dueAt: null, expiresAt: null, supported: true, unsupportedReason: null };
+  const runtime = runtimeView({ worktrees: [wt({ worktreeId: 'w-good', label: 'main', terminals: [good, bad] })] });
+  const throwingHash = (worktreeId, paneKey) => {
+    if (paneKey === 'p-bad') {
+      throw new Error('boom');
+    }
+    return targetHash(worktreeId, paneKey);
+  };
+  const diagnostics = [
+    { at: 1, level: 'info', event: 'good', target: targetHash('w-good', 'p-good') },
+    { at: 2, level: 'info', event: 'bad', target: targetHash('w-good', 'p-bad') },
+  ];
+  const { model } = makeModel({ store, runtime, diagnostics, hashTarget: throwingHash });
+
+  const [goodDiag, badDiag] = model.snapshot().diagnostics;
+  assert.equal(goodDiag.targetLabel, 'main / good');
+  assert.equal(badDiag.target, targetHash('w-good', 'p-bad'));
+  assert.equal(badDiag.targetLabel, null);
+});
+
+test('diagnostics: 스냅숏 JSON에 원문 worktreeId/paneKey를 노출하지 않는다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [wt({ worktreeId: WORKTREE, label: 'main', terminals: [term({ title: 'claude #1' })] })],
+  });
+  const diagnostics = [{ at: 1, level: 'info', event: 'e', target: targetHash(WORKTREE, PANE) }];
+  const { model } = makeModel({ store, runtime, diagnostics, hashTarget: targetHash });
+
+  const json = JSON.stringify(model.snapshot());
+  assert.equal(json.includes(WORKTREE), false);
+  assert.equal(json.includes(PANE), false);
 });

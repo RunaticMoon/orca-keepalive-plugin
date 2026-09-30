@@ -120,7 +120,7 @@
 /**
  * reducer 입력 이벤트. §6, §5.4.
  * @typedef {Object} MachineInput
- * @property {'HOOK'|'POLICY_INVALIDATED'|'TARGET_CHANGED'|'CLOCK_GAP'|'ATTEMPT_RESERVED'|'PASTE_ACCEPTED'|'SUBMIT_ACCEPTED'|'SEND_REFUSED'|'SEND_UNCERTAIN'|'TURN_CONFIRMED'|'TICK'} type
+ * @property {'HOOK'|'POLICY_INVALIDATED'|'TARGET_CHANGED'|'CLOCK_GAP'|'ATTEMPT_RESERVED'|'PASTE_ACCEPTED'|'SUBMIT_ACCEPTED'|'SEND_REFUSED'|'SEND_UNCERTAIN'|'TURN_CONFIRMED'|'TICK'|'RESTORE_EPOCH'} type
  * @property {number} at 이벤트 시각(ms).
  * @property {Object} [payload] 이벤트별 부가 정보(예: HOOK이면 state/worktreeId/paneKey/receivedAt).
  */
@@ -330,6 +330,10 @@ export const DIAGNOSTIC_EVENTS = deepFreeze([
   'shutdown',
   'title_indicator',
   'notify_failed',
+  'event_unresolved',
+  'target_reset',
+  'first_done_ignored',
+  'epoch_restored',
 ]);
 
 /**
@@ -365,6 +369,7 @@ export const MACHINE_INPUT_TYPES = deepFreeze([
   'SEND_UNCERTAIN',
   'TURN_CONFIRMED',
   'TICK',
+  'RESTORE_EPOCH',
 ]);
 
 /**

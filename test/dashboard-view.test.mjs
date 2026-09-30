@@ -13,8 +13,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { REASON_CODES } from '../src/contracts.mjs';
+import { DIAGNOSTIC_EVENTS, REASON_CODES } from '../src/contracts.mjs';
 import {
+  DIAGNOSTIC_EVENT_TEXT,
   formatRemaining,
   reasonText,
   toViewModel,
@@ -301,6 +302,44 @@ test('toViewModel: diagnostics keep only the most recent 20 entries', () => {
   assert.equal(vm.diagnostics.length, 20);
   assert.equal(vm.diagnostics[0].event, 'event_5');
   assert.equal(vm.diagnostics[19].event, 'event_24');
+});
+
+test('toViewModel: diagnostics show target labels, hash fallback, and no-target state', () => {
+  const diagnostics = [
+    { at: SERVER_NOW, level: 'info', event: 'epoch_armed', target: 'abcdef123456', targetLabel: 'main / Claude' },
+    { at: SERVER_NOW, level: 'warn', event: 'target_reset', target: '123456abcdef', targetLabel: null, code: 'pty_changed' },
+    { at: SERVER_NOW, level: 'error', event: 'event_unresolved', code: 'no_target' },
+  ];
+  const { diagnostics: rows } = toViewModel(makeSnapshot({ diagnostics }), 0);
+  assert.equal(rows[0].targetText, 'main / Claude');
+  assert.equal(rows[0].eventText, '캐시 만료 전 keepalive 예약');
+  assert.equal(rows[1].targetText, '#123456');
+  assert.equal(rows[1].eventText, '터미널 식별 정보가 바뀌어 상태 초기화');
+  assert.equal(rows[1].code, 'pty_changed');
+  assert.equal(rows[2].targetText, null);
+  assert.equal(rows[2].eventText, '상태 이벤트를 터미널과 연결하지 못함');
+});
+
+test('toViewModel: new and unknown diagnostic events remain understandable', () => {
+  const diagnostics = [
+    { event: 'first_done_ignored', code: 'NO_FRESH_TURN' },
+    { event: 'epoch_restored' },
+    { event: 'future_event' },
+  ];
+  const { diagnostics: rows } = toViewModel(makeSnapshot({ diagnostics }), 0);
+  assert.equal(rows[0].eventText, '작업 시작을 보지 못해 이번 완료는 예약하지 않음');
+  assert.equal(rows[0].code, 'NO_FRESH_TURN');
+  assert.equal(rows[1].eventText, '리로드 전 예약을 복원');
+  assert.equal(rows[2].eventText, 'future_event');
+});
+
+test('diagnostic event descriptions cover the contract and new events', () => {
+  for (const event of [
+    ...DIAGNOSTIC_EVENTS,
+    'event_unresolved', 'target_reset', 'first_done_ignored', 'epoch_restored',
+  ]) {
+    assert.ok(DIAGNOSTIC_EVENT_TEXT[event], `missing description: ${event}`);
+  }
 });
 
 test('toViewModel: tolerates an empty/garbage snapshot without throwing', () => {

@@ -340,6 +340,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     'SEND_UNCERTAIN',
     'TURN_CONFIRMED',
     'TICK',
+    'RESTORE_EPOCH',
   ]);
   assert.deepEqual(contracts.DECISION_KINDS, ['wait', 'inspect', 'send', 'expire']);
   assert.deepEqual(contracts.HOOK_STATES, ['working', 'blocked', 'waiting', 'done']);
@@ -392,6 +393,10 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     'shutdown',
     'title_indicator',
     'notify_failed',
+    'event_unresolved',
+    'target_reset',
+    'first_done_ignored',
+    'epoch_restored',
   ]);
   assert.deepEqual(contracts.PUBLIC_SNAPSHOT_FORBIDDEN_KEYS, [
     'authToken',

@@ -310,6 +310,42 @@ function createTitleIndicatorRpc(rows) {
   }
 }
 
+/**
+ * coordinator의 epoch 메모리 계약(load/get/remember/forget/prune/flush)을 구현한
+ * 메모리 fake. 두 coordinator 인스턴스가 같은 객체를 공유해 렐로드를 재현할 수 있다.
+ * @param {Map<string, object>} [initial]
+ */
+function createFakeEpochMemory(initial = new Map()) {
+  const store = new Map(initial)
+  const calls = { load: 0, get: [], remember: [], forget: [], prune: [], flush: 0 }
+  return {
+    store,
+    calls,
+    async load() {
+      calls.load += 1
+    },
+    get(key) {
+      calls.get.push(key)
+      const record = store.get(key)
+      return record === undefined ? null : { ...record }
+    },
+    remember(key, record) {
+      calls.remember.push({ key, record: { ...record } })
+      store.set(key, { ...record, savedAt: 1 })
+    },
+    forget(key) {
+      calls.forget.push(key)
+      store.delete(key)
+    },
+    prune(maxAgeMs) {
+      calls.prune.push(maxAgeMs)
+    },
+    async flush() {
+      calls.flush += 1
+    },
+  }
+}
+
 function createHarness(options = {}) {
   const clock = options.clock ?? createFakeClock()
   const hostCall = options.hostCall ?? createHostCall()
@@ -460,6 +496,7 @@ function createHarness(options = {}) {
     scheduler,
     diagnostics,
     createTitleIndicator: createTitleIndicatorFactory,
+    epochMemory: options.epochMemory ?? null,
     cwarmDisabled,
     clientId: 'cache-keepalive:test',
     clock,
@@ -2112,4 +2149,405 @@ test('pendingRealTurn: catalog 재구성으로 target이 삭제되면 정리된�
   worktreeEvent(h, 'w1', 'done', t0 + 1000)
   await h.clock.settle()
   assert.equal(indicator.calls.onTurnCompleted.length, before)
+})
+
+// ---------------------------------------------------------------------------
+// 22. 진단 기록: event_unresolved / target_reset / first_done_ignored
+// ---------------------------------------------------------------------------
+
+const EVENT_KEY_SEP = '\u0000'
+const eventKey = (worktreeId, paneKey) => `${worktreeId}${EVENT_KEY_SEP}${paneKey}`
+
+function unresolvedEvents(h, code) {
+  return h.diagEvents.filter(
+    (entry) => entry.event === 'event_unresolved' && (code === undefined || entry.code === code),
+  )
+}
+
+test('event_unresolved: id가 없는 payload는 invalid_payload를 targetId 없이 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  sendEvent(h, { state: 'working', receivedAt: h.clock.now() })
+  await h.clock.settle()
+
+  const recorded = unresolvedEvents(h)
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].code, 'invalid_payload')
+  assert.equal(recorded[0].targetId, undefined)
+})
+
+test('event_unresolved: catalog에 정확히 1개 매칭이 없으면 no_match를 기록한다', async () => {
+  const h = createHarness({
+    terminals: [makeRow({ worktreeId: 'other', paneKey: 'tab:other' })],
+  })
+  await startHarness(h)
+
+  worktreeEvent(h, 'w1', 'working', h.clock.now())
+  await h.clock.settle(3)
+
+  const recorded = unresolvedEvents(h, 'no_match')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].targetId, eventKey('w1', 'tab:leaf'))
+})
+
+test('event_unresolved: key는 얻었지만 target이 없으면 no_target을 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  // catalog row(w1)와 다른 key를 돌려줘 reconcileCatalog로도 target이 만들어지지 않게 한다.
+  h.observer.resolveEvent = () => ({
+    worktreeId: 'ghost',
+    paneKey: 'tab:leaf',
+    handle: 'h1',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+  })
+
+  worktreeEvent(h, 'w1', 'working', h.clock.now())
+  await h.clock.settle()
+
+  const recorded = unresolvedEvents(h, 'no_target')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].targetId, eventKey('w1', 'tab:leaf'))
+  // 이벤트가 target 상태를 만들지 않았음을 확인한다.
+  assert.equal(h.coordinator.getRuntimeView().worktrees.length, 1)
+  assert.equal(viewTerminal(h).worktreeId, 'w1')
+})
+
+test('event_unresolved: 같은 (targetId, code)는 60초 안에 1회만 기록하고 이후 다시 기록한다', async () => {
+  const h = createHarness({
+    terminals: [makeRow({ worktreeId: 'other', paneKey: 'tab:other' })],
+  })
+  await startHarness(h)
+
+  worktreeEvent(h, 'w1', 'working', h.clock.now())
+  await h.clock.settle(3)
+  assert.equal(unresolvedEvents(h, 'no_match').length, 1)
+
+  worktreeEvent(h, 'w1', 'done', h.clock.now() + 1)
+  await h.clock.settle(3)
+  assert.equal(unresolvedEvents(h, 'no_match').length, 1, '60초 안 중복은 버린다')
+
+  h.clock.jumpWall(60001)
+  worktreeEvent(h, 'w1', 'working', h.clock.now())
+  await h.clock.settle(3)
+  assert.equal(unresolvedEvents(h, 'no_match').length, 2, '60초가 지나면 다시 기록한다')
+})
+
+test('target_reset: incarnationId가 바뀌면 incarnation_changed를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  h.observer.state.rows = [makeRow({ incarnationId: 'inc2' })]
+  await h.clock.advance(h.tickMs)
+
+  const recorded = h.diagEvents.filter((entry) => entry.event === 'target_reset')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].code, 'incarnation_changed')
+  assert.equal(recorded[0].targetId, eventKey('w1', 'tab:leaf'))
+})
+
+test('target_reset: ptyId가 바뀌면 pty_changed를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  h.observer.state.rows = [makeRow({ ptyId: 'pty2' })]
+  await h.clock.advance(h.tickMs)
+
+  const recorded = h.diagEvents.filter((entry) => entry.event === 'target_reset')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].code, 'pty_changed')
+})
+
+test('target_reset: handle만 바뀌면 handle_changed를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  h.observer.state.rows = [makeRow({ handle: 'h2' })]
+  await h.clock.advance(h.tickMs)
+
+  const recorded = h.diagEvents.filter((entry) => entry.event === 'target_reset')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].code, 'handle_changed')
+})
+
+test('target_reset: 행이 그대로면 기록하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(h.diagEvents.filter((entry) => entry.event === 'target_reset').length, 0)
+})
+
+test('first_done_ignored: working 없이 도착한 첫 done은 NO_FRESH_TURN으로 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  worktreeEvent(h, 'w1', 'done', h.clock.now())
+  await h.clock.settle()
+
+  const recorded = h.diagEvents.filter((entry) => entry.event === 'first_done_ignored')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].code, 'NO_FRESH_TURN')
+  assert.equal(recorded[0].targetId, eventKey('w1', 'tab:leaf'))
+  assert.notEqual(viewTerminal(h).phase, 'ARMED')
+})
+
+test('first_done_ignored: working을 본 뒤의 done은 기록하지 않는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  await arm(h, h.clock.now())
+
+  assert.equal(h.diagEvents.filter((entry) => entry.event === 'first_done_ignored').length, 0)
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+})
+
+// ---------------------------------------------------------------------------
+// 23. epoch 메모리(렐로드 예약 저장·복원)
+// ---------------------------------------------------------------------------
+
+const EPOCH_KEY = eventKey('w1', 'tab:leaf')
+const EPOCH_MAX_AGE = 3600000
+
+test('epochMemory: bootstrap에서 load 뒤 1시간 prune을 호출한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+
+  assert.equal(epochMemory.calls.load, 1)
+  assert.deepEqual(epochMemory.calls.prune, [EPOCH_MAX_AGE])
+})
+
+test('epochMemory: 첫 done 뒤 ARMED이면 remember한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  const remembered = epochMemory.calls.remember.filter((call) => call.key === EPOCH_KEY)
+  assert.equal(remembered.length, 1)
+  assert.deepEqual(remembered[0].record, {
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt: t0 + 1000,
+  })
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+})
+
+test('epochMemory: working으로 BUSY가 되면 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+
+  const forgetBefore = epochMemory.calls.forget.length
+  worktreeEvent(h, 'w1', 'working', t0 + 2000)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+  assert.ok(epochMemory.calls.forget.length > forgetBefore)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+test('epochMemory: 같은 ptyId·incarnationId target은 새 인스턴스에서 ARMED로 복원하고 진단을 남긴다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const doneAt = t0 + 1000
+  assert.equal(viewTerminal(h1).phase, 'ARMED')
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+
+  const term = viewTerminal(h2)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, doneAt + TTL_5M)
+  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+
+  const restored = h2.diagEvents.filter((entry) => entry.event === 'epoch_restored')
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].targetId, EPOCH_KEY)
+})
+
+test('epochMemory: incarnationId가 다르면 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  await arm(h1, h1.clock.now())
+  await h1.coordinator.stop()
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+
+  const h2 = createHarness({
+    epochMemory,
+    terminals: [makeRow({ incarnationId: 'inc2' })],
+  })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'UNKNOWN')
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+})
+
+test('epochMemory: ptyId가 다르면 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  await arm(h1, h1.clock.now())
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory, terminals: [makeRow({ ptyId: 'pty2' })] })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'UNKNOWN')
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+})
+
+test('epochMemory: doneAt이 1시간 이상 지났으면 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const now = 1000000
+  epochMemory.store.set(EPOCH_KEY, {
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt: now - EPOCH_MAX_AGE,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(h.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+})
+
+test('epochMemory: catalog에서 사라진 target과 worktree 제거 시 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+
+  h.coordinator.onWorktreeRemoved({ worktreeId: 'w1' })
+  await h.clock.settle()
+  assert.equal(epochMemory.calls.forget.includes(EPOCH_KEY), true)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+test('epochMemory 미제공 시 기존 동작(복원 없음, 오류 없음)', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  await h.coordinator.stop()
+})
+
+test('epochMemory: incarnationId null도 remember되고 같은 ptyId·null로 복원된다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory, terminals: [makeRow({ incarnationId: null })] })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const doneAt = t0 + 1000
+  assert.equal(viewTerminal(h1).phase, 'ARMED')
+
+  const remembered = epochMemory.calls.remember.filter((call) => call.key === EPOCH_KEY)
+  assert.equal(remembered.length, 1)
+  assert.equal(remembered[0].record.incarnationId, null)
+  assert.equal(remembered[0].record.ptyId, 'pty1')
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory, terminals: [makeRow({ incarnationId: null })] })
+  await startHarness(h2)
+
+  const term = viewTerminal(h2)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, doneAt + TTL_5M)
+  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 1)
+})
+
+test('epochMemory: 저장된 incarnationId null과 target inc1은 불일치라 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  epochMemory.store.set(EPOCH_KEY, {
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    ptyId: 'pty1',
+    incarnationId: null,
+    doneAt: 1000000,
+    savedAt: 1,
+  })
+  // target은 incarnationId 'inc1'(기본 makeRow).
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  assert.equal(h.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+})
+
+test('epochMemory: needsReview scope는 복원하지 않고 forget하며 clearReview 뒤에도 전송하지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const hostCall = createHostCall()
+  const h1 = createHarness({ epochMemory, hostCall })
+  await startHarness(h1)
+  await arm(h1, h1.clock.now())
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+  await h1.coordinator.stop()
+
+  // 같은 store를 공유해 검토 필요 상태를 영속시킨다.
+  await h1.rawStore.markReview(SCOPE)
+  assert.equal(h1.rawStore.getBudget(SCOPE).needsReview, true)
+
+  const h2 = createHarness({ epochMemory, hostCall, store: h1.rawStore })
+  await startHarness(h2)
+
+  // needsReview이므로 복원하지 않고 저장 항목을 정리한다.
+  assert.equal(viewTerminal(h2).phase, 'UNKNOWN')
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  // 검토를 해제해도 새 working→done 없이는 전송하지 않는다.
+  await h2.store.clearReview(SCOPE)
+  h2.coordinator.onReviewCleared({ worktreeId: 'w1', paneKey: 'tab:leaf' })
+  await h2.clock.advance(TTL_5M)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('event_unresolved: catalog 재조회 실패는 catalog_failed를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  h.observer.state.onList = () => {
+    throw new Error('catalog down')
+  }
+  worktreeEvent(h, 'ghost', 'working', h.clock.now())
+  await h.clock.settle(3)
+
+  const recorded = unresolvedEvents(h, 'catalog_failed')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].targetId, eventKey('ghost', 'tab:leaf'))
 })

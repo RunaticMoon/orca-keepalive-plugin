@@ -34,7 +34,8 @@ import { sendKeepalive } from './src/guarded-send.mjs'
 import { initialTargetState, reduceTarget, decide } from './src/scheduler.mjs'
 import { createDiagnostics } from './src/diagnostics.mjs'
 import { createTitleIndicator } from './src/title-indicator.mjs'
-import { createCoordinator } from './src/coordinator.mjs'
+import { createCoordinator, targetKeyFor } from './src/coordinator.mjs'
+import { createEpochMemory } from './src/epoch-memory.mjs'
 import { createDashboardModel } from './src/dashboard-model.mjs'
 import { startDashboard } from './src/dashboard-server.mjs'
 import { registerCommands, openInOrcaBrowser } from './src/commands.mjs'
@@ -84,6 +85,7 @@ export function createPlugin(orca, deps = {}) {
     randomUUID = () => nodeCrypto.randomUUID(),
     createDiagnostics: makeDiagnostics = createDiagnostics,
     createStateStore: makeStateStore = createStateStore,
+    createEpochMemory: makeEpochMemory = createEpochMemory,
     createCoordinator: makeCoordinator = createCoordinator,
     createTitleIndicator: makeTitleIndicator = createTitleIndicator,
     createDashboardModel: makeDashboardModel = createDashboardModel,
@@ -313,11 +315,14 @@ export function createPlugin(orca, deps = {}) {
     const hostCall = (method, params) => orca.host.call(method, params)
     diagnostics = makeDiagnostics({ log: (message) => orca.log(message) })
     const store = makeStateStore({ hostCall })
+    // 렐로드 사이에 keepalive 예약(epoch)을 유지하기 위한 영속 메모리. 실패는 모듈이 삼킨다.
+    const epochMemory = makeEpochMemory({ hostCall })
     clientId = 'cache-keepalive:' + randomUUID()
 
     coordinator = makeCoordinator({
       hostCall,
       store,
+      epochMemory,
       resolveBinding: (override) =>
         resolveBindingImpl({
           platform: proc.platform,
@@ -346,6 +351,9 @@ export function createPlugin(orca, deps = {}) {
       store,
       getRuntimeView: () => coordinator.getRuntimeView(),
       getDiagnostics: () => diagnostics.snapshot(),
+      // 진단의 entry.target 해시와 같은 방식으로 터미널 라벨을 매핑한다.
+      hashTarget: (worktreeId, paneKey) =>
+        diagnostics.hashTarget(targetKeyFor(worktreeId, paneKey)),
       onReviewCleared: (info) => coordinator.onReviewCleared(info),
       onPolicyChanged: () => coordinator.onPolicyChanged(),
     })

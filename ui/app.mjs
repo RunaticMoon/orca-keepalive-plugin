@@ -86,6 +86,32 @@ export const REASON_TEXT = Object.freeze({
     'Orca 터미널 목록이 불완전해 자동 전송을 멈췄습니다. 목록이 복구되면 다시 동작합니다.',
 });
 
+/** Short labels for every diagnostic event in `src/contracts.mjs`. */
+export const DIAGNOSTIC_EVENT_TEXT = Object.freeze({
+  bootstrap_started: '플러그인 시작',
+  runtime_connected: 'Orca 런타임에 연결됨',
+  runtime_unavailable: 'Orca 런타임에 연결할 수 없음',
+  settings_unknown: '앱 타이머 설정을 확인하지 못함',
+  settings_changed: '앱 타이머 설정이 변경됨',
+  target_unsupported: '이 터미널에서는 keepalive를 지원하지 않음',
+  epoch_armed: '캐시 만료 전 keepalive 예약',
+  epoch_expired: '캐시 예약이 만료됨',
+  safety_skipped: '안전 조건을 충족하지 않아 전송을 건너뜀',
+  attempt_reserved: 'keepalive 전송 시도를 예약함',
+  paste_accepted: '터미널이 keepalive 입력을 받음',
+  submit_accepted: '터미널이 keepalive 전송을 받음',
+  turn_observed: '전송 후 새 작업 시작을 확인함',
+  send_uncertain: 'keepalive 전송 결과를 확인하지 못함',
+  policy_changed: 'keepalive 동작 설정이 변경됨',
+  shutdown: '플러그인이 종료됨',
+  title_indicator: '터미널 제목 표시가 변경됨',
+  notify_failed: '알림을 표시하지 못함',
+  event_unresolved: '상태 이벤트를 터미널과 연결하지 못함',
+  target_reset: '터미널 식별 정보가 바뀌어 상태 초기화',
+  first_done_ignored: '작업 시작을 보지 못해 이번 완료는 예약하지 않음',
+  epoch_restored: '리로드 전 예약을 복원',
+});
+
 /** Em dash used for unknown numeric values. */
 const PLACEHOLDER = '\u2014';
 
@@ -314,16 +340,25 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
     ? snap.diagnostics.slice(-20).map((entry) => {
         const diag = entry && typeof entry === 'object' ? entry : {};
         const at = finiteOrNull(diag.at);
+        const event =
+          typeof diag.event === 'string'
+            ? diag.event
+            : typeof diag.code === 'string'
+              ? diag.code
+              : '';
         return {
           at,
           timeText: at === null ? PLACEHOLDER : formatClock(at),
           level: typeof diag.level === 'string' ? diag.level : 'info',
-          event:
-            typeof diag.event === 'string'
-              ? diag.event
-              : typeof diag.code === 'string'
-                ? diag.code
-                : '',
+          event,
+          eventText: Object.prototype.hasOwnProperty.call(DIAGNOSTIC_EVENT_TEXT, event)
+            ? DIAGNOSTIC_EVENT_TEXT[event]
+            : event,
+          targetText: typeof diag.targetLabel === 'string'
+            ? diag.targetLabel
+            : typeof diag.target === 'string' && diag.target
+              ? `#${diag.target.slice(0, 6)}`
+              : null,
           code: typeof diag.code === 'string' ? diag.code : null,
         };
       })
@@ -902,7 +937,14 @@ function boot() {
       const li = el('li', 'diag');
       li.appendChild(el('span', 'diag-time', entry.timeText));
       li.appendChild(el('span', `diag-level diag-${entry.level}`, entry.level));
-      li.appendChild(el('span', 'diag-event', entry.event));
+      const target = el('span', 'diag-target', entry.targetText ?? '대상 없음');
+      if (entry.targetText !== null) target.title = entry.targetText;
+      li.appendChild(target);
+      const message = el('span', 'diag-message');
+      message.appendChild(el('span', 'diag-event', entry.eventText));
+      const detail = entry.code ? `${entry.event} · ${entry.code}` : entry.event;
+      if (detail) message.appendChild(el('small', 'diag-detail', detail));
+      li.appendChild(message);
       nodes.diagnostics.appendChild(li);
     }
   }

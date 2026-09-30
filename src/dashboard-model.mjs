@@ -47,6 +47,12 @@ const CONNECTION_TEXT = Object.freeze({
 const WORKTREE_IGNORED_POLICY_REASONS = new Set(['LIMIT_REACHED', 'PARTIAL_OR_UNKNOWN_SEND', 'STORAGE_FAILED']);
 
 /**
+ * 진단 기록의 `entry.target` 해시 형식(`hashTarget` 결과, salt+SHA-256 앞 12 hex).
+ * 형식이 다르면 스냅숏에 target/targetLabel을 넣지 않는다.
+ */
+const DIAGNOSTIC_TARGET_RE = /^[0-9a-f]{12}$/;
+
+/**
  * 대시보드 Action 검증·오류 status/code.
  *
  * dashboard-server는 `err.status`와 `err.code`만 반영한다(§7.4). code는 소문자
@@ -226,6 +232,7 @@ function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled,
  * @param {{snapshot: () => any, setPaused: Function, setWorktree: Function, setTerminal: Function, updateConfig: Function, resetBudget: Function, clearReview: Function, getBudget: Function, getOverrides: Function, isAllowedByPolicy: Function}} options.store
  * @param {() => object} options.getRuntimeView 동기 런타임 뷰 제공자.
  * @param {() => Array<object>} [options.getDiagnostics] 최근 진단 배열(오래된 것 → 최신).
+ * @param {(worktreeId: string, paneKey: string) => string} [options.hashTarget] 진단 `entry.target`과 같은 해시를 만드는 함수. 없거나 함수가 아니면 대상 라벨을 붙이지 않는다(targetLabel null).
  * @param {(info: {worktreeId: string, paneKey: string}) => void} [options.onReviewCleared]
  * @param {() => void} [options.onPolicyChanged] 성공한 mutation 뒤 호출.
  * @param {() => string} [options.randomId]
@@ -244,6 +251,7 @@ export function createDashboardModel({
   store,
   getRuntimeView,
   getDiagnostics = () => [],
+  hashTarget = null,
   onReviewCleared = () => {},
   onPolicyChanged = () => {},
   randomId = () => crypto.randomBytes(12).toString('base64url'),
@@ -255,6 +263,9 @@ export function createDashboardModel({
   if (typeof getRuntimeView !== 'function') {
     throw new TypeError('createDashboardModel requires getRuntimeView');
   }
+
+  // 해시 함수가 아니면 null로 취급해 라벨 매핑을 생략한다.
+  const hashTargetFn = typeof hashTarget === 'function' ? hashTarget : null;
 
   /** @type {Map<string, string>} 내부 key → opaque targetId */
   const keyToId = new Map();
@@ -438,14 +449,77 @@ export function createDashboardModel({
   }
 
   /**
-   * @param {Array<object>} entries
-   * @returns {Array<object>}
+   * 런타임 뷰의 현재 터미널에서 진단 target 해시 → 사람이 읽을 라벨 맵을 만든다.
+   *
+   * 라벨은 `${worktreeLabel} / ${terminalTitle}` 형식이다. worktreeLabel은
+   * `label ?? branch ?? '워크트리'`, terminalTitle은 `title ?? '터미널'`.
+   * `hashTarget`이 없으면 빈 맵을 돌려준다. 개별 `hashTarget` 호출이 던지면 그
+   * 터미널만 건너뛴다. 원문 worktreeId/paneKey는 이 맵 밖으로 나가지 않는다.
+   *
+   * @param {Record<string, unknown>} view 런타임 뷰.
+   * @returns {Map<string, string>} target 해시 → 터미널 라벨.
    */
-  function mapDiagnostics(entries) {
+  function diagnosticLabelsByHash(view) {
+    /** @type {Map<string, string>} */
+    const labels = new Map();
+    if (hashTargetFn === null) {
+      return labels;
+    }
+    const rawWorktrees = Array.isArray(view.worktrees) ? view.worktrees : [];
+    for (const rawWorktree of rawWorktrees) {
+      if (!isPlainObject(rawWorktree)) {
+        continue;
+      }
+      const worktreeId = nonEmptyStringOrNull(rawWorktree.worktreeId);
+      if (worktreeId === null) {
+        continue;
+      }
+      const worktreeLabel =
+        nonEmptyStringOrNull(rawWorktree.label) ?? nonEmptyStringOrNull(rawWorktree.branch) ?? '워크트리';
+      const rawTerminals = Array.isArray(rawWorktree.terminals) ? rawWorktree.terminals : [];
+      for (const rawTerminal of rawTerminals) {
+        if (!isPlainObject(rawTerminal)) {
+          continue;
+        }
+        const paneKey = nonEmptyStringOrNull(rawTerminal.paneKey);
+        if (paneKey === null) {
+          continue;
+        }
+        /** @type {unknown} */
+        let hash;
+        try {
+          hash = hashTargetFn(worktreeId, paneKey);
+        } catch {
+          continue;
+        }
+        if (typeof hash !== 'string' || hash.length === 0) {
+          continue;
+        }
+        const terminalTitle = nonEmptyStringOrNull(rawTerminal.title) ?? '터미널';
+        labels.set(hash, `${worktreeLabel} / ${terminalTitle}`.trim());
+      }
+    }
+    return labels;
+  }
+
+  /**
+   * 진단 기록을 공개 스냅숏용으로 매핑한다.
+   *
+   * 기존 필드(at/level/event/code?)에 더해, `entry.target`이 12자리 hex 해시
+   * 형식이면 `target`을 그대로 넣고 `labelsByHash`에 있으면 사람이 읽을
+   * `targetLabel`을 붙인다. 매칭이 없으면 `targetLabel: null`이다. `target`이
+   * 없거나 형식이 다르면 두 필드 모두 생략한다. 원문 targetId는 노출하지 않는다.
+   *
+   * @param {Array<object>} entries 진단 기록(오래된 것 → 최신).
+   * @param {Map<string, string>} labelsByHash target 해시 → 터미널 라벨.
+   * @returns {Array<{at: number, level: string, event: string, code?: string, target?: string, targetLabel?: string|null}>}
+   */
+  function mapDiagnostics(entries, labelsByHash) {
+    const labels = labelsByHash instanceof Map ? labelsByHash : new Map();
     const list = Array.isArray(entries) ? entries : [];
     return list.slice(-50).map((entry) => {
       const diag = isPlainObject(entry) ? /** @type {Record<string, unknown>} */ (entry) : {};
-      /** @type {{at: number, level: string, event: string, code?: string}} */
+      /** @type {{at: number, level: string, event: string, code?: string, target?: string, targetLabel?: string|null}} */
       const mapped = {
         at: finiteOrNull(diag.at) ?? 0,
         level: nonEmptyStringOrNull(diag.level) ?? 'info',
@@ -454,6 +528,12 @@ export function createDashboardModel({
       const code = nonEmptyStringOrNull(diag.code);
       if (code !== null) {
         mapped.code = code;
+      }
+      const target =
+        typeof diag.target === 'string' && DIAGNOSTIC_TARGET_RE.test(diag.target) ? diag.target : null;
+      if (target !== null) {
+        mapped.target = target;
+        mapped.targetLabel = labels.get(target) ?? null;
       }
       return mapped;
     });
@@ -566,6 +646,9 @@ export function createDashboardModel({
 
     liveKeys = nextLive;
 
+    // 진단 target 해시 → 터미널 라벨. hashTarget이 없으면 빈 맵(targetLabel null).
+    const labelsByHash = diagnosticLabelsByHash(view);
+
     const stored = store.snapshot();
     const config = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config : {};
 
@@ -589,7 +672,7 @@ export function createDashboardModel({
         tabTitleIndicator: config.tabTitleIndicator === true,
       },
       worktrees,
-      diagnostics: mapDiagnostics(getDiagnostics()),
+      diagnostics: mapDiagnostics(getDiagnostics(), labelsByHash),
     };
   }
 

@@ -39,9 +39,11 @@ A keepalive is only considered when **all** of these are true at inspection time
 - The terminal's agent identity is `claude` (`agentIdentity === 'claude'`).
 - The execution host is local (`executionHostId === 'local'`).
 - The terminal is connected to a live PTY.
-- The agent has actually been observed finishing a turn in this plugin's lifetime
-  (a fresh `working` then `done`); a terminal that is already idle at plugin start
-  is *not* scheduled — it waits for the next completed turn.
+- The agent has actually been observed finishing a turn (a fresh `working` then
+  `done`). A terminal that is already idle when the plugin starts is *not* scheduled
+  and waits for the next completed turn — unless the plugin itself had scheduled a
+  keepalive for that same terminal before a reload, which it restores. See
+  [Surviving a plugin reload](#surviving-a-plugin-reload).
 - The combined agent state is `done` and the optional `mainAgent` is `done` or absent.
 - `terminal.agentStatus` reports idle and running, and `terminal.show.agentWait`
   is present and `null` (no permission/wait prompt is being judged).
@@ -70,6 +72,32 @@ Orca's timer setting. Only two TTL values are accepted: 5 minutes and 1 hour.
 - **Catch-up is never done.** Once the expected expiry passes (with a minimum of
   10 s remaining), the epoch is dropped; there is no "late" burst after sleep or a
   clock jump.
+
+### Surviving a plugin reload
+
+Disabling and re-enabling the plugin (or any other worker reload) clears the in-memory
+schedule. To avoid losing a pending keepalive, while an epoch is **armed and not yet
+sent** the plugin writes its observed completion time (`doneAt`) to Orca's plugin
+storage under the key `epochs-v1` (a separate key from the control state `state-v1`).
+Entries older than one hour are pruned when the plugin starts, and at most 200 entries
+are kept. As soon as the epoch leaves the armed, not-yet-sent state — work is observed,
+a send is attempted (an attempt is reserved), it expired, or the target changed — the
+entry is removed.
+
+On the next start the plugin restores an armed schedule only when the catalog still
+contains the **same terminal**: the same `userDataKey`, `profileId`, `worktreeId`, and
+`paneKey`, the same `ptyId`, a compatible `incarnationId`, and `doneAt` within the last
+hour. `incarnationId` can be absent in Orca's catalog: if both the stored and the current
+value are `null` the `ptyId` match is enough, while an entry with a value on only one
+side, or with different values, is not restored. An entry whose scope needs review (an
+open, failed, or uncertain attempt) is dropped instead of restored, and clearing the
+review also removes the record so the same keepalive cannot be sent twice. Each restore
+is reported as an `epoch_restored` diagnostic. Expiry and send conditions are otherwise
+unchanged. A terminal whose incarnation changed (for example after an Orca restart) is
+not restored and waits for the next completed turn. If the terminal finished another turn
+while the plugin was unloaded, the restored schedule is still based on the older completion
+time, so that one keepalive may be sent earlier than necessary; the idle, draft, and quiet
+checks immediately before each send still apply.
 
 ### Consecutive cap and reset
 
@@ -146,7 +174,7 @@ Notes:
 | `workspace:read` | Read the plugin workspace context (terminal handles) so commands and the dashboard can resolve the current worktree. The plugin never guesses focus from a title. |
 | `terminal:send` | Declares intent to send terminal text/Enter. Without it the internal RPC sender is not started; command registration and diagnostics still work. |
 | `notifications:show` | Feedback for toggle/pause/resume/status commands, and the dashboard URL fallback when Orca's built-in browser cannot be opened. |
-| `storage` | Persist plugin state under a single host-storage key (`state-v1`). Orca's own settings are never written. |
+| `storage` | Persist plugin state under host-storage keys (`state-v1` for controls and `epochs-v1` for the reload epoch memory). Orca's own settings are never written. |
 | `events:subscribe` | Subscribe to `agent.status.changed` and `worktree.removed`. |
 
 `terminal:send` is a declaration, not a sandbox: the plugin's direct filesystem/socket
@@ -309,6 +337,11 @@ What you can do in the dashboard:
 - **Clear "needs review":** acknowledges an uncertain send after you have checked the
   terminal input line. It does not delete text or press Enter again.
 - **Settings form** (see below). Changes apply only after you press **저장 (Save)**.
+- **Diagnostics list:** the most recent events (up to 20). Each row shows the time,
+  level, and affected target as `worktree / terminal title`, a short Korean description,
+  and the original `event · code` in small text. Logs store only a hashed target; the
+  dashboard resolves the hash back to a label from the current catalog and falls back to
+  `#` plus the first six hash characters when no live terminal matches it.
 
 The top of the page shows the app timer state, runtime connection state and global
 pause state. The first screen also notes: *"메시지는 사용량을 소비하고 대화 기록에

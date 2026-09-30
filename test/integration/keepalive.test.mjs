@@ -14,6 +14,7 @@ import http from 'node:http'
 
 import { createPlugin } from '../../main.mjs'
 import { createCoordinator } from '../../src/coordinator.mjs'
+import { createEpochMemory } from '../../src/epoch-memory.mjs'
 import { createFakeClock } from '../fixtures/fake-clock.mjs'
 import { startFakeRuntime } from '../fixtures/fake-runtime.mjs'
 import { createOrcaUserData } from '../fixtures/orca-userdata.mjs'
@@ -164,16 +165,20 @@ async function createHarness(options = {}) {
   }
   const clock = createFakeClock()
 
-  const plugin = createPlugin(host.orca, {
+  const pluginDeps = {
     os: { homedir: () => userData.homeDir },
     proc: {
       platform: 'linux',
       ppid: fakePid,
       env: { ORCA_USER_DATA_PATH: userData.userDataPath },
     },
+    // epoch-memory의 savedAt/prune이 가상 clock과 일치하도록 now를 주입한다.
+    createEpochMemory: (epochOptions) =>
+      createEpochMemory({ ...epochOptions, now: () => clock.now() }),
     createCoordinator: (coordinatorOptions) =>
       createCoordinator({ ...coordinatorOptions, clock, tickMs: TICK_MS }),
-  })
+  }
+  let plugin = createPlugin(host.orca, pluginDeps)
   plugin.activate()
 
   let dashboardInfo = null
@@ -192,6 +197,23 @@ async function createHarness(options = {}) {
       await clock.settle(40)
       await waitFor(
         () => runtime.frames.some((frame) => frame.method === 'terminal.list'),
+        { clock },
+      )
+      await clock.advance(TICK_MS + 500)
+    },
+
+    /**
+     * 플러그인을 deactivate한 뒤 같은 host/runtime/clock 위에서 다시 activate한다.
+     * host storage가 유지되므로 epoch-memory 영속/복원을 실제 경로로 검증할 수 있다.
+     */
+    async reload() {
+      await plugin.deactivate()
+      const listBefore = runtime.frames.filter((frame) => frame.method === 'terminal.list').length
+      plugin = createPlugin(host.orca, pluginDeps)
+      plugin.activate()
+      await clock.settle(40)
+      await waitFor(
+        () => runtime.frames.filter((frame) => frame.method === 'terminal.list').length > listBefore,
         { clock },
       )
       await clock.advance(TICK_MS + 500)
@@ -847,6 +869,38 @@ test('scenario 13: 런타임 제목이 ⚡ 적용 값과 달라져도 off면 cus
       h.runtime.getTerminal('h1').customTitle,
       null,
       'tabs.list title이 applied와 달라도 customTitle은 해제된다',
+    )
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 14. epoch 메모리 영속/복원(플러그인 리로드)
+// ---------------------------------------------------------------------------
+
+test('scenario 14: deactivate→재activate 뒤 저장된 예약을 ARMED로 복원하고 epoch_restored를 남긴다', async () => {
+  const h = await createHarness({ enabled: true })
+  try {
+    await h.start()
+
+    // done으로 epoch를 열면 실제 epoch-memory가 host storage에 예약을 저장한다.
+    const doneAt = await h.arm()
+    await waitFor(() => h.host.storage.has('epochs-v1'), { clock: h.clock })
+
+    // 대시보드를 먼저 열지 않는다(리로드 시 서버가 닫히므로 캐시가 무효해진다).
+    await h.reload()
+
+    const restored = await h.waitForTerminal((terminal) => terminal.phase === 'ARMED')
+    assert.ok(restored, '재activate 뒤 ARMED로 복원되어야 한다')
+    assert.equal(restored.dueAt, doneAt + DUE_5M, 'dueAt = doneAt + TTL - margin')
+    assert.equal(restored.expiresAt, doneAt + TTL_5M)
+
+    const dashboard = await h.openDashboard()
+    assert.equal(dashboard.status, 200)
+    assert.ok(
+      dashboard.state.diagnostics.some((entry) => entry.event === 'epoch_restored'),
+      'epoch_restored 진단이 기록되어야 한다',
     )
   } finally {
     await h.cleanup()
