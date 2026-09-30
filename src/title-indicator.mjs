@@ -1,6 +1,8 @@
+import { CACHE_STATES, TITLE_PREFIXES, TITLE_PREFIX_PRIORITY } from './contracts.mjs'
+
 /**
  * 옵션(기본 켜짐): keepalive가 적용되는 Claude 터미널의 Orca 탭 이름 앞에
- * prefix("⚡ ")를 붙이는 모듈 (작업 O).
+ * cacheState별 prefix("⚡ " / "💤 " / "⚠️ ")를 붙이는 모듈 (작업 H).
  *
  * Orca 런타임 RPC만 사용한다(주입된 `rpc`/`hostCall`). `terminal.rename`은 탭 전체의
  * customTitle을 바꾸고(영구 저장) `null`/`""`은 customTitle을 해제한다. 사용자 지정
@@ -9,20 +11,33 @@
  *    최신 갱신 우선)이라 applied와 비교할 수 없다. 그래서 off 해제는 제목 비교 없이
  *    rename(null)을 시도하며, 사용자가 수동으로 바꾼 탭 제목도 off 시 해제될 수 있다(한계).
  *
+ * 상태 기호(§2-2, §2-6):
+ *  - desired pane의 `cacheState`(`kept`/`none`/`review`)를 prefix로 매핑한다. 누락·불량은
+ *    `kept`(⚡)로 간주해 cacheState를 아직 보내지 않는 기존 호출과 호환한다.
+ *  - 같은 탭의 on pane만 합산하고 `review > kept > none` 우선순위로 탭 prefix 하나를 고른다.
+ *    on pane이 없으면 off다.
+ *  - 교체는 기존 prefix(세 기호가 섞여 반복된 경우 포함)를 제거한 base에 새 prefix를
+ *    붙여 rename 1회로 수행한다. `rename(null)`을 거치는 2단계 교체는 하지 않는다.
+ *  - 같은 prefix가 이미 confirmed면 pane 순서·handle·phase 변화로 rename하지 않는다
+ *    (handle 변경은 기록만 갱신한다). 예외: 최초 적용, 미확정 재시도, 재시작 재적용.
+ *
  * 안전 규칙:
  *  - 기록(records)을 storage에 먼저 저장한 뒤 rename한다. 비정상 종료 시 prefix가
- *    남아도 다음 시작의 reconcile이 되돌릴 수 있게 하기 위함이다. 기록의
- *    `confirmed`가 false면 rename이 아직 확인되지 않았다는 뜻이고, 다음
+ *    남아도 다음 시작의 reconcile이 되돌릴 수 있게 하기 위함이다. 새 기록 선저장이
+ *    실패하면 메모리의 기존 복구 기록을 되돌린다(기존 기록을 삭제하지 않는다).
+ *    기록의 `confirmed`가 false면 rename이 아직 확인되지 않았다는 뜻이고, 다음
  *    reconcile이 재적용을 시도한다. 새 인스턴스는 storage에서 읽은 기록을 이번
  *    실행에서 확인되지 않은 것(confirmed:false)으로 취급해 첫 전체 reconcile에서
- *    want=true 탭에 ⚡를 다시 적용한다. 이전 인스턴스 종료가 2초 제한으로 중간에
- *    끊기면(Orca 업데이트/종료 시 runtime RPC가 동시에 닫힘) ⚡가 지워졌는데 기록은
+ *    want=true 탭에 prefix를 다시 적용한다. 이전 인스턴스 종료가 2초 제한으로 중간에
+ *    끊기면(Orca 업데이트/종료 시 runtime RPC가 동시에 닫힘) prefix가 지워졌는데 기록은
  *    confirmed:true로 남을 수 있기 때문이다.
  *  - `session.tabs.list`의 terminal 항목 `id`는 탭 합성 키일 뿐 terminal
  *    핸들이 아니다. rename에는 coordinator가 terminal.list에서 넘긴 handle만 쓴다.
  *  - 모든 RPC/저장 오류는 삼키고 진단에는 안전한 code만 남긴다. 제목 문자열/토큰은
  *    로그·에러·진단에 넣지 않는다.
  *  - 탭별 연속 실패가 maxFailures회면 그 탭을 이 인스턴스 수명 동안 건너뛴다.
+ *  - 실제 턴 완료만을 이유로 하는 refresh rename은 하지 않는다. `onTurnCompleted`는
+ *    coordinator 호출 호환용 no-op으로 남긴다.
  *
  * import 시 부작용이 없고 I/O/타이머를 시작하지 않는다.
  *
@@ -39,13 +54,14 @@ const MAX_STORAGE_BYTES = 64 * 1024
 const MAX_APPLIED_LENGTH = 200
 
 const DEFAULT_STORAGE_KEY = 'title-indicator-v1'
-const DEFAULT_PREFIX = '⚡ '
-const DEFAULT_REFRESH_MIN_INTERVAL_MS = 60_000
-const DEFAULT_SETTLE_MS = 1_500
+const DEFAULT_PREFIX = TITLE_PREFIXES.kept
 const DEFAULT_RPC_TIMEOUT_MS = 3_000
 const DEFAULT_MAX_FAILURES = 3
 const REMOVE_RETRY_BASE_MS = 10_000
 const REMOVE_RETRY_MAX_MS = 5 * 60_000
+
+/** 지원하는 상태 prefix 목록(§2-2). 알려진 prefix 여부 판정과 혼합 제거에 쓴다. */
+const KNOWN_PREFIXES = Object.freeze(Object.values(TITLE_PREFIXES))
 
 /** 제목이 비었을 때 넣는 대체 base. */
 const FALLBACK_BASE = 'Claude'
@@ -72,19 +88,51 @@ function isNonEmptyString(value) {
 }
 
 /**
- * prefix를 반복 제거한 뒤 trim한다.
+ * 알려진 상태 prefix인지 확인한다.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isKnownPrefix(value) {
+  return typeof value === 'string' && KNOWN_PREFIXES.includes(value)
+}
+
+/**
+ * applied 문자열 앞부분에서 알려진 prefix를 읽는다(옛 기록의 prefix 필드 호환).
+ * @param {unknown} applied
+ * @returns {string|null}
+ */
+function prefixFromApplied(applied) {
+  if (typeof applied !== 'string') {
+    return null
+  }
+  for (const candidate of KNOWN_PREFIXES) {
+    if (applied.startsWith(candidate)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+/**
+ * prefix를 반복 제거한 뒤 trim한다. 세 기호가 섞여 반복돼도(`💤 ⚡ ⚡ title`) 모두
+ * 제거한다. `prefixes`에 빈 문자열은 무시한다.
  * @param {string} value
- * @param {string} prefix
+ * @param {ReadonlyArray<string>} prefixes
  * @returns {string}
  */
-function stripPrefix(value, prefix) {
+function stripPrefix(value, prefixes) {
   let text = typeof value === 'string' ? value : ''
-  if (prefix.length === 0) {
+  const candidates = Array.isArray(prefixes) ? prefixes.filter((entry) => isNonEmptyString(entry)) : []
+  if (candidates.length === 0) {
     return text.trim()
   }
   let strips = 0
-  while (strips < MAX_PREFIX_STRIPS && text.startsWith(prefix)) {
-    text = text.slice(prefix.length)
+  while (strips < MAX_PREFIX_STRIPS) {
+    const matched = candidates.find((candidate) => text.startsWith(candidate))
+    if (matched === undefined) {
+      break
+    }
+    text = text.slice(matched.length)
     strips += 1
   }
   return text.trim()
@@ -92,11 +140,12 @@ function stripPrefix(value, prefix) {
 
 /**
  * 저장된 tabKey에서 records Map을 복원한다. 최상위 형식이 불량이면 null을 돌려준다.
- * 개별 record가 불량이면 그 항목만 버린다. `confirmed`가 없으면 true로 채운다(형식
- * 기본값). load()는 이 값을 저장소에 남기지 않고 모든 항목을 미확정으로 다시
- * 표시하므로 이 기본값은 재적용 여부에 영향을 주지 않는다.
+ * 개별 record가 불량이면 그 항목만 버린다. `prefix`가 없거나 알 수 없으면 `applied`
+ * 앞부분의 알려진 prefix로 추론하고, 그것도 없으면 기본 `⚡ `를 쓴다(§2-6 옛 기록 호환).
+ * `confirmed`가 없으면 true로 채운다(형식 기본값). load()는 이 값을 저장소에 남기지
+ * 않고 모든 항목을 미확정으로 다시 표시하므로 이 기본값은 재적용 여부에 영향을 주지 않는다.
  * @param {unknown} raw
- * @returns {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>|null}
+ * @returns {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, prefix:string, confirmed:boolean}>|null}
  */
 function parseStoredRecords(raw) {
   if (raw === undefined || raw === null) {
@@ -119,23 +168,42 @@ function parseStoredRecords(raw) {
     if (!isNonEmptyString(key) || !isObject(value)) {
       continue
     }
-    const { worktreeId, tabId, handle, applied, confirmed } = value
+    const { worktreeId, tabId, handle, applied, prefix, confirmed } = value
     if (!isNonEmptyString(worktreeId) || !isNonEmptyString(tabId)) {
       continue
     }
     if (!isNonEmptyString(handle) || !isNonEmptyString(applied)) {
       continue
     }
-    records.set(key, { worktreeId, tabId, handle, applied, confirmed: confirmed !== false })
+    const resolvedPrefix = isKnownPrefix(prefix) ? prefix : (prefixFromApplied(applied) ?? DEFAULT_PREFIX)
+    records.set(key, {
+      worktreeId,
+      tabId,
+      handle,
+      applied,
+      prefix: resolvedPrefix,
+      confirmed: confirmed !== false,
+    })
   }
   return records
 }
 
 /**
- * pane 단위 desired 목록을 탭 단위 want/handle/leafId로 합산한다.
+ * pane의 cacheState를 정규화한다. 누락·불량이면 `kept`로 간주해 기존 호출과 호환한다.
+ * @param {unknown} value
+ * @returns {'kept'|'none'|'review'}
+ */
+function normalizeCacheState(value) {
+  return CACHE_STATES.includes(value) ? value : 'kept'
+}
+
+/**
+ * pane 단위 desired 목록을 탭 단위 want/handle/leafId/prefix로 합산한다.
  * on pane이 하나라도 있으면 want=true이고 handle/leafId는 첫 on pane의 값이다.
+ * prefix는 on pane의 cacheState를 `review > kept > none` 우선순위로 합산해 고른다(§2-2).
+ * off pane의 handle은 쓰지 않는다(제거는 기록의 handle을 쓴다).
  * @param {unknown} desired
- * @returns {Map<string, {worktreeId:string, tabId:string, want:boolean, handle:string|null, leafId:string|null}>}
+ * @returns {Map<string, {worktreeId:string, tabId:string, want:boolean, handle:string|null, leafId:string|null, prefix:string|null}>}
  */
 function aggregateDesired(desired) {
   const byTab = new Map()
@@ -154,18 +222,38 @@ function aggregateDesired(desired) {
     const tabKey = `${worktreeId}:${tabId}`
     let agg = byTab.get(tabKey)
     if (agg === undefined) {
-      agg = { worktreeId, tabId, want: false, handle: null, leafId: null }
+      agg = { worktreeId, tabId, want: false, handle: null, leafId: null, prefix: null }
       byTab.set(tabKey, agg)
     }
     if (pane.on === true) {
-      agg.want = true
+      const state = normalizeCacheState(pane.cacheState)
       if (agg.handle === null && isNonEmptyString(pane.handle)) {
         agg.handle = pane.handle
         agg.leafId = isNonEmptyString(pane.leafId) ? pane.leafId : null
       }
+      if (agg.want === false) {
+        agg.want = true
+        agg.prefix = TITLE_PREFIXES[state]
+      } else if (TITLE_PREFIX_PRIORITY.indexOf(state) < TITLE_PREFIX_PRIORITY.indexOf(cacheStateOfPrefix(agg.prefix))) {
+        agg.prefix = TITLE_PREFIXES[state]
+      }
     }
   }
   return byTab
+}
+
+/**
+ * prefix에 대응하는 cacheState를 되돌린다(합산 우선순위 비교용). 알 수 없으면 `kept`.
+ * @param {string|null} prefix
+ * @returns {'kept'|'none'|'review'}
+ */
+function cacheStateOfPrefix(prefix) {
+  for (const state of CACHE_STATES) {
+    if (TITLE_PREFIXES[state] === prefix) {
+      return state
+    }
+  }
+  return 'kept'
 }
 
 /**
@@ -174,12 +262,10 @@ function aggregateDesired(desired) {
  * @param {Object} deps
  * @param {{ call: (method: string, params: unknown, options?: {timeoutMs?: number}) => Promise<unknown> }} deps.rpc
  * @param {(method: string, params?: unknown) => Promise<unknown>} deps.hostCall `storage.get`/`storage.set`.
- * @param {{ now?: () => number, sleep?: (ms: number) => Promise<unknown> }} [deps.clock]
+ * @param {{ now?: () => number }} [deps.clock]
  * @param {{ record: (input: {event: string, code?: string}) => void }} [deps.diagnostics]
  * @param {string} [deps.storageKey]
- * @param {string} [deps.prefix]
- * @param {number} [deps.refreshMinIntervalMs]
- * @param {number} [deps.settleMs]
+ * @param {string} [deps.prefix] cacheState가 누락된 pane에 쓸 기본 prefix(기본 `⚡ `).
  * @param {number} [deps.rpcTimeoutMs]
  * @param {number} [deps.maxFailures]
  * @returns {{
@@ -197,8 +283,6 @@ export function createTitleIndicator({
   diagnostics,
   storageKey = DEFAULT_STORAGE_KEY,
   prefix = DEFAULT_PREFIX,
-  refreshMinIntervalMs = DEFAULT_REFRESH_MIN_INTERVAL_MS,
-  settleMs = DEFAULT_SETTLE_MS,
   rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   maxFailures = DEFAULT_MAX_FAILURES,
 } = {}) {
@@ -210,23 +294,15 @@ export function createTitleIndicator({
   }
 
   const now = clock !== null && typeof clock === 'object' && typeof clock.now === 'function' ? clock.now : () => Date.now()
-  const sleep =
-    clock !== null && typeof clock === 'object' && typeof clock.sleep === 'function'
-      ? clock.sleep
-      : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const diag =
     diagnostics !== null && typeof diagnostics === 'object' && typeof diagnostics.record === 'function'
       ? diagnostics
       : { record: () => {} }
 
-  const safePrefix = typeof prefix === 'string' ? prefix : DEFAULT_PREFIX
+  const safePrefix = isNonEmptyString(prefix) ? prefix : DEFAULT_PREFIX
+  /** 기존 prefix 제거 대상: 세 상태 기호 + 설정된 기본 prefix. */
+  const stripCandidates = [...new Set([...KNOWN_PREFIXES, safePrefix])]
   const key = isNonEmptyString(storageKey) ? storageKey : DEFAULT_STORAGE_KEY
-  const minInterval =
-    typeof refreshMinIntervalMs === 'number' && Number.isFinite(refreshMinIntervalMs) && refreshMinIntervalMs >= 0
-      ? refreshMinIntervalMs
-      : DEFAULT_REFRESH_MIN_INTERVAL_MS
-  const settle =
-    typeof settleMs === 'number' && Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_SETTLE_MS
   const timeout =
     typeof rpcTimeoutMs === 'number' && Number.isFinite(rpcTimeoutMs) && rpcTimeoutMs > 0
       ? rpcTimeoutMs
@@ -235,16 +311,15 @@ export function createTitleIndicator({
     Number.isSafeInteger(maxFailures) && maxFailures > 0 ? maxFailures : DEFAULT_MAX_FAILURES
 
   /**
-   * tabKey → { worktreeId, tabId, handle, applied, confirmed }. 삽입 순서가 곧 오래된 순서다.
+   * tabKey → { worktreeId, tabId, handle, applied, prefix, confirmed }. 삽입 순서가 곧 오래된 순서다.
    * `applied`는 더 이상 제거/복원 판정에 쓰지 않는다(Orca `session.tabs.list` title이
    * customTitle이 아니라 런타임 제목이라 비교할 수 없다). 저장 형식 호환·진단용으로만 유지한다.
-   * @type {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>}
+   * `prefix`는 이 기록에 적용한 상태 기호이며 같은 prefix no-op 판정에 쓴다.
+   * @type {Map<string, {worktreeId:string, tabId:string, handle:string, applied:string, prefix:string, confirmed:boolean}>}
    */
   const records = new Map()
   /** @type {Map<string, boolean>} tabKey → 최근 reconcile의 want. */
   const wantByTab = new Map()
-  /** @type {Map<string, number>} tabKey → 마지막 refresh 시각(ms). 메모리 전용. */
-  const lastRefreshAt = new Map()
   /** @type {Map<string, number>} tabKey → 연속 실패 횟수. */
   const failures = new Map()
   /** @type {Map<string, number>} tabKey → 제거 작업 연속 실패 횟수. apply 실패와 분리한다. */
@@ -332,10 +407,10 @@ export function createTitleIndicator({
 
   /**
    * records를 저장용 plain object로 복사한다.
-   * @returns {Record<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>}
+   * @returns {Record<string, {worktreeId:string, tabId:string, handle:string, applied:string, prefix:string, confirmed:boolean}>}
    */
   function recordsToObject() {
-    /** @type {Record<string, {worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}>} */
+    /** @type {Record<string, {worktreeId:string, tabId:string, handle:string, applied:string, prefix:string, confirmed:boolean}>} */
     const out = {}
     for (const [tabKey, record] of records) {
       out[tabKey] = { ...record }
@@ -409,31 +484,36 @@ export function createTitleIndicator({
   }
 
   /**
-   * 제목에서 prefix 반복을 제거하고 trim한 base를 만든다. 비면 'Claude'.
+   * 제목에서 알려진 prefix(세 기호 + 기본 prefix)가 섞여 반복된 경우까지 모두 제거하고
+   * trim한 base를 만든다. 비면 'Claude'.
    * @param {unknown} title
    * @returns {string}
    */
   function baseFromTitle(title) {
-    const stripped = stripPrefix(typeof title === 'string' ? title : '', safePrefix)
+    const stripped = stripPrefix(typeof title === 'string' ? title : '', stripCandidates)
     return stripped.length > 0 ? stripped : FALLBACK_BASE
   }
 
   /**
-   * base에 prefix를 붙이고 최대 길이로 자른다.
+   * base에 지정한 prefix를 붙이고 최대 길이로 자른다. prefix가 없으면 기본 prefix를 쓴다.
    * @param {string} base
+   * @param {string|null} [targetPrefix]
    * @returns {string}
    */
-  function makeApplied(base) {
-    const full = safePrefix + base
+  function makeApplied(base, targetPrefix) {
+    const used = isKnownPrefix(targetPrefix) ? targetPrefix : safePrefix
+    const full = used + base
     return full.length > MAX_APPLIED_LENGTH ? full.slice(0, MAX_APPLIED_LENGTH) : full
   }
 
   /**
    * want=true이고 적용이 필요할 때 prefix를 적용한다. 기록을 `confirmed:false`로
    * 먼저 저장한 뒤 rename하고, rename이 성공하면 `confirmed:true`로 갱신·저장한다.
+   * 새 기록 선저장이 실패하면 메모리의 기존 복구 기록을 되돌린다(삭제하지 않는다).
+   * 교체도 `stripPrefix(base) + 새 prefix` 한 번의 rename으로만 수행한다(2단계 금지).
    * 핸들은 coordinator가 terminal.list에서 넘긴 `agg.handle`만 쓴다. 탭을 찾지
    * 못하거나 핸들이 없으면 아무것도 하지 않는다.
-   * @param {{worktreeId:string, tabId:string, handle:string|null, leafId:string|null}} agg
+   * @param {{worktreeId:string, tabId:string, handle:string|null, leafId:string|null, prefix:string|null}} agg
    */
   async function applyTab(agg) {
     const tabKey = `${agg.worktreeId}:${agg.tabId}`
@@ -456,16 +536,30 @@ export function createTitleIndicator({
       return
     }
     const handle = agg.handle
+    const targetPrefix = isKnownPrefix(agg.prefix) ? agg.prefix : safePrefix
 
     const base = baseFromTitle(found.title)
-    const applied = makeApplied(base)
-    const record = { worktreeId: agg.worktreeId, tabId: agg.tabId, handle, applied, confirmed: false }
+    const applied = makeApplied(base, targetPrefix)
+    const previous = records.get(tabKey) ?? null
+    const record = {
+      worktreeId: agg.worktreeId,
+      tabId: agg.tabId,
+      handle,
+      applied,
+      prefix: targetPrefix,
+      confirmed: false,
+    }
 
     records.set(tabKey, record)
     try {
       await persistRecords()
     } catch {
-      records.delete(tabKey)
+      // 새 기록 선저장 실패: 메모리의 기존 복구 기록을 되돌린다(삭제하지 않는다).
+      if (previous === null) {
+        records.delete(tabKey)
+      } else {
+        records.set(tabKey, previous)
+      }
       noteFailure(tabKey, 'save_failed')
       return
     }
@@ -497,7 +591,6 @@ export function createTitleIndicator({
   async function deleteRecord(tabKey) {
     records.delete(tabKey)
     wantByTab.delete(tabKey)
-    lastRefreshAt.delete(tabKey)
     failures.delete(tabKey)
     clearRemoveFailure(tabKey)
     try {
@@ -515,7 +608,7 @@ export function createTitleIndicator({
    * off 시 해제될 수 있다(한계). 조회/rename 실패면 기록을 보존하고 지수 백오프 후
    * 재시도한다.
    * @param {string} tabKey
-   * @param {{worktreeId:string, tabId:string, handle:string, applied:string, confirmed:boolean}} record
+   * @param {{worktreeId:string, tabId:string, handle:string, applied:string, prefix:string, confirmed:boolean}} record
    */
   async function removeTab(tabKey, record) {
     if (now() < (removeRetryAt.get(tabKey) ?? 0)) {
@@ -548,98 +641,10 @@ export function createTitleIndicator({
   }
 
   /**
-   * 실제 사용자 턴 완료 시 커스텀 제목을 해제하고 자동 제목을 다시 읽어 새 prefix를
-   * 적용한다. 확정(`confirmed:true`)된 기록에만 동작한다. 갱신 중 rename이 실패하면
-   * 기록을 미확정으로 돌려 다음 reconcile이 재적용하게 한다. 간격 제한을 지키고
-   * 직렬 queue로 실행한다.
-   * @param {string} tabKey
-   */
-  async function refreshTab(tabKey) {
-    const record = records.get(tabKey)
-    if (record === undefined || record.confirmed !== true || disabled.has(tabKey)) {
-      return
-    }
-    if (wantByTab.get(tabKey) === false) {
-      await removeTab(tabKey, record)
-      return
-    }
-
-    let found
-    try {
-      found = await readTab(record.worktreeId, record.tabId, null)
-    } catch {
-      noteFailure(tabKey, 'list_failed')
-      return
-    }
-    if (found === null) {
-      noteFailure(tabKey, 'tab_missing')
-      return
-    }
-    // title은 런타임 제목 투영값이라 applied와 비교할 수 없다. 사용자가 이름을
-    // 바꿨는지 판별할 수 없으므로 항상 rename(null)로 해제한 뒤 새 제목을 적용한다.
-
-    const handle = record.handle
-    try {
-      await rpc.call('terminal.rename', { terminal: handle, title: null }, { timeoutMs: timeout })
-    } catch {
-      noteFailure(tabKey, 'rename_failed')
-      return
-    }
-
-    await sleep(settle)
-
-    if (wantByTab.get(tabKey) === false) {
-      await deleteRecord(tabKey)
-      return
-    }
-
-    let after
-    try {
-      after = await readTab(record.worktreeId, record.tabId, null)
-    } catch {
-      noteFailure(tabKey, 'list_failed')
-      return
-    }
-    if (after === null) {
-      noteFailure(tabKey, 'tab_missing')
-      return
-    }
-
-    const applied = makeApplied(baseFromTitle(after.title))
-    record.applied = applied
-    record.confirmed = false
-    records.set(tabKey, record)
-    try {
-      await persistRecords()
-    } catch {
-      noteFailure(tabKey, 'save_failed')
-      return
-    }
-    try {
-      await rpc.call(
-        'terminal.rename',
-        { terminal: record.handle, title: applied },
-        { timeoutMs: timeout },
-      )
-    } catch {
-      // 미확정으로 남긴다. 다음 reconcile이 재적용을 시도한다.
-      noteFailure(tabKey, 'rename_failed')
-      return
-    }
-    record.confirmed = true
-    records.set(tabKey, record)
-    try {
-      await persistRecords()
-    } catch {
-      diagnose('save_failed')
-    }
-    clearFailures(tabKey)
-    // 제거 재시도가 실패했던 탭도 refresh로 제목을 복구했으면 재시도 상태를 지운다.
-    clearRemoveFailure(tabKey)
-  }
-
-  /**
    * desired 하나를 모든 탭에 대해 반영한다.
+   * - on: 합산한 prefix를 적용한다. 이미 같은 prefix가 confirmed면 rename하지 않고
+   *   handle만 갱신한다. 다른 prefix면 한 번의 rename으로 교체한다.
+   * - off: 기록이 있으면 rename(null)로 제거한다(기록이 없으면 손대지 않는다).
    * @param {unknown[]} desired
    * @param {boolean} removeOnly
    */
@@ -665,7 +670,9 @@ export function createTitleIndicator({
       }
 
       if (want) {
+        const targetPrefix = agg !== null && isKnownPrefix(agg.prefix) ? agg.prefix : safePrefix
         if (record === null) {
+          // 기록이 없어도 제목에 알려진 prefix가 보이면 중복 없이 새 prefix로 교체한다.
           if (agg !== null && !disabled.has(tabKey)) {
             await applyTab(agg)
           }
@@ -676,12 +683,18 @@ export function createTitleIndicator({
           if (agg !== null && !disabled.has(tabKey)) {
             await applyTab(agg)
           }
+        } else if (record.prefix !== targetPrefix) {
+          // 이전 prefix 제거 + 새 prefix를 한 번의 rename으로 교체한다(2단계 금지).
+          if (agg !== null && !disabled.has(tabKey) && isNonEmptyString(agg.handle)) {
+            await applyTab(agg)
+          }
         } else if (
           agg !== null &&
           !disabled.has(tabKey) &&
           isNonEmptyString(agg.handle) &&
           agg.handle !== record.handle
         ) {
+          // 같은 prefix 유지 중 handle만 바뀌면 rename 없이 기록만 갱신한다.
           record.handle = agg.handle
           records.set(tabKey, record)
           try {
@@ -698,8 +711,8 @@ export function createTitleIndicator({
   }
 
   /**
-   * 최근 reconcile의 want 상태를 동기적으로 갱신한다. refresh가 "도중 off"를
-   * 판단할 때 최신 호출을 즉시 볼 수 있게 한다.
+   * 최근 reconcile의 want 상태를 동기적으로 갱신한다. reconcile이 진행 중일 때
+   * 다음 호출의 최신 desired를 즉시 반영한다.
    * @param {unknown[]} desired
    * @param {boolean} removeOnly
    */
@@ -748,7 +761,7 @@ export function createTitleIndicator({
   /**
    * storage에서 기록을 읽는다. 형식이 불량이면 빈 기록으로 시작한다. 읽은 기록은
    * 저장된 `confirmed`와 무관하게 이번 실행에서 미확정(confirmed:false)으로
-   * 표시해, 첫 전체 reconcile이 want=true 탭에 ⚡를 다시 적용하게 한다.
+   * 표시해, 첫 전체 reconcile이 want=true 탭에 prefix를 다시 적용하게 한다.
    * @returns {Promise<void>}
    */
   function load() {
@@ -775,9 +788,9 @@ export function createTitleIndicator({
         return
       }
       // 저장된 confirmed 값과 무관하게 이번 실행에서는 미확정으로 취급한다. 이전
-      // 인스턴스 종료가 2초 제한으로 중간에 끊기면 ⚡가 지워졌는데 기록은
+      // 인스턴스 종료가 2초 제한으로 중간에 끊기면 prefix가 지워졌는데 기록은
       // confirmed:true로 남을 수 있으므로, 첫 전체 reconcile이 want=true 탭에
-      // 새 handle로 ⚡를 다시 적용하게 한다. 저장 형식의 confirmed 필드는 유지한다.
+      // 새 handle로 prefix를 다시 적용하게 한다. 저장 형식의 confirmed 필드는 유지한다.
       for (const [tabKey, record] of parsed) {
         records.set(tabKey, { ...record, confirmed: false })
       }
@@ -786,21 +799,14 @@ export function createTitleIndicator({
   }
 
   /**
-   * 사용자 턴 완료 시 호출된다. 기록이 있고 간격이 지났으면 refresh를 queue에 넣는다.
+   * 사용자 턴 완료 시 coordinator가 호출한다. 실제 턴 완료만으로 같은 기호의 제목을
+   * 다시 쓰지 않기 위해 no-op이다(§2-6). 호출 호환을 위해 시그니처와 export는 유지한다.
    * @param {string} tabKey
    * @returns {Promise<void>}
    */
   function onTurnCompleted(tabKey) {
-    const record = isNonEmptyString(tabKey) ? records.get(tabKey) : undefined
-    if (record === undefined || record.confirmed !== true || disabled.has(tabKey)) {
-      return Promise.resolve()
-    }
-    const last = lastRefreshAt.get(tabKey)
-    if (typeof last === 'number' && now() - last < minInterval) {
-      return Promise.resolve()
-    }
-    lastRefreshAt.set(tabKey, now())
-    return enqueue(() => refreshTab(tabKey))
+    void tabKey
+    return Promise.resolve()
   }
 
   /**
@@ -826,7 +832,6 @@ export function createTitleIndicator({
         } finally {
           records.delete(tabKey)
           wantByTab.delete(tabKey)
-          lastRefreshAt.delete(tabKey)
           failures.delete(tabKey)
           clearRemoveFailure(tabKey)
         }

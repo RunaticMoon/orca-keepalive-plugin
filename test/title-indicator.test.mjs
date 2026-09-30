@@ -17,6 +17,8 @@ const TAB = 'tab-1'
 const LEAF = 'leaf-1'
 const HANDLE = 'terminal:local:1'
 const PREFIX = '⚡ '
+const PREFIX_NONE = '💤 '
+const PREFIX_REVIEW = '⚠️ '
 const KEY = 'title-indicator-v1'
 const TAB_KEY = `${WORKTREE}:${TAB}`
 
@@ -169,6 +171,7 @@ test('apply: 기록을 먼저 저장한 뒤 rename하고 prefix를 붙인다', a
       tabId: TAB,
       handle: HANDLE,
       applied: PREFIX + 'Claude',
+      prefix: PREFIX,
       confirmed: true,
     },
   })
@@ -481,46 +484,43 @@ test('load 후 원치 않는 기록은 reconcile에서 정리한다(비정상 �
 })
 
 // ---------------------------------------------------------------------------
-// refresh
+// turn 완료 (no-op) / off 제거
 // ---------------------------------------------------------------------------
 
-test('onTurnCompleted: refresh 순서(null → settle → 새 applied)와 간격 제한', async () => {
+test('onTurnCompleted: 실제 턴 완료만으로는 rename하지 않는다(no-op)', async () => {
+  // 같은 기호의 턴 완료 refresh를 제거했다. 실제 턴 완료는 제목을 다시 쓰지 않는다.
   let listCount = 0
   const tabsList = () => {
     listCount += 1
     if (listCount === 1) return listOf(entry({ title: 'Claude' }))
-    if (listCount === 2) return listOf(entry({ title: PREFIX + 'Claude' }))
     return listOf(entry({ title: 'Updated' }))
   }
   const { rpc, ti, clock, storage } = setup({ tabsList, start: 1000 })
   await ti.load()
   await ti.reconcile([pane()])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
 
   clock.advance(60_001)
   await ti.onTurnCompleted(TAB_KEY)
 
-  const renames = rpc.callsFor('terminal.rename')
-  assert.equal(renames.length, 3)
-  assert.deepEqual(renames[1].params, { terminal: HANDLE, title: null })
-  assert.deepEqual(renames[2].params, { terminal: HANDLE, title: PREFIX + 'Updated' })
-  assert.deepEqual(clock.sleeps, [1500])
-  assert.equal(storage.get(KEY)[TAB_KEY].applied, PREFIX + 'Updated')
+  assert.equal(rpc.callsFor('terminal.rename').length, 1, '턴 완료로 rename하지 않는다')
+  assert.equal(rpc.callsFor('session.tabs.list').length, 1, '턴 완료로 조회하지 않는다')
+  assert.deepEqual(clock.sleeps, [], 'settle sleep을 하지 않는다')
+  assert.equal(storage.get(KEY)[TAB_KEY].applied, PREFIX + 'Claude')
 
-  // 같은 시각에는 다시 refresh하지 않는다.
-  const before = rpc.callsFor('terminal.rename').length
+  // 같은 시각에 다시 호출해도 아무 변화가 없다.
   await ti.onTurnCompleted(TAB_KEY)
-  assert.equal(rpc.callsFor('terminal.rename').length, before)
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
 })
 
-test('onTurnCompleted: refresh 실행 전 off면 remove 경로로 제목을 되돌린다', async () => {
+test('onTurnCompleted: 호출 후 off reconcile이면 정상 제거 경로로 되돌린다', async () => {
   const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })) })
   await ti.load()
   await ti.reconcile([pane()])
 
-  // refresh를 queue에 먼저 올리고, 다음 동기 desired 갱신에서 off 상태를 먼저 알린다.
-  const refresh = ti.onTurnCompleted(TAB_KEY)
+  const completed = ti.onTurnCompleted(TAB_KEY)
   const off = ti.reconcile([pane({ on: false })])
-  await Promise.all([refresh, off])
+  await Promise.all([completed, off])
 
   assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
     { terminal: HANDLE, title: PREFIX + 'Claude' },
@@ -529,29 +529,15 @@ test('onTurnCompleted: refresh 실행 전 off면 remove 경로로 제목을 되�
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
-test('onTurnCompleted: refresh 도중 want가 false면 재적용하지 않고 기록을 지운다', async () => {
-  let listCount = 0
-  const tabsList = () => {
-    listCount += 1
-    if (listCount === 1) return listOf(entry({ title: 'Claude' }))
-    return listOf(entry({ title: PREFIX + 'Claude' }))
-  }
-  const { rpc, ti, clock } = setup({ tabsList, start: 1000 })
+test('onTurnCompleted: 기록이 없어도 off reconcile 전에는 rename하지 않는다', async () => {
+  const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: 'Claude' })) })
   await ti.load()
   await ti.reconcile([pane()])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
 
-  clock.advance(60_001)
-  let offPromise = null
-  clock.onSleep = () => {
-    offPromise = ti.reconcile([pane({ on: false })])
-  }
   await ti.onTurnCompleted(TAB_KEY)
-  await offPromise
-
-  const renames = rpc.callsFor('terminal.rename')
-  assert.equal(renames.length, 2)
-  assert.deepEqual(renames[1].params, { terminal: HANDLE, title: null })
-  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
+  assert.equal(rpc.callsFor('session.tabs.list').length, 1)
 })
 
 test('onTurnCompleted: 기록이 없으면 RPC를 호출하지 않는다', async () => {
@@ -699,6 +685,7 @@ test('apply: rename 1회 실패 후 다음 reconcile에서 재시도해 확정�
     tabId: TAB,
     handle: HANDLE,
     applied: PREFIX + 'Claude',
+    prefix: PREFIX,
     confirmed: true,
   })
 })
@@ -830,6 +817,7 @@ test('load: confirmed:true 저장 기록도 새 handle로 첫 reconcile에서 �
     tabId: TAB,
     handle: handle2,
     applied: PREFIX + 'Claude',
+    prefix: PREFIX,
     confirmed: true,
   })
 })
@@ -1001,38 +989,38 @@ test('remove: 미확정 기록도 제목 비교 없이 rename(null)로 해제한
   assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
-test('refresh: 재적용 rename 실패 시 미확정으로 돌려 다음 reconcile에서 재적용한다', async () => {
-  let listCount = 0
-  const tabsList = () => {
-    listCount += 1
-    if (listCount === 1) return listOf(entry({ title: 'Claude' }))
-    if (listCount === 2) return listOf(entry({ title: PREFIX + 'Claude' }))
-    return listOf(entry({ title: 'Updated' }))
-  }
-  let renameCount = 0
-  const rename = () => {
-    renameCount += 1
-    if (renameCount === 3) throw new Error('rename down')
+test('reconcile: 교체 rename 실패 시 미확정으로 남기고 다음 reconcile에서 재적용한다', async () => {
+  let title = 'Claude'
+  const tabsList = () => listOf(entry({ title }))
+  let failNextRename = false
+  const rename = (params) => {
+    if (failNextRename) throw new Error('rename down')
+    title = params.title ?? 'Claude'
     return {}
   }
-  const { rpc, ti, clock, storage } = setup({ tabsList, rename, start: 1000 })
+  const { rpc, ti, storage } = setup({ tabsList, rename, start: 1000 })
   await ti.load()
-  await ti.reconcile([pane()])
+  await ti.reconcile([pane({ cacheState: 'kept' })])
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
   assert.equal(storage.get(KEY)[TAB_KEY].confirmed, true)
 
-  clock.advance(60_001)
-  await ti.onTurnCompleted(TAB_KEY)
-  // refresh 재적용이 실패했으므로 미확정 + 새 applied가 저장된다.
+  // ⚡ → 💤 교체 rename 실패: 새 prefix 기록이 미확정으로 남는다.
+  failNextRename = true
+  await ti.reconcile([pane({ cacheState: 'none' })])
   assert.equal(storage.get(KEY)[TAB_KEY].confirmed, false)
-  assert.equal(storage.get(KEY)[TAB_KEY].applied, PREFIX + 'Updated')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, '💤 ')
+  assert.equal(storage.get(KEY)[TAB_KEY].applied, '💤 Claude')
 
-  await ti.reconcile([pane()])
-  const last = rpc.callsFor('terminal.rename').at(-1)
-  assert.deepEqual(last.params, { terminal: HANDLE, title: PREFIX + 'Updated' })
+  // 다음 reconcile에서 재적용 rename은 한 번만 발생한다(2단계 교체 금지).
+  failNextRename = false
+  const before = rpc.callsFor('terminal.rename').length
+  await ti.reconcile([pane({ cacheState: 'none' })])
+  assert.equal(rpc.callsFor('terminal.rename').length - before, 1)
   assert.equal(storage.get(KEY)[TAB_KEY].confirmed, true)
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, '💤 ')
 })
 
-test('onTurnCompleted: 미확정 기록은 refresh하지 않는다', async () => {
+test('onTurnCompleted: 미확정 기록도 no-op이라 RPC를 호출하지 않는다', async () => {
   const storage = new Map([
     [
       KEY,
@@ -1042,6 +1030,7 @@ test('onTurnCompleted: 미확정 기록은 refresh하지 않는다', async () =>
           tabId: TAB,
           handle: HANDLE,
           applied: PREFIX + 'Claude',
+          prefix: PREFIX,
           confirmed: false,
         },
       },
@@ -1172,4 +1161,228 @@ test('진단에는 제목 문자열/handle을 남기지 않는다', async () => 
   assert.ok(diagnostics.entries.length > 0)
   assert.equal(text.includes(secretTitle), false)
   assert.equal(text.includes(HANDLE), false)
+})
+
+// ---------------------------------------------------------------------------
+// 세 상태 prefix 합산·교체 (작업 H)
+// ---------------------------------------------------------------------------
+
+test('reconcile: 세 기호 전환은 매번 rename 1회, 결과 접두어 1개', async () => {
+  const prefixes = { kept: PREFIX, none: PREFIX_NONE, review: PREFIX_REVIEW }
+  let title = 'Claude'
+  const tabsList = () => listOf(entry({ title }))
+  const rename = (params) => {
+    title = params.title ?? 'Claude'
+    return {}
+  }
+  const { rpc, ti, storage } = setup({ tabsList, rename })
+  await ti.load()
+
+  // 최초 적용(⚡)은 rename 1회.
+  await ti.reconcile([pane({ cacheState: 'kept' })])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
+  assert.equal(title, PREFIX + 'Claude')
+
+  const transitions = [
+    ['kept', 'none'],
+    ['none', 'review'],
+    ['review', 'kept'],
+    ['kept', 'review'],
+    ['review', 'none'],
+    ['none', 'kept'],
+  ]
+  for (const [from, to] of transitions) {
+    assert.equal(storage.get(KEY)[TAB_KEY].prefix, prefixes[from], `${from} 상태로 시작`)
+    const before = rpc.callsFor('terminal.rename').length
+    await ti.reconcile([pane({ cacheState: to })])
+    assert.equal(rpc.callsFor('terminal.rename').length - before, 1, `${from} → ${to} rename 1회`)
+    assert.equal(title, prefixes[to] + 'Claude', `${from} → ${to} 결과 접두어 1개`)
+    assert.equal(storage.get(KEY)[TAB_KEY].prefix, prefixes[to])
+  }
+})
+
+test('reconcile: 같은 기호 반복(BUSY→ARMED 상당)은 rename하지 않는다', async () => {
+  const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: 'Claude' })) })
+  await ti.load()
+  await ti.reconcile([pane({ cacheState: 'kept' })])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
+
+  for (let i = 0; i < 3; i += 1) {
+    await ti.reconcile([pane({ cacheState: 'kept' })])
+  }
+  assert.equal(rpc.callsFor('terminal.rename').length, 1, '같은 기호는 rename하지 않는다')
+  assert.equal(rpc.callsFor('session.tabs.list').length, 1, '같은 기호는 조회도 반복하지 않는다')
+})
+
+test('reconcile: on pane 우선순위 review > kept > none, off pane은 제외', async () => {
+  const { rpc, ti, storage } = setup({ tabsList: () => listOf(entry({ title: 'Claude' })) })
+  await ti.load()
+
+  // none + kept → kept(⚡)
+  await ti.reconcile([
+    pane({ leafId: 'leaf-1', handle: HANDLE, on: true, cacheState: 'none' }),
+    pane({ leafId: 'leaf-2', handle: 'h2', on: true, cacheState: 'kept' }),
+  ])
+  assert.equal(rpc.callsFor('terminal.rename').at(-1).params.title, PREFIX + 'Claude')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
+
+  // off pane의 review는 합산에서 제외된다 → none(💤)
+  await ti.reconcile([
+    pane({ leafId: 'leaf-1', handle: HANDLE, on: true, cacheState: 'none' }),
+    pane({ leafId: 'leaf-2', handle: 'h2', on: false, cacheState: 'review' }),
+  ])
+  assert.equal(rpc.callsFor('terminal.rename').at(-1).params.title, PREFIX_NONE + 'Claude')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX_NONE)
+
+  // kept + review → review(⚠️)
+  await ti.reconcile([
+    pane({ leafId: 'leaf-1', handle: HANDLE, on: true, cacheState: 'kept' }),
+    pane({ leafId: 'leaf-2', handle: 'h2', on: true, cacheState: 'review' }),
+  ])
+  assert.equal(rpc.callsFor('terminal.rename').at(-1).params.title, PREFIX_REVIEW + 'Claude')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX_REVIEW)
+})
+
+test('reconcile: cacheState 누락·불량은 kept(⚡)로 간주한다', async () => {
+  const { rpc, ti, storage } = setup({ tabsList: () => listOf(entry({ title: 'Claude' })) })
+  await ti.load()
+
+  await ti.reconcile([pane()])
+  assert.equal(rpc.callsFor('terminal.rename').at(-1).params.title, PREFIX + 'Claude')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
+
+  await ti.reconcile([pane({ cacheState: 'bogus' })])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1, '누락과 같은 kept이므로 rename하지 않는다')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
+})
+
+test('apply: 세 기호가 섞여 반복된 접두어를 모두 제거한다', async () => {
+  const { rpc, ti } = setup({ tabsList: () => listOf(entry({ title: `${PREFIX_NONE}${PREFIX}${PREFIX_REVIEW}${PREFIX_NONE}Claude` })) })
+  await ti.load()
+  await ti.reconcile([pane({ cacheState: 'review' })])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.equal(renames[0].params.title, PREFIX_REVIEW + 'Claude')
+})
+
+test('load: 재시작 후 미확정 재적용은 현재 상태 기호로 한다(TTLI-ED3D)', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX_NONE + 'Claude',
+          prefix: PREFIX_NONE,
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX_NONE + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane({ cacheState: 'none' })])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.equal(renames[0].params.title, PREFIX_NONE + 'Claude')
+  assert.equal(store.get(KEY)[TAB_KEY].confirmed, true)
+})
+
+test('load: prefix 없는 옛 기록은 applied에서 기호를 읽어 호환한다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      { [TAB_KEY]: { worktreeId: WORKTREE, tabId: TAB, handle: HANDLE, applied: PREFIX_REVIEW + 'Claude' } },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX_REVIEW + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane({ cacheState: 'review' })])
+
+  assert.equal(rpc.callsFor('terminal.rename').at(-1).params.title, PREFIX_REVIEW + 'Claude')
+  assert.equal(store.get(KEY)[TAB_KEY].prefix, PREFIX_REVIEW)
+})
+
+test('apply: 새 기록 선저장 실패 시 기존 복구 기록을 되돌린다', async () => {
+  const storage = new Map()
+  let failSet = false
+  const order = []
+  const rpc = makeRpc(order, {
+    'session.tabs.list': () => listOf(entry({ title: PREFIX + 'Claude' })),
+    'terminal.rename': () => ({}),
+  })
+  const hostCall = async (method, params) => {
+    if (method === 'storage.get') {
+      return { value: storage.has(params.key) ? structuredClone(storage.get(params.key)) : undefined }
+    }
+    if (method === 'storage.set') {
+      if (failSet) throw new Error('no storage')
+      storage.set(params.key, structuredClone(params.value))
+      return { ok: true }
+    }
+    throw new Error('unexpected hostCall ' + method)
+  }
+  const ti = createTitleIndicator({ rpc, hostCall, clock: makeClock(1000), diagnostics: makeDiagnostics() })
+  await ti.load()
+
+  // 확정 기록을 만든다.
+  await ti.reconcile([pane({ cacheState: 'kept' })])
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
+  const applied = rpc.callsFor('terminal.rename').length
+  assert.equal(applied, 1)
+
+  // 선저장 실패로 ⚡ → 💤 교체를 시도한다.
+  failSet = true
+  await ti.reconcile([pane({ cacheState: 'none' })])
+  assert.equal(rpc.callsFor('terminal.rename').length, applied, '선저장 실패면 rename하지 않는다')
+
+  // 기존 ⚡ 확정 기록이 살아 있어 같은 기호 reconcile은 rename하지 않는다.
+  failSet = false
+  await ti.reconcile([pane({ cacheState: 'kept' })])
+  assert.equal(rpc.callsFor('terminal.rename').length, applied, '복구 기록 유지(같은 기호 rename 0)')
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX)
+
+  // 저장이 회복되면 교체가 진행된다.
+  await ti.reconcile([pane({ cacheState: 'none' })])
+  assert.equal(storage.get(KEY)[TAB_KEY].prefix, PREFIX_NONE)
+})
+
+test('removeOnly: 💤 기록도 명시적 off에서 rename(null)로 해제한다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX_NONE + 'Claude',
+          prefix: PREFIX_NONE,
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX_NONE + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane({ on: false })], { removeOnly: true })
+
+  assert.deepEqual(rpc.callsFor('terminal.rename').map((call) => call.params), [
+    { terminal: HANDLE, title: null },
+  ])
+  assert.deepEqual(store.get(KEY), {})
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
