@@ -5,17 +5,41 @@ import {
   createEpochMemory,
   EPOCH_MEMORY_KEY,
   EPOCH_MEMORY_MAX_ENTRIES,
+  EPOCH_MEMORY_MAX_BYTES,
 } from '../src/epoch-memory.mjs';
+import { CACHE_HISTORY_RETENTION_MS, REASON_CODES } from '../src/contracts.mjs';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const USER = 'u'.repeat(64);
+const RETENTION = CACHE_HISTORY_RETENTION_MS;
 
 /**
- * 유효한 EpochRecord(saveAt 제외). remember 입력으로 쓴다.
+ * 유효한 v2 EpochRecord(saveAt 제외). remember 입력으로 쓴다.
+ * basisAt은 doneAt 이하, expiresAt은 doneAt보다 크게 doneAt 기준으로 파생한다.
  * @param {object} [over]
  */
-const rec = (over = {}) => ({
+const rec = (over = {}) => {
+  const doneAt = typeof over.doneAt === 'number' ? over.doneAt : 1000;
+  return {
+    kind: 'armed',
+    worktreeId: 'w1',
+    paneKey: 't1:l1',
+    userDataKey: USER,
+    profileId: 'p1',
+    ptyId: 'pty-1',
+    incarnationId: 'inc-1',
+    doneAt,
+    basisAt: doneAt - 100,
+    expiresAt: doneAt + 300000,
+    lastBlockReason: null,
+    expiredAt: null,
+    ...over,
+  };
+};
+
+/** v1(구버전) 저장 레코드. kind·expiresAt 등이 없다. */
+const v1rec = (over = {}) => ({
   worktreeId: 'w1',
   paneKey: 't1:l1',
   userDataKey: USER,
@@ -23,6 +47,23 @@ const rec = (over = {}) => ({
   ptyId: 'pty-1',
   incarnationId: 'inc-1',
   doneAt: 1000,
+  ...over,
+});
+
+/** v1 레코드를 로드했을 때 기대하는 v2 형태(기본값). */
+const v2fromV1 = (over = {}) => ({
+  kind: 'armed',
+  worktreeId: 'w1',
+  paneKey: 't1:l1',
+  userDataKey: USER,
+  profileId: 'p1',
+  ptyId: 'pty-1',
+  incarnationId: 'inc-1',
+  doneAt: 1000,
+  basisAt: 1000,
+  expiresAt: null,
+  lastBlockReason: null,
+  expiredAt: null,
   ...over,
 });
 
@@ -100,7 +141,7 @@ test('load: 저장값이 없으면 빈 상태', async () => {
 
 test('load: 저장값이 문자열이면 JSON.parse 허용', async () => {
   const host = createFakeHost({
-    initial: JSON.stringify({ version: 1, entries: { k1: { ...rec(), savedAt: 7 } } }),
+    initial: JSON.stringify({ version: 2, entries: { k1: { ...rec(), savedAt: 7 } } }),
   });
   const memory = createEpochMemory({ hostCall: host.hostCall });
   await memory.load();
@@ -108,16 +149,17 @@ test('load: 저장값이 문자열이면 JSON.parse 허용', async () => {
   assert.deepEqual(memory.get('k1'), { ...rec(), savedAt: 7 });
 });
 
-test('load: 형식이 잘못된 항목은 버리고 유효한 항목만 적재', async () => {
+test('load: v2 형식이 잘못된 항목은 버리고 유효한 항목만 적재', async () => {
   const host = createFakeHost({
     initial: {
-      version: 1,
+      version: 2,
       entries: {
         good: { ...rec(), savedAt: 7 },
         nullIncarnation: { ...rec({ incarnationId: null }), savedAt: 7 },
         emptyString: { ...rec({ ptyId: '' }), savedAt: 7 },
         emptyIncarnation: { ...rec({ incarnationId: '' }), savedAt: 7 },
         badDoneAt: { ...rec({ doneAt: 'nope' }), savedAt: 7 },
+        unknownKind: { ...rec({ kind: 'bogus' }), savedAt: 7 },
         missingFields: { worktreeId: 'w1' },
         notObject: 42,
       },
@@ -127,16 +169,20 @@ test('load: 형식이 잘못된 항목은 버리고 유효한 항목만 적재',
   await memory.load();
 
   assert.deepEqual(memory.get('good'), { ...rec(), savedAt: 7 });
-  assert.deepEqual(memory.get('nullIncarnation'), { ...rec({ incarnationId: null }), savedAt: 7 });
+  assert.deepEqual(memory.get('nullIncarnation'), {
+    ...rec({ incarnationId: null }),
+    savedAt: 7,
+  });
   assert.equal(memory.get('emptyString'), null);
   assert.equal(memory.get('emptyIncarnation'), null);
   assert.equal(memory.get('badDoneAt'), null);
+  assert.equal(memory.get('unknownKind'), null);
   assert.equal(memory.get('missingFields'), null);
   assert.equal(memory.get('notObject'), null);
 });
 
-test('load: 최상위 형식이 잘못되면 빈 상태', async () => {
-  const host = createFakeHost({ initial: { version: 2, entries: { k: { ...rec(), savedAt: 7 } } } });
+test('load: 미지원 version이면 빈 상태', async () => {
+  const host = createFakeHost({ initial: { version: 3, entries: { k: { ...rec(), savedAt: 7 } } } });
   const memory = createEpochMemory({ hostCall: host.hostCall });
   await memory.load();
 
@@ -144,7 +190,7 @@ test('load: 최상위 형식이 잘못되면 빈 상태', async () => {
 });
 
 test('load: storage.get 실패 시 빈 상태(throw 금지)', async () => {
-  const host = createFakeHost({ initial: { version: 1, entries: { k: { ...rec(), savedAt: 7 } } } });
+  const host = createFakeHost({ initial: { version: 2, entries: { k: { ...rec(), savedAt: 7 } } } });
   host.setGetFail(true);
   const memory = createEpochMemory({ hostCall: host.hostCall });
 
@@ -153,22 +199,100 @@ test('load: storage.get 실패 시 빈 상태(throw 금지)', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v1 호환
+// ---------------------------------------------------------------------------
+
+test('v1: basisAt이 있으면 그대로, 없으면 doneAt을 basisAt으로 로드하고 expiresAt은 추정하지 않는다', async () => {
+  const host = createFakeHost({
+    initial: {
+      version: 1,
+      entries: {
+        withBasis: { ...v1rec({ doneAt: 1000, basisAt: 500 }), savedAt: 7 },
+        without: { ...v1rec({ doneAt: 6000 }), savedAt: 7 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  assert.deepEqual(memory.get('withBasis'), { ...v2fromV1({ basisAt: 500 }), savedAt: 7 });
+  assert.deepEqual(memory.get('without'), {
+    ...v2fromV1({ doneAt: 6000, basisAt: 6000 }),
+    savedAt: 7,
+  });
+  assert.equal(memory.get('withBasis').expiresAt, null);
+  assert.equal(memory.get('without').lastBlockReason, null);
+  assert.equal(memory.get('without').expiredAt, null);
+});
+
+test('v1: 잘못된 basisAt(초과·비수치·null)은 doneAt으로 대체한다', async () => {
+  const host = createFakeHost({
+    initial: {
+      version: 1,
+      entries: {
+        future: { ...v1rec({ doneAt: 1000, basisAt: 2000 }), savedAt: 7 },
+        nonNumeric: { ...v1rec({ doneAt: 1000, basisAt: 'x' }), savedAt: 7 },
+        nullish: { ...v1rec({ doneAt: 1000, basisAt: null }), savedAt: 7 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  for (const key of ['future', 'nonNumeric', 'nullish']) {
+    const record = memory.get(key);
+    assert.notEqual(record, null, key);
+    assert.equal(record.kind, 'armed', key);
+    assert.equal(record.basisAt, 1000, key);
+    assert.equal(record.doneAt, 1000, key);
+    assert.equal(record.expiresAt, null, key);
+  }
+});
+
+test('v1: 비유한수 doneAt은 버린다', async () => {
+  const host = createFakeHost({
+    initial: {
+      version: 1,
+      entries: {
+        nan: { ...v1rec({ doneAt: Number.NaN }), savedAt: 7 },
+        inf: { ...v1rec({ doneAt: Number.POSITIVE_INFINITY }), savedAt: 7 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  assert.equal(memory.get('nan'), null);
+  assert.equal(memory.get('inf'), null);
+});
+
+// ---------------------------------------------------------------------------
 // round-trip
 // ---------------------------------------------------------------------------
 
-test('round-trip: remember → flush → 새 인스턴스 load → get', async () => {
+test('round-trip: v2 armed/history(pending)/history(expired) 저장·복원, envelope version 2', async () => {
   const host = createFakeHost();
+  const armed = rec({ doneAt: 42 });
+  const pending = rec({ doneAt: 43, kind: 'history', expiresAt: 500000 });
+  const expired = rec({ doneAt: 44, kind: 'history', expiresAt: 900000, expiredAt: 900000 });
+
   const first = createEpochMemory({ hostCall: host.hostCall, now: () => 111 });
-  first.remember('k1', rec({ doneAt: 42 }));
+  first.remember('armed', armed);
+  first.remember('pending', pending);
+  first.remember('expired', expired);
   await first.flush();
 
   const stored = host.read();
-  assert.equal(stored.version, 1);
-  assert.deepEqual(stored.entries.k1, { ...rec({ doneAt: 42 }), savedAt: 111 });
+  assert.equal(stored.version, 2);
+  assert.deepEqual(stored.entries.armed, { ...armed, savedAt: 111 });
+  assert.deepEqual(stored.entries.pending, { ...pending, savedAt: 111 });
+  assert.deepEqual(stored.entries.expired, { ...expired, savedAt: 111 });
 
   const second = createEpochMemory({ hostCall: host.hostCall, now: () => 999 });
   await second.load();
-  assert.deepEqual(second.get('k1'), { ...rec({ doneAt: 42 }), savedAt: 111 });
+  assert.deepEqual(second.get('armed'), { ...armed, savedAt: 111 });
+  assert.deepEqual(second.get('pending'), { ...pending, savedAt: 111 });
+  assert.deepEqual(second.get('expired'), { ...expired, savedAt: 111 });
 });
 
 test('round-trip: incarnationId null도 저장·복원', async () => {
@@ -182,6 +306,94 @@ test('round-trip: incarnationId null도 저장·복원', async () => {
   const second = createEpochMemory({ hostCall: host.hostCall });
   await second.load();
   assert.deepEqual(second.get('k1'), { ...rec({ incarnationId: null }), savedAt: 111 });
+});
+
+test('remember: kind를 생략하면 armed로 저장한다', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+  const { kind, ...withoutKind } = rec();
+  memory.remember('k1', withoutKind);
+  await memory.flush();
+
+  assert.equal(memory.get('k1').kind, 'armed');
+  assert.equal(host.read().entries.k1.kind, 'armed');
+});
+
+test('remember: 허용 밖 필드(초안·화면·오류 메시지 등)는 저장하지 않는다', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+  memory.remember('k1', { ...rec(), draft: 'secret draft', screen: 'screen text', message: 'oops' });
+  await memory.flush();
+
+  const stored = host.read().entries.k1;
+  assert.deepEqual(stored, { ...rec(), savedAt: 1000 });
+  assert.equal('draft' in stored, false);
+  assert.equal('screen' in stored, false);
+  assert.equal('message' in stored, false);
+});
+
+// ---------------------------------------------------------------------------
+// 검증: 잘못된 레코드 거부 / reason 정규화
+// ---------------------------------------------------------------------------
+
+test('remember: 잘못된 레코드는 저장하지 않는다', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('unknownKind', rec({ kind: 'bogus' }));
+  memory.remember('expiredArmed', rec({ kind: 'armed', expiresAt: 300000, expiredAt: 300000 }));
+  memory.remember('mismatch', rec({ kind: 'history', expiresAt: 900000, expiredAt: 800000 }));
+  memory.remember('historyNoExpires', rec({ kind: 'history', expiresAt: null }));
+  memory.remember('badDoneAt', rec({ doneAt: Number.NaN }));
+  memory.remember('infBasis', rec({ basisAt: Number.POSITIVE_INFINITY }));
+  memory.remember('nanExpires', rec({ expiresAt: Number.NaN }));
+  memory.remember('basisAfterDone', rec({ basisAt: 999999 }));
+  memory.remember('expiresBeforeDone', rec({ expiresAt: 1000 }));
+  memory.remember('emptyPty', rec({ ptyId: '' }));
+  memory.remember('', rec());
+  memory.remember('notObject', 42);
+  await memory.flush();
+
+  for (const key of [
+    'unknownKind',
+    'expiredArmed',
+    'mismatch',
+    'historyNoExpires',
+    'badDoneAt',
+    'infBasis',
+    'nanExpires',
+    'basisAfterDone',
+    'expiresBeforeDone',
+    'emptyPty',
+    '',
+    'notObject',
+  ]) {
+    assert.equal(memory.get(key), null, key);
+  }
+  assert.equal(host.setCount(), 0);
+});
+
+test('remember: lastBlockReason은 허용 reason만, 그 밖은 null로 정규화', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('known', rec({ lastBlockReason: REASON_CODES.DRAFT_PRESENT }));
+  memory.remember('unknown', rec({ lastBlockReason: 'NOT_A_REAL_REASON' }));
+  memory.remember('sentence', rec({ lastBlockReason: '입력창 초안이 감지되어 전송하지 못함' }));
+  memory.remember('missing', { ...rec(), lastBlockReason: undefined });
+  memory.remember('expiredCause', rec({
+    kind: 'history',
+    expiresAt: 300000,
+    expiredAt: 300000,
+    lastBlockReason: REASON_CODES.OUTPUT_ACTIVE,
+  }));
+  await memory.flush();
+
+  assert.equal(memory.get('known').lastBlockReason, REASON_CODES.DRAFT_PRESENT);
+  assert.equal(memory.get('unknown').lastBlockReason, null);
+  assert.equal(memory.get('sentence').lastBlockReason, null);
+  assert.equal(memory.get('missing').lastBlockReason, null);
+  assert.equal(memory.get('expiredCause').lastBlockReason, REASON_CODES.OUTPUT_ACTIVE);
 });
 
 test('remember: incarnationId는 비어있지 않은 string 또는 null만 허용', async () => {
@@ -198,6 +410,25 @@ test('remember: incarnationId는 비어있지 않은 string 또는 null만 허�
   assert.equal(memory.get('undef'), null);
   assert.equal(memory.get('number'), null);
   assert.equal(memory.get('nullOk').incarnationId, null);
+});
+
+// ---------------------------------------------------------------------------
+// remember: 같은 내용 / 변경
+// ---------------------------------------------------------------------------
+
+test('remember: 같은 내용이면 추가 persist 없음', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('k1', rec());
+  await memory.flush();
+  const before = host.setCount();
+  assert.equal(before, 1);
+
+  memory.remember('k1', rec());
+  await memory.flush();
+  assert.equal(host.setCount(), before);
+  assert.notEqual(memory.get('k1'), null);
 });
 
 test('remember: 동일 내용에서 incarnationId null도 정확히 비교', async () => {
@@ -217,41 +448,6 @@ test('remember: 동일 내용에서 incarnationId null도 정확히 비교', asy
   assert.equal(host.setCount(), before + 1);
 });
 
-// ---------------------------------------------------------------------------
-// remember
-// ---------------------------------------------------------------------------
-
-test('remember: 검증 실패 항목은 저장하지 않는다', async () => {
-  const host = createFakeHost();
-  const memory = createEpochMemory({ hostCall: host.hostCall });
-
-  memory.remember('bad', { ...rec(), ptyId: '' });
-  memory.remember('bad2', { ...rec(), doneAt: Number.NaN });
-  memory.remember('', rec());
-  memory.remember('bad3', 42);
-  await memory.flush();
-
-  assert.equal(memory.get('bad'), null);
-  assert.equal(memory.get('bad2'), null);
-  assert.equal(memory.get('bad3'), null);
-  assert.equal(host.setCount(), 0);
-});
-
-test('remember: 같은 내용(doneAt·ptyId·incarnationId)이면 추가 persist 없음', async () => {
-  const host = createFakeHost();
-  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
-
-  memory.remember('k1', rec());
-  await memory.flush();
-  const before = host.setCount();
-  assert.equal(before, 1);
-
-  memory.remember('k1', rec());
-  await memory.flush();
-  assert.equal(host.setCount(), before);
-  assert.notEqual(memory.get('k1'), null);
-});
-
 test('remember: ptyId가 바뀌면 다시 persist', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
@@ -266,6 +462,36 @@ test('remember: ptyId가 바뀌면 다시 persist', async () => {
   assert.equal(host.read().entries.k1.ptyId, 'pty-2');
 });
 
+test('remember: 새 필드(kind·expiresAt·reason·expiredAt·basisAt)가 바뀌면 다시 persist', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 4000 }));
+  await memory.flush();
+  let before = host.setCount();
+
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 3000 }));
+  await memory.flush();
+  assert.equal(host.setCount(), before + 1, 'basisAt 변경');
+
+  before = host.setCount();
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 3000, lastBlockReason: REASON_CODES.DRAFT_PRESENT }));
+  await memory.flush();
+  assert.equal(host.setCount(), before + 1, 'lastBlockReason 변경');
+
+  before = host.setCount();
+  memory.remember('k1', rec({
+    doneAt: 5000,
+    basisAt: 3000,
+    lastBlockReason: REASON_CODES.DRAFT_PRESENT,
+    kind: 'history',
+    expiresAt: 300000,
+    expiredAt: 300000,
+  }));
+  await memory.flush();
+  assert.equal(host.setCount(), before + 1, 'kind/expiredAt 변경');
+});
+
 test('get: 반환값을 바꿔도 내부에 영향 없음', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
@@ -275,10 +501,12 @@ test('get: 반환값을 바꿔도 내부에 영향 없음', async () => {
   const view = memory.get('k1');
   view.doneAt = 0;
   view.ptyId = 'hacked';
+  view.kind = 'history';
 
   const again = memory.get('k1');
   assert.equal(again.doneAt, 1000);
   assert.equal(again.ptyId, 'pty-1');
+  assert.equal(again.kind, 'armed');
 });
 
 // ---------------------------------------------------------------------------
@@ -310,12 +538,12 @@ test('forget: 없는 항목은 no-op(추가 persist 없음)', async () => {
   assert.equal(host.setCount(), before);
 });
 
-test('prune: now() - doneAt >= maxAgeMs 인 항목 제거', async () => {
+test('prune: 만료 전 armed는 now() - doneAt >= maxAgeMs 이면 제거', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 10000 });
-  memory.remember('old', rec({ doneAt: 8000 }));
-  memory.remember('exact', rec({ doneAt: 9500 }));
-  memory.remember('new', rec({ doneAt: 9900 }));
+  memory.remember('old', rec({ doneAt: 8000, expiresAt: 500000 }));
+  memory.remember('exact', rec({ doneAt: 9500, expiresAt: 500000 }));
+  memory.remember('new', rec({ doneAt: 9900, expiresAt: 500000 }));
   await memory.flush();
 
   memory.prune(500);
@@ -324,14 +552,131 @@ test('prune: now() - doneAt >= maxAgeMs 인 항목 제거', async () => {
   assert.equal(memory.get('old'), null);
   assert.equal(memory.get('exact'), null);
   assert.notEqual(memory.get('new'), null);
+  assert.equal(memory.get('new').kind, 'armed');
   assert.equal(host.read().entries.old, undefined);
   assert.notEqual(host.read().entries.new, undefined);
+});
+
+test('prune: 만료된 v2 armed는 삭제 전에 history + expiredAt=expiresAt으로 전환', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 5000 });
+  memory.remember('expired', rec({ doneAt: 1000, basisAt: 1000, expiresAt: 2000 }));
+  await memory.flush();
+
+  memory.prune(3600000);
+  await memory.flush();
+
+  const record = memory.get('expired');
+  assert.notEqual(record, null);
+  assert.equal(record.kind, 'history');
+  assert.equal(record.expiredAt, 2000);
+  assert.equal(record.expiresAt, 2000);
+  assert.equal(host.read().entries.expired.kind, 'history');
+  assert.equal(host.read().entries.expired.expiredAt, 2000);
+});
+
+test('prune: armed가 maxAge를 넘겼어도 실제 만료면 history 전환을 우선한다', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 5000 });
+  memory.remember('expired', rec({ doneAt: 1000, basisAt: 1000, expiresAt: 2000 }));
+  await memory.flush();
+
+  memory.prune(100); // maxAge로는 제거 대상이지만 만료 이력 보존이 우선이다.
+  await memory.flush();
+
+  assert.equal(memory.get('expired').kind, 'history');
+  assert.equal(memory.get('expired').expiredAt, 2000);
+});
+
+test('prune: 만료 24시간을 넘긴 armed는 history로 남기지 않고 제거', async () => {
+  const host = createFakeHost();
+  const now = 2000 + RETENTION;
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => now });
+  memory.remember('ancient', rec({ doneAt: 1000, basisAt: 1000, expiresAt: 2000 }));
+  await memory.flush();
+
+  memory.prune(3600000);
+  await memory.flush();
+
+  assert.equal(memory.get('ancient'), null);
+});
+
+test('prune: v1 armed(expiresAt 없음)는 기존 maxAge 규칙으로 제거', async () => {
+  const host = createFakeHost({
+    initial: { version: 1, entries: { old: { ...v1rec({ doneAt: 1000 }), savedAt: 1 } } },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 3601000 });
+  await memory.load();
+
+  memory.prune(3600000);
+  await memory.flush();
+
+  assert.equal(memory.get('old'), null);
+  assert.equal(host.read().entries.old, undefined);
+});
+
+test('prune: history는 now >= expiresAt + 24h 정각에 제거하고 직전에는 유지', async () => {
+  // 정각: 제거
+  {
+    const expiresAt = 100000;
+    const host = createFakeHost();
+    const memory = createEpochMemory({
+      hostCall: host.hostCall,
+      now: () => expiresAt + RETENTION,
+    });
+    memory.remember('h', rec({ doneAt: 50000, kind: 'history', expiresAt }));
+    await memory.flush();
+    memory.prune(3600000);
+    await memory.flush();
+    assert.equal(memory.get('h'), null, '정각 제거');
+    assert.equal(host.read().entries.h, undefined);
+  }
+  // 직전: 유지
+  {
+    const expiresAt = 100000;
+    const host = createFakeHost();
+    const memory = createEpochMemory({
+      hostCall: host.hostCall,
+      now: () => expiresAt + RETENTION - 1,
+    });
+    memory.remember('h', rec({ doneAt: 50000, kind: 'history', expiresAt }));
+    await memory.flush();
+    memory.prune(3600000);
+    await memory.flush();
+    assert.notEqual(memory.get('h'), null, '직전 유지');
+  }
+});
+
+test('prune: pending history(expiredAt null)도 같은 24시간 상한을 쓴다', async () => {
+  const expiresAt = 100000;
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => expiresAt + RETENTION });
+  memory.remember('h', rec({ doneAt: 50000, kind: 'history', expiresAt }));
+  await memory.flush();
+  assert.equal(memory.get('h').expiredAt, null);
+
+  memory.prune(3600000);
+  await memory.flush();
+  assert.equal(memory.get('h'), null);
+});
+
+test('prune: savedAt 갱신은 history 보존을 연장하지 않는다', async () => {
+  const expiresAt = 100000;
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => expiresAt + RETENTION });
+  memory.remember('h', rec({ doneAt: 50000, kind: 'history', expiresAt }));
+  await memory.flush();
+  assert.equal(memory.get('h').savedAt, expiresAt + RETENTION, 'savedAt은 방금 갱신됨');
+
+  memory.prune(3600000);
+  await memory.flush();
+  assert.equal(memory.get('h'), null);
 });
 
 test('prune: 제거 대상이 없으면 persist하지 않는다', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 10000 });
-  memory.remember('new', rec({ doneAt: 9900 }));
+  memory.remember('new', rec({ doneAt: 9900, expiresAt: 500000 }));
   await memory.flush();
   const before = host.setCount();
 
@@ -354,6 +699,7 @@ test('MAX_ENTRIES: 초과 시 doneAt이 가장 오래된 것부터 제거', asyn
   await memory.flush();
 
   const stored = host.read();
+  assert.equal(stored.version, 2);
   assert.equal(Object.keys(stored.entries).length, EPOCH_MEMORY_MAX_ENTRIES);
   assert.equal(memory.get('k0'), null);
   assert.equal(memory.get('k4'), null);
@@ -366,6 +712,32 @@ test('MAX_ENTRIES: 초과 시 doneAt이 가장 오래된 것부터 제거', asyn
   await fresh.load();
   assert.equal(fresh.get('k0'), null);
   assert.notEqual(fresh.get('k5'), null);
+});
+
+test('MAX_BYTES: 직렬화 크기 초과 시 오래된 것부터 제거', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+  const bigPty = 'x'.repeat(10000);
+  const total = 40;
+  for (let index = 0; index < total; index += 1) {
+    memory.remember(`k${index}`, rec({ doneAt: index, ptyId: bigPty }));
+  }
+  await memory.flush();
+
+  const stored = host.read();
+  assert.ok(Object.keys(stored.entries).length < total, '일부 제거됨');
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(stored), 'utf8') <= EPOCH_MEMORY_MAX_BYTES,
+    '직렬화 크기 상한 이하',
+  );
+  assert.equal(memory.get('k0'), null, '가장 오래된 항목 제거');
+  assert.notEqual(memory.get(`k${total - 1}`), null, '가장 최근 항목 유지');
+  // 순서 보존: 남은 항목은 연속 구간이다.
+  const remaining = Object.keys(stored.entries).map((key) => Number(key.slice(1))).sort((a, b) => a - b);
+  assert.equal(remaining[remaining.length - 1], total - 1);
+  for (let index = 1; index < remaining.length; index += 1) {
+    assert.equal(remaining[index], remaining[index - 1] + 1);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -387,6 +759,7 @@ test('storage.set 실패는 삼키고 다음 변경 때 재시도', async () => 
 
   const stored = host.read();
   assert.notEqual(stored, undefined);
+  assert.equal(stored.version, 2);
   assert.notEqual(stored.entries.k1, undefined);
   assert.notEqual(stored.entries.k2, undefined);
 });
@@ -395,9 +768,9 @@ test('연속 변경은 persist 1회로 coalesce', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
 
-  memory.remember('k1', rec({ doneAt: 1 }));
-  memory.remember('k2', rec({ doneAt: 2 }));
-  memory.remember('k3', rec({ doneAt: 3 }));
+  memory.remember('k1', rec({ doneAt: 1, basisAt: 1, expiresAt: 100 }));
+  memory.remember('k2', rec({ doneAt: 2, basisAt: 2, expiresAt: 200 }));
+  memory.remember('k3', rec({ doneAt: 3, basisAt: 3, expiresAt: 300 }));
   await memory.flush();
 
   assert.equal(host.setCount(), 1);
@@ -405,7 +778,7 @@ test('연속 변경은 persist 1회로 coalesce', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// load race
+// load race / tombstone
 // ---------------------------------------------------------------------------
 
 test('load 진행 중 remember한 변경은 load 결과로 덮어쓰지 않는다', async () => {
@@ -414,7 +787,7 @@ test('load 진행 중 remember한 변경은 load 결과로 덮어쓰지 않는�
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 5000 });
 
   const loading = memory.load();
-  memory.remember('k1', rec({ doneAt: 2000 }));
+  memory.remember('k1', rec({ doneAt: 2000, basisAt: 2000, expiresAt: 300000 }));
   await loading;
 
   assert.equal(memory.get('k1').doneAt, 2000);
@@ -425,7 +798,7 @@ test('load 진행 중 remember한 변경은 load 결과로 덮어쓰지 않는�
 test('load 진행 중 forget한 변경은 load 결과로 되살아나지 않는다', async () => {
   const host = createFakeHost({
     initial: {
-      version: 1,
+      version: 2,
       entries: { k1: { ...rec(), savedAt: 1 }, k2: { ...rec(), savedAt: 1 } },
     },
   });
@@ -479,7 +852,7 @@ test('load: 상한 초과 저장값을 정리하면 persist 예약', async () =>
   const entries = {};
   const total = EPOCH_MEMORY_MAX_ENTRIES + 3;
   for (let index = 0; index < total; index += 1) {
-    entries[`k${index}`] = { ...rec({ doneAt: index }), savedAt: 1 };
+    entries[`k${index}`] = { ...v1rec({ doneAt: index }), savedAt: 1 };
   }
   const host = createFakeHost({ initial: { version: 1, entries } });
   const memory = createEpochMemory({ hostCall: host.hostCall });
@@ -488,75 +861,10 @@ test('load: 상한 초과 저장값을 정리하면 persist 예약', async () =>
   await memory.flush();
 
   const stored = host.read();
+  assert.equal(stored.version, 2);
   assert.equal(Object.keys(stored.entries).length, EPOCH_MEMORY_MAX_ENTRIES);
   assert.equal(stored.entries.k0, undefined);
   assert.notEqual(stored.entries.k3, undefined);
   assert.equal(memory.get('k0'), null);
   assert.notEqual(memory.get('k3'), null);
-});
-
-// ---------------------------------------------------------------------------
-// basisAt
-// ---------------------------------------------------------------------------
-
-test('basisAt: 유효한 값은 round-trip 되고 옛 레코드(없음)도 그대로 로드된다', async () => {
-  const host = createFakeHost();
-  const first = createEpochMemory({ hostCall: host.hostCall, now: () => 111 });
-  first.remember('with', rec({ doneAt: 5000, basisAt: 4000 }));
-  first.remember('without', rec({ doneAt: 6000 }));
-  await first.flush();
-
-  assert.equal(host.read().entries.with.basisAt, 4000);
-  assert.equal('basisAt' in host.read().entries.without, false);
-
-  const second = createEpochMemory({ hostCall: host.hostCall });
-  await second.load();
-  assert.equal(second.get('with').basisAt, 4000);
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(second.get('without'), 'basisAt'),
-    false,
-  );
-  assert.equal(second.get('without').doneAt, 6000);
-});
-
-test('basisAt: load 시 잘못된 값(doneAt 초과·비수치·null)은 생략한다', async () => {
-  const host = createFakeHost({
-    initial: {
-      version: 1,
-      entries: {
-        future: { ...rec({ doneAt: 1000, basisAt: 2000 }), savedAt: 7 },
-        nonNumeric: { ...rec({ doneAt: 1000, basisAt: 'x' }), savedAt: 7 },
-        nullish: { ...rec({ doneAt: 1000, basisAt: null }), savedAt: 7 },
-        valid: { ...rec({ doneAt: 1000, basisAt: 500 }), savedAt: 7 },
-      },
-    },
-  });
-  const memory = createEpochMemory({ hostCall: host.hostCall });
-  await memory.load();
-
-  for (const key of ['future', 'nonNumeric', 'nullish']) {
-    const record = memory.get(key);
-    assert.notEqual(record, null);
-    assert.equal(Object.prototype.hasOwnProperty.call(record, 'basisAt'), false);
-    assert.equal(record.doneAt, 1000);
-  }
-  assert.equal(memory.get('valid').basisAt, 500);
-});
-
-test('remember: basisAt만 바뀌어도 다시 persist한다', async () => {
-  const host = createFakeHost();
-  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
-
-  memory.remember('k1', rec({ doneAt: 5000, basisAt: 4000 }));
-  await memory.flush();
-  const before = host.setCount();
-
-  memory.remember('k1', rec({ doneAt: 5000, basisAt: 4000 }));
-  await memory.flush();
-  assert.equal(host.setCount(), before, '같은 내용이면 persist 없음');
-
-  memory.remember('k1', rec({ doneAt: 5000, basisAt: 3000 }));
-  await memory.flush();
-  assert.equal(host.setCount(), before + 1);
-  assert.equal(host.read().entries.k1.basisAt, 3000);
 });

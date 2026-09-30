@@ -6,8 +6,15 @@
  * 저장하고 복원하기 위한 독립 모듈이다. coordinator 연결은 하지 않으며, host
  * storage는 주입된 `hostCall`로만 접근하고 import 시 I/O/타이머를 시작하지 않는다.
  *
- * 계약 요약:
- *  - 저장 형식: `{ version: 1, entries: { [key]: EpochRecord } }`.
+ * 계약 요약(§2-4):
+ *  - 저장 형식: `{ version: 2, entries: { [key]: EpochMemoryRecordV2 } }`.
+ *    storage key는 기존 'epochs-v1'을 유지하고 envelope version만 2로 올린다.
+ *  - 읽기는 version 1과 2를 모두 지원한다. version 1 레코드는 기존 규칙으로 읽어
+ *    kind='armed'로 취급하고 basisAt이 없으면 doneAt을 쓴다. v1에는 TTL 정보가
+ *    없으므로 expiresAt을 null로 두고 만료 시각·원인을 추정하지 않는다.
+ *  - kind='armed'는 복원 가능한 예약, kind='history'는 표시 전용이다. history는
+ *    전송 예약으로 복원하지 않는다. expiredAt !== null이면 반드시 history이며
+ *    expiresAt과 같은 값이어야 한다.
  *  - load는 없음/형식 오류/호출 실패 시 빈 상태로 시작한다(throw 금지).
  *  - remember/forget/prune은 동기이며 throw하지 않는다. 변경 시 persist를 예약한다.
  *  - persist는 직렬화·coalesce되며 storage.set 실패는 삼키고 다음 변경 때 재시도한다.
@@ -17,31 +24,56 @@
  * @module epoch-memory
  */
 
-/** host storage의 단일 key. */
+import {
+  EPOCH_MEMORY_VERSION,
+  CACHE_HISTORY_RETENTION_MS,
+  EXPIRE_CAUSE_REASONS,
+} from './contracts.mjs';
+
+/** host storage의 단일 key. 형식 호환을 위해 유지한다. */
 export const EPOCH_MEMORY_KEY = 'epochs-v1';
 
 /** 저장 가능한 최대 항목 수. 초과 시 doneAt이 가장 오래된 것부터 제거한다. */
 export const EPOCH_MEMORY_MAX_ENTRIES = 200;
 
+/** 직렬화 결과의 최대 크기(byte). 초과 시 doneAt이 오래된 것부터 레코드 단위로 제거한다. */
+export const EPOCH_MEMORY_MAX_BYTES = 256 * 1024;
+
 /**
- * 영속되는 epoch 한 건.
+ * 영속되는 epoch 한 건(§2-4 EpochMemoryRecordV2).
  * @typedef {Object} EpochRecord
- * @property {string} worktreeId
- * @property {string} paneKey
+ * @property {'armed'|'history'} kind armed=복원 가능한 예약, history=표시 전용.
  * @property {string} userDataKey
  * @property {string} profileId
+ * @property {string} worktreeId
+ * @property {string} paneKey
  * @property {string} ptyId
- * @property {string|null} incarnationId
+ * @property {string|null} incarnationId 재시작에 따른 변경은 허용한다.
  * @property {number} doneAt
- * @property {number} [basisAt] 캐시 TTL 기준 시각. 유효하지 않으면 생략되며, 없는 옛 레코드도 그대로 로드된다.
- * @property {number} savedAt
+ * @property {number|null} basisAt 없으면 doneAt을 쓴다.
+ * @property {number|null} expiresAt 예상 만료 시각(ms). TTL 정보가 없으면 null.
+ * @property {string|null} lastBlockReason EXPIRE_CAUSE_REASONS 중 하나 또는 null.
+ * @property {number|null} expiredAt null이 아니면 expiresAt과 같은 값이다.
+ * @property {number} savedAt 저장 시각(ms). 갱신으로 보존 기간을 연장하지 않는다.
  */
 
 /** 항상 비어있지 않은 string이어야 하는 필드. */
-const REQUIRED_STRING_FIELDS = ['worktreeId', 'paneKey', 'userDataKey', 'profileId', 'ptyId'];
+const REQUIRED_STRING_FIELDS = ['userDataKey', 'profileId', 'worktreeId', 'paneKey', 'ptyId'];
 
-/** 비교 시 사용하는 전체 record 필드. incarnationId는 null을 허용한다. */
-const RECORD_FIELDS = [...REQUIRED_STRING_FIELDS, 'incarnationId', 'doneAt', 'basisAt', 'savedAt'];
+/** 비교 시 사용하는 전체 record 필드. incarnationId 등 null을 허용한다. */
+const RECORD_FIELDS = [
+  'kind',
+  ...REQUIRED_STRING_FIELDS,
+  'incarnationId',
+  'doneAt',
+  'basisAt',
+  'expiresAt',
+  'lastBlockReason',
+  'expiredAt',
+  'savedAt',
+];
+
+const ALLOWED_KINDS = ['armed', 'history'];
 
 /**
  * @param {unknown} value
@@ -72,16 +104,23 @@ function isFiniteNumber(value) {
 }
 
 /**
- * raw 값을 EpochRecord로 검증·정규화한다. 실패 시 null.
- * 알려진 필드만 남겨 storage에 불필요한 필드가 섞이지 않게 한다.
- * @param {unknown} raw
- * @param {number} [savedAt] remember 경로에서 강제할 savedAt.
- * @returns {EpochRecord|null}
+ * UTF-8 byte 길이. Buffer가 없는 환경에서는 문자열 길이로 대체한다.
+ * @param {string} text
+ * @returns {number}
  */
-function normalizeRecord(raw, savedAt) {
-  if (!isPlainObject(raw)) {
-    return null;
+function utf8ByteLength(text) {
+  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
+    return Buffer.byteLength(text, 'utf8');
   }
+  return text.length;
+}
+
+/**
+ * 공통 identity 필드(문자열·incarnationId·doneAt)를 검증해 복사한다. 실패 시 null.
+ * @param {Record<string, unknown>} raw
+ * @returns {{userDataKey:string,profileId:string,worktreeId:string,paneKey:string,ptyId:string,incarnationId:string|null,doneAt:number}|null}
+ */
+function normalizeIdentity(raw) {
   /** @type {Record<string, unknown>} */
   const out = {};
   for (const field of REQUIRED_STRING_FIELDS) {
@@ -101,17 +140,133 @@ function normalizeRecord(raw, savedAt) {
     return null;
   }
   out.doneAt = raw.doneAt;
-  // basisAt은 optional. 유효(유한수, doneAt 이하)하면 저장하고 아니면 통째로 생략한다.
-  // 생략은 레코드 전체를 버리는 이유가 되지 않는다(옛 레코드 호환).
-  if (raw.basisAt !== undefined && isFiniteNumber(raw.basisAt) && raw.basisAt <= raw.doneAt) {
-    out.basisAt = raw.basisAt;
+  return /** @type {any} */ (out);
+}
+
+/**
+ * version 2 raw 값을 EpochRecord로 검증·정규화한다. 실패 시 null.
+ * 잘못된 kind는 armed로 추정하지 않고 레코드 전체를 버린다.
+ * @param {unknown} raw
+ * @param {number} [savedAt] remember 경로에서 강제할 savedAt.
+ * @returns {EpochRecord|null}
+ */
+function normalizeV2Record(raw, savedAt) {
+  if (!isPlainObject(raw)) {
+    return null;
   }
+  const kind = raw.kind;
+  if (!ALLOWED_KINDS.includes(/** @type {string} */ (kind))) {
+    return null;
+  }
+  const identity = normalizeIdentity(raw);
+  if (identity === null) {
+    return null;
+  }
+  const doneAt = identity.doneAt;
+
+  // basisAt: null/undefined 또는 유한수이면서 doneAt 이하만 허용한다.
+  let basisAt = null;
+  if (raw.basisAt !== null && raw.basisAt !== undefined) {
+    if (!isFiniteNumber(raw.basisAt) || raw.basisAt > doneAt) {
+      return null;
+    }
+    basisAt = raw.basisAt;
+  }
+
+  // expiresAt: null/undefined 또는 유한수이면서 doneAt보다 커야 한다.
+  let expiresAt = null;
+  if (raw.expiresAt !== null && raw.expiresAt !== undefined) {
+    if (!isFiniteNumber(raw.expiresAt) || raw.expiresAt <= doneAt) {
+      return null;
+    }
+    expiresAt = raw.expiresAt;
+  }
+  // history는 만료 시각이 있어야 24시간 보존 경계를 계산할 수 있다.
+  if (kind === 'history' && expiresAt === null) {
+    return null;
+  }
+
+  // expiredAt: null 또는 expiresAt과 같은 유한수. 값이 있으면 kind는 반드시 history다.
+  let expiredAt = null;
+  if (raw.expiredAt !== null && raw.expiredAt !== undefined) {
+    if (
+      kind !== 'history' ||
+      expiresAt === null ||
+      !isFiniteNumber(raw.expiredAt) ||
+      raw.expiredAt !== expiresAt
+    ) {
+      return null;
+    }
+    expiredAt = raw.expiredAt;
+  }
+
+  // 허용 밖 reason은 null로 정규화한다(레코드는 유지).
+  const lastBlockReason =
+    typeof raw.lastBlockReason === 'string' && EXPIRE_CAUSE_REASONS.includes(raw.lastBlockReason)
+      ? raw.lastBlockReason
+      : null;
+
   const effectiveSavedAt = savedAt !== undefined ? savedAt : raw.savedAt;
   if (!isFiniteNumber(effectiveSavedAt)) {
     return null;
   }
-  out.savedAt = effectiveSavedAt;
-  return /** @type {EpochRecord} */ (out);
+
+  return {
+    kind: /** @type {'armed'|'history'} */ (kind),
+    userDataKey: identity.userDataKey,
+    profileId: identity.profileId,
+    worktreeId: identity.worktreeId,
+    paneKey: identity.paneKey,
+    ptyId: identity.ptyId,
+    incarnationId: identity.incarnationId,
+    doneAt,
+    basisAt,
+    expiresAt,
+    lastBlockReason,
+    expiredAt,
+    savedAt: effectiveSavedAt,
+  };
+}
+
+/**
+ * version 1 raw 값을 기존 규칙으로 검증하고 v2 레코드로 변환한다. 실패 시 null.
+ * basisAt이 없거나 유효하지 않으면 doneAt을 쓰고, expiresAt은 추정하지 않고 null로 둔다.
+ * @param {unknown} raw
+ * @param {number} [savedAt] 강제할 savedAt(load에서는 undefined).
+ * @returns {EpochRecord|null}
+ */
+function normalizeV1Record(raw, savedAt) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const identity = normalizeIdentity(raw);
+  if (identity === null) {
+    return null;
+  }
+  const doneAt = identity.doneAt;
+  const basisAt =
+    raw.basisAt !== undefined && isFiniteNumber(raw.basisAt) && raw.basisAt <= doneAt
+      ? raw.basisAt
+      : doneAt;
+  const effectiveSavedAt = savedAt !== undefined ? savedAt : raw.savedAt;
+  if (!isFiniteNumber(effectiveSavedAt)) {
+    return null;
+  }
+  return {
+    kind: 'armed',
+    userDataKey: identity.userDataKey,
+    profileId: identity.profileId,
+    worktreeId: identity.worktreeId,
+    paneKey: identity.paneKey,
+    ptyId: identity.ptyId,
+    incarnationId: identity.incarnationId,
+    doneAt,
+    basisAt,
+    expiresAt: null,
+    lastBlockReason: null,
+    expiredAt: null,
+    savedAt: effectiveSavedAt,
+  };
 }
 
 /**
@@ -130,15 +285,20 @@ function sameRecord(a, b) {
 }
 
 /**
- * 같은 내용(remember persist 생략 판단)인지 비교한다.
+ * 같은 내용(remember persist 생략 판단)인지 비교한다. kind와 새 시각·원인 필드를 포함한다.
+ * savedAt은 보존 기간을 연장하지 않으므로 비교에서 제외한다.
  * @param {EpochRecord} a
  * @param {EpochRecord} b
  * @returns {boolean}
  */
 function sameContent(a, b) {
   return (
+    a.kind === b.kind &&
     a.doneAt === b.doneAt &&
     a.basisAt === b.basisAt &&
+    a.expiresAt === b.expiresAt &&
+    a.lastBlockReason === b.lastBlockReason &&
+    a.expiredAt === b.expiredAt &&
     a.ptyId === b.ptyId &&
     a.incarnationId === b.incarnationId
   );
@@ -181,7 +341,7 @@ function sameEntrySet(a, b) {
  * @returns {{
  *   load: () => Promise<void>,
  *   get: (key: string) => EpochRecord|null,
- *   remember: (key: string, record: Omit<EpochRecord, 'savedAt'>) => void,
+ *   remember: (key: string, record: Partial<EpochRecord>) => void,
  *   forget: (key: string) => void,
  *   prune: (maxAgeMs: number) => void,
  *   flush: () => Promise<void>,
@@ -203,7 +363,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
   /** 미완료 load 수. 0보다 크면 load가 끝나기 전 변경으로 본다. */
   let outstandingLoads = 0;
   /**
-   * load가 끝나기 전 삭제(forget/prune)된 key. load 결과가 삭제를 되살리지 않게 한다.
+   * load가 끝나기 전 삭제(forget/prune/상한)된 key. load 결과가 삭제를 되살리지 않게 한다.
    * load 시작 전에 삭제했지만 저장에 실패한 key는 추적하지 않는다. coordinator는 빈
    * 메모리에서 bootstrap 때 1회만 load하므로 이 경로에 도달하지 않는다.
    */
@@ -235,7 +395,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
     for (const [key, record] of entries) {
       out[key] = copyRecord(record);
     }
-    return { version: 1, entries: out };
+    return { version: EPOCH_MEMORY_VERSION, entries: out };
   }
 
   /**
@@ -265,33 +425,81 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
   }
 
   /**
-   * MAX_ENTRIES를 넘으면 doneAt이 가장 오래된 항목부터 제거한다.
+   * key를 내부에서 제거하고, load 진행 중이면 tombstone으로 기록한다.
+   * @param {string} key
+   * @returns {void}
+   */
+  function deleteEntry(key) {
+    entries.delete(key);
+    if (outstandingLoads > 0) {
+      deletedKeys.add(key);
+    }
+  }
+
+  /**
+   * doneAt이 가장 오래된 entry를 제거한다.
    * @returns {boolean} 제거가 있었는지.
    */
-  function enforceMaxEntries() {
-    if (entries.size <= EPOCH_MEMORY_MAX_ENTRIES) {
-      return false;
-    }
-    const rows = [...entries.entries()].sort((a, b) => a[1].doneAt - b[1].doneAt);
-    const removeCount = rows.length - EPOCH_MEMORY_MAX_ENTRIES;
-    for (let index = 0; index < removeCount; index += 1) {
-      entries.delete(rows[index][0]);
-      if (outstandingLoads > 0) {
-        deletedKeys.add(rows[index][0]);
+  function removeOldest() {
+    let oldestKey = null;
+    let oldestDoneAt = Number.POSITIVE_INFINITY;
+    for (const [key, record] of entries) {
+      if (record.doneAt < oldestDoneAt) {
+        oldestDoneAt = record.doneAt;
+        oldestKey = key;
       }
     }
+    if (oldestKey === null) {
+      return false;
+    }
+    deleteEntry(oldestKey);
     return true;
   }
 
   /**
-   * 저장 value에서 유효한 항목만 적재한다. 형식 오류는 버린다.
+   * 항목 수(EPOCH_MEMORY_MAX_ENTRIES)와 직렬화 크기(EPOCH_MEMORY_MAX_BYTES) 상한을
+   * 지킨다. 초과분은 doneAt이 가장 오래된 것부터 레코드 단위로 제거한다.
+   * @returns {boolean} 제거가 있었는지.
+   */
+  function enforceLimits() {
+    let changed = false;
+    while (entries.size > EPOCH_MEMORY_MAX_ENTRIES) {
+      if (!removeOldest()) {
+        break;
+      }
+      changed = true;
+    }
+    while (
+      entries.size > 0 &&
+      utf8ByteLength(JSON.stringify(buildValue())) > EPOCH_MEMORY_MAX_BYTES
+    ) {
+      if (!removeOldest()) {
+        break;
+      }
+      changed = true;
+    }
+    return changed;
+  }
+
+  /**
+   * 저장 value에서 유효한 항목만 적재한다. 형식 오류·미지원 version은 버린다.
    * @param {unknown} value
    * @returns {Map<string, EpochRecord>}
    */
   function parseLoadedValue(value) {
     /** @type {Map<string, EpochRecord>} */
     const loaded = new Map();
-    if (!isPlainObject(value) || value.version !== 1 || !isPlainObject(value.entries)) {
+    if (!isPlainObject(value) || !isPlainObject(value.entries)) {
+      return loaded;
+    }
+    /** @type {((raw: unknown, savedAt?: number) => EpochRecord|null)|null} */
+    let normalize = null;
+    if (value.version === 1) {
+      normalize = normalizeV1Record;
+    } else if (value.version === EPOCH_MEMORY_VERSION) {
+      normalize = normalizeV2Record;
+    }
+    if (normalize === null) {
       return loaded;
     }
     const rawEntries = /** @type {Record<string, unknown>} */ (value.entries);
@@ -299,7 +507,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
       if (!isNonEmptyString(key)) {
         continue;
       }
-      const record = normalizeRecord(rawEntries[key]);
+      const record = normalize(rawEntries[key]);
       if (record !== null) {
         loaded.set(key, record);
       }
@@ -350,7 +558,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
       if (changedVsStorage) {
         schedulePersist();
       }
-      if (enforceMaxEntries()) {
+      if (enforceLimits()) {
         // 병합 뒤 상한 초과로 잘라낸 경우도 storage와 달라졌으므로 저장한다.
         schedulePersist();
       }
@@ -372,16 +580,18 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
 
   /**
    * epoch를 저장한다. 검증 실패·잘못된 key는 조용히 무시한다(throw 금지).
-   * 같은 내용(doneAt·basisAt·ptyId·incarnationId 동일)이면 persist를 예약하지 않는다.
+   * kind를 생략하면 'armed'로 취급한다(기존 호출 호환).
+   * 같은 내용(kind·시각·원인·ptyId·incarnationId 동일)이면 persist를 예약하지 않는다.
    * @param {string} key
-   * @param {Omit<EpochRecord, 'savedAt'>} record
+   * @param {Partial<EpochRecord>} record
    * @returns {void}
    */
   function remember(key, record) {
-    if (!isNonEmptyString(key)) {
+    if (!isNonEmptyString(key) || !isPlainObject(record)) {
       return;
     }
-    const normalized = normalizeRecord(record, now());
+    const source = record.kind === undefined ? { ...record, kind: 'armed' } : record;
+    const normalized = normalizeV2Record(source, now());
     if (normalized === null) {
       return;
     }
@@ -392,7 +602,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
       return;
     }
     entries.set(key, normalized);
-    enforceMaxEntries();
+    enforceLimits();
     schedulePersist();
   }
 
@@ -417,19 +627,39 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
   }
 
   /**
-   * `now() - doneAt >= maxAgeMs`인 항목을 제거한다. 변경이 있으면 persist를 예약한다.
+   * 보존 기간이 지난 레코드를 제거하고, 만료된 v2 armed를 history로 전환한다.
+   * - armed: `now() - doneAt >= maxAgeMs`이면 제거(기존 규칙). 단 expiresAt이 이미
+   *   지났으면 삭제 전에 kind='history', expiredAt=expiresAt으로 전환하며, 그 이력이
+   *   24시간 보존을 이미 넘겼으면 바로 제거한다.
+   * - history: `now() >= expiresAt + CACHE_HISTORY_RETENTION_MS`이면 제거한다.
+   * savedAt 갱신은 보존 기간을 연장하지 않는다.
    * @param {number} maxAgeMs
    * @returns {void}
    */
   function prune(maxAgeMs) {
     const at = now();
+    const hasMaxAge = typeof maxAgeMs === 'number' && Number.isFinite(maxAgeMs);
     let changed = false;
     for (const [key, record] of [...entries]) {
-      if (at - record.doneAt >= maxAgeMs) {
-        entries.delete(key);
-        if (outstandingLoads > 0) {
-          deletedKeys.add(key);
+      if (record.kind === 'history') {
+        if (record.expiresAt !== null && at >= record.expiresAt + CACHE_HISTORY_RETENTION_MS) {
+          deleteEntry(key);
+          changed = true;
         }
+        continue;
+      }
+      // armed: 실제 만료가 지났으면 삭제보다 표시 이력 전환을 우선한다.
+      if (record.expiresAt !== null && at >= record.expiresAt) {
+        if (at >= record.expiresAt + CACHE_HISTORY_RETENTION_MS) {
+          deleteEntry(key);
+        } else {
+          entries.set(key, { ...record, kind: 'history', expiredAt: record.expiresAt });
+        }
+        changed = true;
+        continue;
+      }
+      if (hasMaxAge && at - record.doneAt >= maxAgeMs) {
+        deleteEntry(key);
         changed = true;
       }
     }
