@@ -3,7 +3,7 @@
   "id": "cache-keepalive",
   "publisher": "runaticmoon",
   "name": "Cache Keepalive",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Schedule small keepalive messages for idle Claude terminals, with per-worktree and per-terminal controls.",
   "engines": { "orca": ">=1.4.214" },
   "pluginApi": 1,
@@ -11,7 +11,7 @@
   "contributes": {
     "commands": [
       { "id": "keepalive-open", "title": "Cache Keepalive: Open Dashboard", "context": "global" },
-      { "id": "keepalive-toggle-pause", "title": "Cache Keepalive: Toggle On/Off (All)", "context": "global" },
+      { "id": "keepalive-toggle-pause", "title": "Cache Keepalive: Pause/Resume All", "context": "global" },
       { "id": "keepalive-pause", "title": "Cache Keepalive: Pause All", "context": "global" },
       { "id": "keepalive-resume", "title": "Cache Keepalive: Resume", "context": "global" },
       { "id": "keepalive-toggle-worktree", "title": "Cache Keepalive: Toggle Current Worktree", "context": "worktree" },
@@ -27,7 +27,9 @@
       { "on": "worktree.removed" }
     ],
     "keybindings": [
-      { "command": "keepalive-open", "key": "Mod+Alt+Shift+J", "when": "global" }
+      { "command": "keepalive-open", "key": "Mod+Alt+O", "when": "global" },
+      { "command": "keepalive-toggle-pause", "key": "Mod+Alt+P", "when": "global" },
+      { "command": "keepalive-toggle-worktree", "key": "Mod+Alt+K", "when": "worktree" }
     ]
   },
   "capabilities": [

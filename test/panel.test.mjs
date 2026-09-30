@@ -32,7 +32,7 @@ test('all eight Orca commands and terminal alternatives are discoverable', async
   const html = await readFile(panelPath, 'utf8')
   const titles = [
     'Open Dashboard',
-    'Toggle On/Off (All)',
+    'Pause/Resume All',
     'Pause All',
     'Resume',
     'Toggle Current Worktree',
@@ -45,6 +45,35 @@ test('all eight Orca commands and terminal alternatives are discoverable', async
     assert.ok(html.includes(`keepalive.mjs ${argument}</code>`), argument)
   }
   assert.ok(html.includes('%USERPROFILE%\\.orca-cache-keepalive\\keepalive.mjs status'))
+})
+
+test('keepalive toggle shortcuts are documented in the panel', async () => {
+  const html = await readFile(panelPath, 'utf8')
+  for (const shortcut of ['⌘⌥O', '⌘⌥P', '⌘⌥K', 'Ctrl+Alt+O', 'Ctrl+Alt+P', 'Ctrl+Alt+K']) {
+    assert.ok(html.includes(shortcut), shortcut)
+  }
+  for (const removed of ['⌘⌥⇧J', 'Alt+Shift+J']) {
+    assert.ok(!html.includes(removed), removed)
+  }
+  assert.ok(html.includes('사이드바 등 Orca 기본 화면'), '단축키 동작 범위 안내 문구가 있다')
+  assert.ok(!html.includes('사이드바·대시보드 등'), '틀린 안내 문구가 없다')
+
+  const kbdIds = [...html.matchAll(/<kbd id="([^"]+)"/g)].map((match) => match[1]).sort()
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1])
+  const script = scripts.join('\n')
+  const referencedIds = [...script.matchAll(/getElementById\('([^']+-(?:primary|other))'\)/g)]
+    .map((match) => match[1])
+    .sort()
+  assert.deepEqual(kbdIds, referencedIds)
+})
+
+test('panel explains all three tab symbols and title refresh behavior', async () => {
+  const html = await readFile(panelPath, 'utf8')
+  assert.match(html, /탭 이름에 캐시 상태 표시/)
+  for (const label of ['⚡ 유지 중', '💤 유지 중인 캐시 없음', '⚠️ 확인 필요']) {
+    assert.ok(html.includes(label), label)
+  }
+  assert.match(html, /같은 기호가 유지되면 제목을 다시 쓰지 않습니다/)
 })
 
 test('inline action script parses and fits Orca shell prelude', async () => {

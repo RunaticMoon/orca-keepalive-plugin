@@ -21,7 +21,15 @@
 import crypto from 'node:crypto';
 
 import { StoreError } from './state-store.mjs';
-import { ValidationError } from './config.mjs';
+import { ValidationError, capFor } from './config.mjs';
+import {
+  CACHE_STATES,
+  CACHE_STATUSES,
+  EXPIRE_CAUSE_REASONS,
+  RESERVATION_NOTES,
+  TITLE_PREFIXES,
+  TITLE_PREFIX_PRIORITY,
+} from './contracts.mjs';
 
 /** 허용 Action type. §7.4. */
 const ACTION_TYPES = new Set(['pause', 'worktree', 'terminal', 'config', 'reset-budget', 'clear-review', 'worktree-orca']);
@@ -45,6 +53,16 @@ const CONNECTION_TEXT = Object.freeze({
 
 /** worktree scope에서 무시하는 budget 기반 정책 사유. */
 const WORKTREE_IGNORED_POLICY_REASONS = new Set(['LIMIT_REACHED', 'PARTIAL_OR_UNKNOWN_SEND', 'STORAGE_FAILED']);
+
+/** 캐시 표시 필드 allowlist. §2-1. 알 수 없는 문자열은 복사하지 않는다. */
+const CACHE_STATE_SET = new Set(CACHE_STATES);
+const CACHE_STATUS_SET = new Set(CACHE_STATUSES);
+const EXPIRE_CAUSE_REASON_SET = new Set(EXPIRE_CAUSE_REASONS);
+const RESERVATION_NOTE_SET = new Set(RESERVATION_NOTES);
+
+/** 캐시 표시 필드 누락·불량 값의 기본값. §2-1. */
+const DEFAULT_CACHE_STATE = 'none';
+const DEFAULT_CACHE_STATUS = 'no-reservation';
 
 /**
  * 진단 기록의 `entry.target` 해시 형식(`hashTarget` 결과, salt+SHA-256 앞 12 hex).
@@ -100,6 +118,94 @@ function finiteOrNull(value) {
  */
 function nonEmptyStringOrNull(value) {
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * 런타임 뷰 terminal의 캐시 표시 필드를 allowlist로 검증·정규화한다(§2-1).
+ *
+ * 알려진 enum·유한 timestamp·boolean만 복사하고, 누락·불량 값은
+ * `cacheState='none'`, `cacheStatus='no-reservation'`, `reservationNote=null`,
+ * 나머지 null, `indicatorOn=false`로 정규화한다. 알 수 없는 문자열(초안·제목·오류
+ * 원문 등)은 어떤 형태로도 추가 노출하지 않는다. 영속 budget이 `needsReview`면 실제
+ * 캐시 상태보다 사용자 확인 필요 표시를 우선해 `review`로 덮는다.
+ *
+ * @param {unknown} rawTerminal
+ * @param {boolean} needsReview
+ * @returns {{cacheState: string, cacheStatus: string, reservationNote: 'initial'|'safety-cutoff'|null, indicatorOn: boolean, dueAt: number|null, expiresAt: number|null, expiredAt: number|null, expireCause: string|null, blockedReason: string|null}}
+ */
+function cacheDisplayOf(rawTerminal, needsReview) {
+  const raw = isPlainObject(rawTerminal) ? /** @type {Record<string, unknown>} */ (rawTerminal) : {};
+  let cacheState = CACHE_STATE_SET.has(raw.cacheState) ? /** @type {string} */ (raw.cacheState) : DEFAULT_CACHE_STATE;
+  let cacheStatus = CACHE_STATUS_SET.has(raw.cacheStatus)
+    ? /** @type {string} */ (raw.cacheStatus)
+    : DEFAULT_CACHE_STATUS;
+  if (needsReview) {
+    // 영속 budget의 검토 필요 표시가 실제 캐시 상태보다 우선한다.
+    cacheState = 'review';
+    cacheStatus = 'review';
+  }
+  return {
+    cacheState,
+    cacheStatus,
+    reservationNote: RESERVATION_NOTE_SET.has(raw.reservationNote)
+      ? /** @type {'initial'|'safety-cutoff'} */ (raw.reservationNote)
+      : null,
+    indicatorOn: raw.indicatorOn === true,
+    dueAt: finiteOrNull(raw.dueAt),
+    expiresAt: finiteOrNull(raw.expiresAt),
+    expiredAt: finiteOrNull(raw.expiredAt),
+    expireCause: EXPIRE_CAUSE_REASON_SET.has(raw.expireCause) ? /** @type {string} */ (raw.expireCause) : null,
+    blockedReason: EXPIRE_CAUSE_REASON_SET.has(raw.blockedReason) ? /** @type {string} */ (raw.blockedReason) : null,
+  };
+}
+
+/**
+ * 상태 요약의 캐시 상태 문구(§2-2 합산 규칙·§2-7). 표시기 on(`indicatorOn=true`)인
+ * 터미널만 합산해 기호를 정하고 유지 중·만료·확인 필요 개수를 담는다. on 터미널이
+ * 없으면 캐시 문구를 만들지 않는다(설정만 켜짐과 실제 캐시 유지를 구분).
+ *
+ * @param {Array<object>} terminals 스냅숏 terminal 목록.
+ * @returns {string|null}
+ */
+function cacheSegmentText(terminals) {
+  const list = Array.isArray(terminals) ? terminals : [];
+  const on = list.filter((terminal) => isPlainObject(terminal) && terminal.indicatorOn === true);
+  if (on.length === 0) {
+    return null;
+  }
+  let kept = 0;
+  let expired = 0;
+  let review = 0;
+  for (const terminal of on) {
+    if (terminal.cacheState === 'kept') {
+      kept += 1;
+    }
+    if (terminal.cacheState === 'review') {
+      review += 1;
+    }
+    if (terminal.cacheStatus === 'expired') {
+      expired += 1;
+    }
+  }
+  // 우선순위: review > kept > none (§2-2). 만료는 기호 없이 개수로만 표시한다.
+  let state = 'none';
+  for (const candidate of TITLE_PREFIX_PRIORITY) {
+    if (candidate === 'review' && review > 0) {
+      state = 'review';
+      break;
+    }
+    if (candidate === 'kept' && kept > 0) {
+      state = 'kept';
+      break;
+    }
+    if (candidate === 'none') {
+      state = 'none';
+      break;
+    }
+  }
+  const symbol = TITLE_PREFIXES[state] ?? '';
+  const keptText = kept > 0 ? `유지 중 ${kept}` : '유지 중 아님';
+  return `${symbol}${keptText} · 만료 ${expired} · 확인 필요 ${review}`;
 }
 
 /**
@@ -161,8 +267,9 @@ function relativeFutureText(remainingMs) {
 }
 
 /**
- * 상태 알림의 워크트리 한 줄. 현재 워크트리는 `▶ `, 실제 켜짐은 `⚡ `를 앞에
- * 붙이고 다음 전송/확인 필요를 덧붙인다. 원시 worktreeId·경로는 넣지 않는다.
+ * 상태 알림의 워크트리 한 줄. 현재 워크트리는 `▶ `를 앞에 붙이고, 실제 캐시
+ * 상태 기호(⚡/💤/⚠️)와 유지 중·만료·확인 필요 개수, 다음 전송을 덧붙인다.
+ * 설정값(effectiveEnabled)만으로 ⚡를 붙이지 않는다. 원시 worktreeId·경로는 넣지 않는다.
  *
  * @param {object} worktree 스냅숏 worktree(`label`, `branch`, `enabled`, `effectiveEnabled`, `terminals`).
  * @param {{current: boolean, paused: boolean, defaultWorktreeEnabled: boolean, serverNow: number}} context
@@ -187,9 +294,6 @@ function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled,
   if (current) {
     head += '▶ ';
   }
-  if (displayOn) {
-    head += '⚡ ';
-  }
   head += displayLabel;
   if (displayOn && paused) {
     head += ' 켜짐(일시정지 중)';
@@ -201,7 +305,6 @@ function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled,
 
   const terminals = Array.isArray(wt.terminals) ? wt.terminals : [];
   let nextDueAt = null;
-  let reviewCount = 0;
   for (const terminal of terminals) {
     if (!isPlainObject(terminal)) {
       continue;
@@ -211,15 +314,15 @@ function statusWorktreeLine(worktree, { current, paused, defaultWorktreeEnabled,
     if (dueAt !== null && (nextDueAt === null || dueAt < nextDueAt)) {
       nextDueAt = dueAt;
     }
-    if (terminal.needsReview === true) {
-      reviewCount += 1;
-    }
+  }
+
+  // 캐시 상태는 설정값이 아니라 indicatorOn 터미널의 실제 상태로만 표시한다(§2-2).
+  const cacheSegment = cacheSegmentText(terminals);
+  if (cacheSegment !== null) {
+    parts.push(cacheSegment);
   }
   if (nextDueAt !== null) {
     parts.push(`다음 전송 ${relativeFutureText(nextDueAt - serverNow)}`);
-  }
-  if (reviewCount > 0) {
-    parts.push(`확인 필요 ${reviewCount}`);
   }
 
   return parts.join(' · ');
@@ -391,11 +494,12 @@ export function createDashboardModel({
   /**
    * 정책 사유를 저장소에서 읽는다. scope가 유효하지 않으면 generic 사유를 돌려준다.
    * @param {{userDataKey: string, profileId: string, worktreeId: string, paneKey?: string|null}} scope
+   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed: boolean, reason: string|null}}
    */
-  function policyOf(scope) {
+  function policyOf(scope, ttlMs) {
     try {
-      const result = store.isAllowedByPolicy(scope);
+      const result = store.isAllowedByPolicy(scope, { ttlMs: ttlMs ?? null });
       if (isPlainObject(result) && typeof result.allowed === 'boolean') {
         return { allowed: result.allowed, reason: nonEmptyStringOrNull(result.reason) };
       }
@@ -575,7 +679,7 @@ export function createDashboardModel({
           isPlainObject(override) && (override.worktree === true || override.worktree === false)
             ? override.worktree
             : null;
-        const gate = worktreeGate(timer, connection, policyOf(worktreeScope));
+        const gate = worktreeGate(timer, connection, policyOf(worktreeScope, timer.ttlMs));
 
         const terminals = [];
         const rawTerminals = Array.isArray(rawWorktree.terminals) ? rawWorktree.terminals : [];
@@ -600,7 +704,7 @@ export function createDashboardModel({
             unsupportedReason,
             timer,
             connection,
-            policyOf(terminalScope),
+            policyOf(terminalScope, timer.ttlMs),
             runtimeReason,
           );
 
@@ -612,6 +716,8 @@ export function createDashboardModel({
 
           const budget = store.getBudget(terminalScope);
           const title = nonEmptyStringOrNull(rawTerminal.title) ?? '(제목 없음)';
+          const needsReview = isPlainObject(budget) && budget.needsReview === true;
+          const cache = cacheDisplayOf(rawTerminal, needsReview);
 
           terminals.push({
             id: tmId,
@@ -620,11 +726,18 @@ export function createDashboardModel({
             enabledOverride,
             effectiveEnabled: terminalGateResult.effectiveEnabled,
             reason: terminalGateResult.reason,
-            dueAt: finiteOrNull(rawTerminal.dueAt),
-            expiresAt: finiteOrNull(rawTerminal.expiresAt),
+            cacheState: cache.cacheState,
+            cacheStatus: cache.cacheStatus,
+            reservationNote: cache.reservationNote,
+            indicatorOn: cache.indicatorOn,
+            dueAt: cache.dueAt,
+            expiresAt: cache.expiresAt,
+            expiredAt: cache.expiredAt,
+            expireCause: cache.expireCause,
+            blockedReason: cache.blockedReason,
             charged: isPlainObject(budget) && typeof budget.charged === 'number' ? budget.charged : 0,
             confirmed: isPlainObject(budget) && typeof budget.confirmed === 'number' ? budget.confirmed : 0,
-            needsReview: isPlainObject(budget) && budget.needsReview === true,
+            needsReview,
             supported,
           });
         }
@@ -651,6 +764,12 @@ export function createDashboardModel({
 
     const stored = store.snapshot();
     const config = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config : {};
+    const cap5m = finiteOrNull(config.maxConsecutiveKeepalives5m);
+    const cap1h = finiteOrNull(config.maxConsecutiveKeepalives1h);
+    const capActive = capFor(timer.ttlMs, {
+      maxConsecutiveKeepalives5m: cap5m ?? 0,
+      maxConsecutiveKeepalives1h: cap1h ?? 0,
+    });
 
     return {
       revision: isPlainObject(stored) && Number.isSafeInteger(stored.revision) ? stored.revision : 0,
@@ -665,7 +784,9 @@ export function createDashboardModel({
         margin1hMs: finiteOrNull(config.margin1hMs),
         quietOutputMs: finiteOrNull(config.quietOutputMs),
         observedInputQuietMs: finiteOrNull(config.observedInputQuietMs),
-        maxConsecutiveKeepalives: finiteOrNull(config.maxConsecutiveKeepalives),
+        maxConsecutiveKeepalives5m: cap5m,
+        maxConsecutiveKeepalives1h: cap1h,
+        maxConsecutiveKeepalivesActive: capActive,
         respectCwarmDisabled: config.respectCwarmDisabled === true,
         logLevel: typeof config.logLevel === 'string' ? config.logLevel : 'info',
         runtimeUserDataPath: typeof config.runtimeUserDataPath === 'string' ? config.runtimeUserDataPath : null,

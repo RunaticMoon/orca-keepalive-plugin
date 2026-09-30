@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_CONFIG,
   ValidationError,
+  capFor,
   parseConfig,
   parseConfigPatch,
 } from '../src/config.mjs';
@@ -35,7 +36,7 @@ function assertValidation(fn, code, field) {
 
 test('DEFAULT_CONFIG는 frozen이다', () => {
   assert.ok(Object.isFrozen(DEFAULT_CONFIG));
-  assert.equal(DEFAULT_CONFIG.schemaVersion, 1);
+  assert.equal(DEFAULT_CONFIG.schemaVersion, 2);
 });
 
 test('DEFAULT_CONFIG는 JSON round-trip 후 parseConfig와 동일하다', () => {
@@ -77,11 +78,16 @@ test('prototype pollution key를 거절한다', () => {
 // schemaVersion
 // ---------------------------------------------------------------------------
 
-test('schemaVersion 1만 허용한다', () => {
-  assert.equal(parseConfig({ schemaVersion: 1 }).schemaVersion, 1);
-  assertValidation(() => parseConfig({ schemaVersion: 2 }), 'unsupported_schema', 'schemaVersion');
-  assertValidation(() => parseConfig({ schemaVersion: '1' }), 'unsupported_schema', 'schemaVersion');
+test('schemaVersion 1(레거시)과 2만 허용한다(결과는 항상 2)', () => {
+  assert.equal(parseConfig({ schemaVersion: 1 }).schemaVersion, 2);
+  assert.equal(parseConfig({ schemaVersion: 2 }).schemaVersion, 2);
+  assertValidation(() => parseConfig({ schemaVersion: '2' }), 'unsupported_schema', 'schemaVersion');
   assertValidation(() => parseConfig({ schemaVersion: 0 }), 'unsupported_schema', 'schemaVersion');
+  assertValidation(() => parseConfig({ schemaVersion: 3 }), 'unsupported_schema', 'schemaVersion');
+});
+
+test('schemaVersion이 없으면 2로 간주한다', () => {
+  assert.equal(parseConfig({ paused: true }).schemaVersion, 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -120,17 +126,17 @@ for (const field of ['paused', 'defaultWorktreeEnabled', 'respectCwarmDisabled',
   });
 }
 
-test('tabTitleIndicator: 기본값은 false(실험 옵션)', () => {
-  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, false);
-  assert.equal(parseConfig({}).tabTitleIndicator, false);
+test('tabTitleIndicator: 기본값은 true', () => {
+  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, true);
+  assert.equal(parseConfig({}).tabTitleIndicator, true);
   assert.equal(parseConfig({ tabTitleIndicator: true }).tabTitleIndicator, true);
   assert.equal(parseConfig({ tabTitleIndicator: false }).tabTitleIndicator, false);
 });
 
 test('patch: tabTitleIndicator를 patch할 수 있다', () => {
-  const merged = parseConfigPatch({ tabTitleIndicator: true }, DEFAULT_CONFIG);
-  assert.equal(merged.tabTitleIndicator, true);
-  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, false, 'patch는 원본을 변경하지 않는다');
+  const merged = parseConfigPatch({ tabTitleIndicator: false }, DEFAULT_CONFIG);
+  assert.equal(merged.tabTitleIndicator, false);
+  assert.equal(DEFAULT_CONFIG.tabTitleIndicator, true, 'patch는 원본을 변경하지 않는다');
   assertValidation(() => parseConfigPatch({ tabTitleIndicator: 'yes' }, DEFAULT_CONFIG), 'invalid_type', 'tabTitleIndicator');
   assertValidation(() => parseConfigPatch({ tabTitleIndicator: 1 }, DEFAULT_CONFIG), 'invalid_type', 'tabTitleIndicator');
 });
@@ -144,7 +150,8 @@ const integerCases = [
   ['margin1hMs', 60000, 600000],
   ['quietOutputMs', 2500, 60000],
   ['observedInputQuietMs', 10000, 300000],
-  ['maxConsecutiveKeepalives', 0, 1000],
+  ['maxConsecutiveKeepalives5m', 0, 1000],
+  ['maxConsecutiveKeepalives1h', 0, 1000],
 ];
 
 for (const [field, min, max] of integerCases) {
@@ -224,7 +231,7 @@ test('patch: 일부 key만 병합하고 원본/입력은 불변', () => {
   assert.equal(merged.paused, true);
   assert.equal(merged.margin5mMs, 45000);
   assert.equal(merged.message, DEFAULT_CONFIG.message);
-  assert.equal(merged.schemaVersion, 1);
+  assert.equal(merged.schemaVersion, 2);
   // 원본/입력 불변
   assert.equal(current.paused, false);
   assert.equal(DEFAULT_CONFIG.paused, false);
@@ -236,9 +243,10 @@ test('patch: unknown key 거절', () => {
   assertValidation(() => parseConfigPatch({ bogus: 1 }, DEFAULT_CONFIG), 'unknown_field', 'bogus');
 });
 
-test('patch: schemaVersion은 1로 변경 불가', () => {
-  assert.equal(parseConfigPatch({ schemaVersion: 1 }, DEFAULT_CONFIG).schemaVersion, 1);
-  assertValidation(() => parseConfigPatch({ schemaVersion: 2 }, DEFAULT_CONFIG), 'unsupported_schema', 'schemaVersion');
+test('patch: schemaVersion은 2만 허용', () => {
+  assert.equal(parseConfigPatch({ schemaVersion: 2 }, DEFAULT_CONFIG).schemaVersion, 2);
+  assertValidation(() => parseConfigPatch({ schemaVersion: 1 }, DEFAULT_CONFIG), 'unsupported_schema', 'schemaVersion');
+  assertValidation(() => parseConfigPatch({ schemaVersion: 3 }, DEFAULT_CONFIG), 'unsupported_schema', 'schemaVersion');
 });
 
 test('patch: 필드가 잘못되면 거절', () => {
@@ -253,6 +261,145 @@ test('patch: prototype pollution key 거절', () => {
     'unknown_field',
     '__proto__',
   );
+});
+
+// ---------------------------------------------------------------------------
+// v1 → v2 마이그레이션
+// ---------------------------------------------------------------------------
+
+test('마이그레이션: 레거시 3(옛 기본값)은 버리고 새 기본값을 쓴다', () => {
+  const migrated = parseConfig({ schemaVersion: 1, maxConsecutiveKeepalives: 3 });
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.maxConsecutiveKeepalives5m, 8);
+  assert.equal(migrated.maxConsecutiveKeepalives1h, 3);
+  assert.equal('maxConsecutiveKeepalives' in migrated, false);
+});
+
+test('마이그레이션: 레거시 5는 새 키 두 개에 적용된다', () => {
+  const migrated = parseConfig({ schemaVersion: 1, maxConsecutiveKeepalives: 5 });
+  assert.equal(migrated.maxConsecutiveKeepalives5m, 5);
+  assert.equal(migrated.maxConsecutiveKeepalives1h, 5);
+  assert.equal('maxConsecutiveKeepalives' in migrated, false);
+});
+
+test('마이그레이션: 레거시 키가 없으면 새 기본값', () => {
+  const migrated = parseConfig({ schemaVersion: 1 });
+  assert.equal(migrated.maxConsecutiveKeepalives5m, 8);
+  assert.equal(migrated.maxConsecutiveKeepalives1h, 3);
+});
+
+test('마이그레이션: tabTitleIndicator false도 true로 강제한다', () => {
+  assert.equal(parseConfig({ schemaVersion: 1, tabTitleIndicator: false }).tabTitleIndicator, true);
+  assert.equal(parseConfig({ schemaVersion: 1 }).tabTitleIndicator, true);
+});
+
+test('마이그레이션: 레거시 키가 잘못되면 거절한다', () => {
+  assertValidation(
+    () => parseConfig({ schemaVersion: 1, maxConsecutiveKeepalives: 1001 }),
+    'out_of_range',
+    'maxConsecutiveKeepalives',
+  );
+  assertValidation(
+    () => parseConfig({ schemaVersion: 1, maxConsecutiveKeepalives: '3' }),
+    'invalid_type',
+    'maxConsecutiveKeepalives',
+  );
+});
+
+test('마이그레이션: v1 입력의 다른 unknown key는 거절한다', () => {
+  assertValidation(
+    () => parseConfig({ schemaVersion: 1, bogus: 1 }),
+    'unknown_field',
+    'bogus',
+  );
+});
+
+test('v2 입력에 레거시 키가 있으면 unknown_field로 거부한다', () => {
+  assertValidation(
+    () => parseConfig({ schemaVersion: 2, maxConsecutiveKeepalives: 3 }),
+    'unknown_field',
+    'maxConsecutiveKeepalives',
+  );
+  // schemaVersion 없음(2로 간주)이어도 레거시는 거부.
+  assertValidation(
+    () => parseConfig({ maxConsecutiveKeepalives: 3 }),
+    'unknown_field',
+    'maxConsecutiveKeepalives',
+  );
+});
+
+test('patch: 레거시 키는 새 키 두 개에 매핑된다(새 키가 있으면 우선)', () => {
+  const both = parseConfigPatch({ maxConsecutiveKeepalives: 4 }, DEFAULT_CONFIG);
+  assert.equal(both.maxConsecutiveKeepalives5m, 4);
+  assert.equal(both.maxConsecutiveKeepalives1h, 4);
+
+  const precedence = parseConfigPatch(
+    { maxConsecutiveKeepalives: 4, maxConsecutiveKeepalives5m: 9 },
+    DEFAULT_CONFIG,
+  );
+  assert.equal(precedence.maxConsecutiveKeepalives5m, 9);
+  assert.equal(precedence.maxConsecutiveKeepalives1h, 4);
+
+  assertValidation(
+    () => parseConfigPatch({ maxConsecutiveKeepalives: -1 }, DEFAULT_CONFIG),
+    'out_of_range',
+    'maxConsecutiveKeepalives',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// parseConfigPatch + v1 current (tabTitleIndicator 강제 금지)
+// ---------------------------------------------------------------------------
+
+test('patch: current가 v1이면 tabTitleIndicator를 강제로 켜지 않고 유지한다', () => {
+  const v1Current = { schemaVersion: 1, tabTitleIndicator: false, maxConsecutiveKeepalives: 2 };
+  const merged = parseConfigPatch({ paused: true }, v1Current);
+
+  assert.equal(merged.schemaVersion, 2);
+  assert.equal(merged.paused, true);
+  assert.equal(merged.tabTitleIndicator, false, 'patch 경로는 current의 false를 유지한다');
+  // 마이그레이션 자체(레거시 키 분배)는 그대로 일어난다.
+  assert.equal(merged.maxConsecutiveKeepalives5m, 2);
+  assert.equal(merged.maxConsecutiveKeepalives1h, 2);
+  // 로드(parseConfig) 경로는 여전히 true로 강제한다.
+  assert.equal(parseConfig(v1Current).tabTitleIndicator, true);
+});
+
+test('patch: current가 v1이고 tabTitleIndicator가 없으면 기본값 true', () => {
+  const merged = parseConfigPatch({ paused: true }, { schemaVersion: 1 });
+  assert.equal(merged.tabTitleIndicator, true);
+});
+
+test('patch: current가 v1이어도 patch의 tabTitleIndicator가 우선한다', () => {
+  const merged = parseConfigPatch(
+    { tabTitleIndicator: true },
+    { schemaVersion: 1, tabTitleIndicator: false },
+  );
+  assert.equal(merged.tabTitleIndicator, true);
+});
+
+// ---------------------------------------------------------------------------
+// capFor
+// ---------------------------------------------------------------------------
+
+test('capFor: TTL 5분이면 maxConsecutiveKeepalives5m', () => {
+  assert.equal(capFor(300000, { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 }), 8);
+});
+
+test('capFor: TTL 1시간이면 maxConsecutiveKeepalives1h', () => {
+  assert.equal(capFor(3600000, { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 }), 3);
+});
+
+test('capFor: TTL 미상이면 두 값 중 더 작은(보수적) 값', () => {
+  assert.equal(capFor(null, { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 }), 3);
+  assert.equal(capFor(undefined, { maxConsecutiveKeepalives5m: 2, maxConsecutiveKeepalives1h: 9 }), 2);
+  assert.equal(capFor(12345, { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 }), 3);
+});
+
+test('capFor: 0은 무제한으로 보아 min 계산에서 제외된다', () => {
+  assert.equal(capFor(null, { maxConsecutiveKeepalives5m: 0, maxConsecutiveKeepalives1h: 5 }), 5);
+  assert.equal(capFor(null, { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 0 }), 8);
+  assert.equal(capFor(null, { maxConsecutiveKeepalives5m: 0, maxConsecutiveKeepalives1h: 0 }), 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -374,6 +521,7 @@ test('contracts enum 목록이 기대값과 일치한다', () => {
     minSendSpacingMs: 2000,
     clockGapMs: 10000,
     clockSkewMs: 5000,
+    basisMaxGapMs: 180000,
   });
   assert.deepEqual(contracts.DIAGNOSTIC_EVENTS, [
     'bootstrap_started',

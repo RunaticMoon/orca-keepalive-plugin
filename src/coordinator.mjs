@@ -12,7 +12,10 @@
  * @module coordinator
  */
 
-import { REASON_CODES, TIMING } from './contracts.mjs'
+import { REASON_CODES, TIMING, CACHE_HISTORY_RETENTION_MS } from './contracts.mjs'
+import { reduceCacheHistory, normalizeBlockReason } from './cache-history.mjs'
+import { projectCacheStatus } from './cache-status.mjs'
+import { capFor } from './config.mjs'
 import { sameBinding } from './runtime-location.mjs'
 import { marginFor } from './scheduler.mjs'
 import { repoIdFromWorktreeId } from './terminal-observer.mjs'
@@ -41,6 +44,8 @@ const UNRESOLVED_DEDUPE_MS = 60000
 const UNRESOLVED_DEDUPE_MAX = 256
 /** epoch 메모리로 저장/복원하는 예약의 최대 수명(ms). 허용 최대 TTL인 1시간과 같다. */
 const EPOCH_MEMORY_MAX_AGE_MS = 3600000
+/** epoch 메모리 prune 주기(ms). tick마다 호출하지 않고 이 간격 이상 지났을 때만 부른다. */
+const EPOCH_MEMORY_PRUNE_INTERVAL_MS = 3600000
 
 /**
  * @typedef {Object} RuntimeConnection
@@ -53,10 +58,17 @@ const EPOCH_MEMORY_MAX_AGE_MS = 3600000
  * @property {string|null} title
  * @property {string} phase
  * @property {string|null} reason
- * @property {number|null} dueAt
- * @property {number|null} expiresAt
+ * @property {number|null} dueAt 실행 가능한 예약이 있을 때만 값이 있다(§2-1). 이력 복원만으로는 만들지 않는다.
+ * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약이 취소돼도 이력이 있으면 유지한다.
  * @property {boolean} supported
  * @property {string|null} unsupportedReason
+ * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태(§2-1).
+ * @property {string} cacheStatus 표시용 상태(§2-1 표).
+ * @property {'initial'|'safety-cutoff'|null} reservationNote cacheStatus='no-reservation' 문구 구분(§2-1). 초기 관측 부재면 'initial', 10초 조기 EXPIRE 구간이면 'safety-cutoff', 그 밖은 null.
+ * @property {boolean} indicatorOn 탭 표시용 활성 조건(§2-2). 전송 허용 필드로 사용하지 않는다.
+ * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). 그 전에는 null.
+ * @property {string|null} expireCause 만료된 epoch의 마지막 차단 reason 또는 null.
+ * @property {string|null} blockedReason 현재 이력의 마지막 차단 reason 또는 null.
  *
  * @typedef {Object} RuntimeWorktreeView
  * @property {string} worktreeId
@@ -83,6 +95,7 @@ const EPOCH_MEMORY_MAX_AGE_MS = 3600000
  * @property {(payload: unknown) => void} onReviewCleared
  * @property {() => void} onPolicyChanged
  * @property {() => any} getRpc
+ * @property {(key:string) => import('./contracts.mjs').CacheHistory|null} __debugCacheHistory 테스트 전용 내부 조회.
  */
 
 /**
@@ -91,6 +104,14 @@ const EPOCH_MEMORY_MAX_AGE_MS = 3600000
  */
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value)
 }
 
 /**
@@ -216,13 +237,19 @@ export function createCoordinator({
   let rpc = null
   /** @type {object|null} */
   let observer = null
-  /** @type {object|null} 탭 제목 표시기(실험 옵션). rpc 준비 후 1회 생성한다. */
+  /** @type {object|null} 탭 제목 표시기. rpc 준비 후 1회 생성한다. */
   let titleIndicator = null
   let titleIndicatorCreated = false
   /** updateTitleIndicator 호출 순번. 늦게 끝난 이전 호출의 reconcile을 버린다. */
   let titleIndicatorSeq = 0
   /** 마지막 catalog 조회 실패 여부. policy 변경 시에도 보수적 reconciliation을 유지한다. */
   let titleIndicatorCatalogFailed = true
+  /**
+   * 마지막 reconcile이 확인한 cwarm.disabled 결과. getRuntimeView의 indicatorOn이
+   * 동기적으로 같은 gate를 쓰도록 캐시한다(§2-2).
+   * @type {boolean}
+   */
+  let cwarmBlockedCache = false
   /** @type {object|null} */
   let latestCatalog = null
   /** 마지막 catalog가 complete가 아니면 true. true인 동안 새 전송을 시작하지 않는다. */
@@ -238,14 +265,19 @@ export function createCoordinator({
   let connection = { state: 'starting', reason: null }
 
   /**
-   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason} }
-   * @type {Map<string, {state:any, decision:any, meta:any}>}
+   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason}, cacheHistory: CacheHistory|null, observed: boolean, expiredBy: 'cutoff'|'clock-gap'|null }
+   * cacheHistory는 표시 전용 관측 이력(§2-3)이다. scheduler의 epoch와 독립이며
+   * 영속 저장·복원·제목 출력은 다른 작업(I/J)이 담당한다.
+   * observed는 이번 플러그인 실행에서 이 target이 초기(UNKNOWN) 상태를 벗어나는
+   * 입력을 한 번이라도 적용받았는지다(§2-1 reservationNote 'initial' 판정).
+   * expiredBy는 phase가 EXPIRED일 때 마지막 만료를 만든 원인이다. 10초 조기
+   * EXPIRE면 'cutoff', CLOCK_GAP이면 'clock-gap', 그 밖은 null이며 phase가
+   * EXPIRED를 벗어나면 null로 되돌린다.
+   * @type {Map<string, {state:any, decision:any, meta:any, cacheHistory:any, observed:boolean, expiredBy:'cutoff'|'clock-gap'|null}>}
    */
   const targets = new Map()
   /** key → 다음 시도 허용 시각(skipped 후 최소 tickMs 대기). @type {Map<string, number>} */
   const skipUntil = new Map()
-  /** 실제(사람/기타) 턴의 working을 관측한 target key. 그 done에서 탭 제목을 새로 고친다. @type {Set<string>} */
-  const pendingRealTurn = new Set()
   /** `${targetId ?? ''}\u0000${code}` → 마지막 event_unresolved 기록 시각(clock.now). @type {Map<string, number>} */
   const unresolvedRecordedAt = new Map()
 
@@ -282,6 +314,8 @@ export function createCoordinator({
 
   /** @type {Promise<unknown>} */
   let chain = Promise.resolve()
+  /** 마지막 epochMemory.prune 호출 시각(clock.now). 한 번도 부르지 않았으면 null. */
+  let lastEpochPruneAt = null
 
   // -------------------------------------------------------------------------
   // 직렬 실행 큐
@@ -308,6 +342,8 @@ export function createCoordinator({
 
   /**
    * targets Map의 최신 state에 reduce를 적용한다(클로저에 잡힌 옛 state 금지).
+   * 적용 전 state(before)와 적용 후(after)를 비교해 표시 전용 cacheHistory도
+   * 같은 지점에서 갱신한다(§2-3). epoch를 지운 뒤 시각을 찾지 않는다.
    * 적용 뒤 RuntimeView용 decision을 갱신한다. config를 넘기면 그 값으로,
    * 생략하면 refreshDecision이 그 시점의 store config를 읽는다.
    * @param {string} key
@@ -320,22 +356,354 @@ export function createCoordinator({
     if (!entry) {
       return null
     }
+    const before = entry.state
     entry.state = scheduler.reduceTarget(entry.state, input)
+    // 초기 상태를 벗어나는 입력(관측·복원·검토 해제·handle 변경 등)을 한 번이라도
+    // 적용받으면 observed=true가 된다. TICK은 상태를 바꾸지 않을 수 있으므로 제외한다.
+    const type = isObject(input) ? input.type : null
+    if (type !== 'TICK') {
+      entry.observed = true
+    }
+    // phase가 EXPIRED일 때만 마지막 만료 원인을 기록하고, 벗어나면 지운다(§2-1).
+    if (entry.state.phase === 'EXPIRED') {
+      if (type === 'EXPIRE') {
+        entry.expiredBy = 'cutoff'
+      } else if (type === 'CLOCK_GAP') {
+        entry.expiredBy = 'clock-gap'
+      }
+    } else {
+      entry.expiredBy = null
+    }
+    updateCacheHistory(key, before, entry.state, input)
     syncEpochMemory(key, entry.state)
     refreshDecision(key, config)
     return entry.state
   }
 
   /**
+   * 현재 설정에서 알 수 있는 TTL(ms). known이고 ttlMs가 유한수일 때만 값이 있다.
+   * 캐시 이력의 예상 만료 시각 계산에 쓴다(decide와 같은 설정을 본다).
+   * @returns {number|null}
+   */
+  function currentTtlMs() {
+    if (!isObject(lastSettings) || lastSettings.known !== true) {
+      return null
+    }
+    const ttlMs = lastSettings.ttlMs
+    return typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : null
+  }
+
+  /**
+   * 이력을 바꾸지 않는 reason(만료 자체·관측 부재·단순 대기)은 호출하지 않는다.
+   * 허용 목록 밖 reason은 reduceCacheHistory의 BLOCK이 정규화로 걸러낸다.
+   * @param {unknown} reason
+   * @returns {boolean}
+   */
+  function isRecordableBlockReason(reason) {
+    return (
+      typeof reason === 'string' &&
+      reason.length > 0 &&
+      reason !== 'EXPIRED' &&
+      reason !== 'NO_FRESH_TURN'
+    )
+  }
+
+  /**
+   * 현재 이력의 같은 epoch에 차단 reason을 기록한다. epochId가 이력과 다르면
+   * (새 턴 뒤 도착한 옛 결과 등) 무시한다. reduceBlock이 만료 전 여부·중복
+   * reason·허용 목록을 한 번 더 검증한다.
+   * @param {string} key
+   * @param {string} reason
+   * @param {number|null} epochId
+   * @param {number} at
+   * @returns {void}
+   */
+  function recordBlockReason(key, reason, epochId, at) {
+    const entry = targets.get(key)
+    if (!entry || !isRecordableBlockReason(reason)) {
+      return
+    }
+    const cur = entry.cacheHistory
+    if (cur === null || cur.epochId !== epochId) {
+      return
+    }
+    const next = reduceCacheHistory(cur, { type: 'BLOCK', epochId, reason, at })
+    if (next !== cur) {
+      entry.cacheHistory = next
+      // 이력만 바뀐 경우에도 저장이 갱신되게 한다(applyReduce 밖에서 호출된다).
+      syncEpochMemory(key, entry.state)
+    }
+  }
+
+  /**
+   * 실행 중 tick에서 모든 target의 이력에 현재 시각을 반영한다(§2-3). 실제
+   * expiresAt을 지나면 expiredAt을 확정하고, 만료 후 24시간이 지나면 지운다.
+   * scheduler의 10초 조기 EXPIRE 동작과는 무관하다(만료 시각은 expiresAt 기준).
+   * @param {number} now
+   * @returns {void}
+   */
+  function advanceCacheHistories(now) {
+    for (const [key, entry] of targets) {
+      const cur = entry.cacheHistory
+      if (cur === null) {
+        continue
+      }
+      const next = reduceCacheHistory(cur, { type: 'ADVANCE', now })
+      if (next !== cur) {
+        entry.cacheHistory = next
+        // 만료 확정/24시간 삭제도 저장에 반영한다(applyReduce 밖에서 실행된다).
+        syncEpochMemory(key, entry.state)
+      }
+    }
+  }
+
+  /**
+   * applyReduce의 before/after를 비교해 cacheHistory를 갱신한다(§2-3).
+   *
+   * - 새 턴이 인정되면(실제 working의 budgetResetSeq 증가, TURN_CONFIRMED/자체 턴
+   *   working의 selfTurnSeq 증가) CLEAR한다.
+   * - TARGET_CHANGED는 ptyId가 바뀐 경우에만 CLEAR한다. handle/incarnation만 바뀌면
+   *   이력을 보존한다(예약 무효화는 scheduler가 그대로 처리한다).
+   * - POLICY_INVALIDATED는 폐기 전 epochId로 폐기 시점 reason을 BLOCK으로 남긴다.
+   * - 그 밖에는 after.epoch를 기준으로 OPEN/RETIME한다. epoch가 지워져도 이력은
+   *   지우지 않는다. TTL을 모르면 OPEN을 보류하고, 알게 된 뒤 다음 적용에서
+   *   OPEN(이력 없음/다른 epoch) 또는 RETIME(같은 epoch의 TTL 변경)한다.
+   *
+   * @param {string} key
+   * @param {any} before 적용 전 scheduler state.
+   * @param {any} after 적용 후 scheduler state.
+   * @param {any} input scheduler reduce 입력.
+   * @returns {void}
+   */
+  function updateCacheHistory(key, before, after, input) {
+    const entry = targets.get(key)
+    if (!entry) {
+      return
+    }
+    const cur = entry.cacheHistory
+    let next = cur
+    const type = isObject(input) ? input.type : null
+
+    if (
+      after.budgetResetSeq > before.budgetResetSeq ||
+      after.selfTurnSeq > before.selfTurnSeq
+    ) {
+      // 실제 새 턴 또는 자체 keepalive 턴 시작: 옛 이력을 삭제한다.
+      next = null
+    } else if (type === 'TARGET_CHANGED') {
+      const prevPty = isObject(before.target) ? before.target.ptyId : null
+      const nextPty = isObject(after.target) ? after.target.ptyId : null
+      if (prevPty !== nextPty) {
+        next = null
+      }
+    } else if (type === 'POLICY_INVALIDATED') {
+      if (cur !== null && isObject(before.epoch) && cur.epochId === before.epoch.id) {
+        const reason = isObject(input) ? input.reason : null
+        if (isRecordableBlockReason(reason)) {
+          next = reduceCacheHistory(cur, {
+            type: 'BLOCK',
+            epochId: before.epoch.id,
+            reason,
+            at: clock.now(),
+          })
+        }
+      }
+    } else {
+      const epoch = after.epoch
+      const ttlMs = currentTtlMs()
+      if (isObject(epoch) && ttlMs !== null) {
+        const basisAt =
+          typeof epoch.basisAt === 'number' && Number.isFinite(epoch.basisAt)
+            ? epoch.basisAt
+            : epoch.doneAt
+        const expiresAt = basisAt + ttlMs
+        if (next === null || next.epochId !== epoch.id) {
+          next = reduceCacheHistory(next, {
+            type: 'OPEN',
+            epochId: epoch.id,
+            doneAt: epoch.doneAt,
+            basisAt,
+            expiresAt,
+          })
+        } else if (next.expiredAt === null && next.expiresAt !== expiresAt) {
+          next = reduceCacheHistory(next, {
+            type: 'RETIME',
+            epochId: epoch.id,
+            expiresAt,
+          })
+        }
+      }
+    }
+
+    if (next !== cur) {
+      entry.cacheHistory = next
+    }
+  }
+
+  /**
+   * target에서 epoch-memory가 요구하는 식별자 필드를 뽑는다. 하나라도 비어 있지 않은
+   * 문자열이 아니면 null을 돌려준다(incarnationId는 null 허용).
+   * @param {any} target
+   * @returns {{userDataKey:string,profileId:string,worktreeId:string,paneKey:string,ptyId:string,incarnationId:string|null}|null}
+   */
+  function identityFromTarget(target) {
+    if (!isObject(target)) {
+      return null
+    }
+    /** @type {Record<string, string>} */
+    const out = {}
+    for (const field of ['userDataKey', 'profileId', 'worktreeId', 'paneKey', 'ptyId']) {
+      const value = target[field]
+      if (typeof value !== 'string' || value.length === 0) {
+        return null
+      }
+      out[field] = value
+    }
+    const inc = target.incarnationId
+    if (inc === null || inc === undefined) {
+      out.incarnationId = /** @type {any} */ (null)
+    } else if (typeof inc === 'string' && inc.length > 0) {
+      out.incarnationId = inc
+    } else {
+      return null
+    }
+    return /** @type {any} */ (out)
+  }
+
+  /**
+   * cacheHistory를 표시 전용 저장 레코드(kind='history')로 변환한다. epoch-memory의
+   * v2 검증(history는 expiresAt 필수, expiresAt > doneAt, expiredAt===expiresAt)을
+   * 통과하지 못하면 null을 돌려준다.
+   * @param {any} target
+   * @param {any} history
+   * @returns {object|null}
+   */
+  function historyRecordFrom(target, history) {
+    const identity = identityFromTarget(target)
+    if (identity === null || !isObject(history)) {
+      return null
+    }
+    if (!isFiniteNumber(history.doneAt) || !isFiniteNumber(history.expiresAt)) {
+      return null
+    }
+    if (history.expiresAt <= history.doneAt) {
+      return null
+    }
+    let expiredAt = null
+    if (history.expiredAt !== null && history.expiredAt !== undefined) {
+      if (history.expiredAt !== history.expiresAt) {
+        return null
+      }
+      expiredAt = history.expiresAt
+    }
+    return {
+      kind: 'history',
+      ...identity,
+      doneAt: history.doneAt,
+      basisAt: isFiniteNumber(history.basisAt) ? history.basisAt : history.doneAt,
+      expiresAt: history.expiresAt,
+      lastBlockReason: normalizeBlockReason(history.lastBlockReason),
+      expiredAt,
+    }
+  }
+
+  /**
+   * ARMED 예약을 저장 레코드(kind='armed')로 변환한다. 같은 epoch의 cacheHistory가
+   * 있으면 그 expiresAt·lastBlockReason을 함께 저장해 재시작 뒤 표시까지 복원한다.
+   * TTL을 몰라 이력이 없으면 expiresAt=null로 저장한다(epoch-memory는 armed의
+   * expiresAt null을 허용한다).
+   * @param {any} target
+   * @param {any} epoch
+   * @param {any} history
+   * @returns {object|null}
+   */
+  function armedRecordFrom(target, epoch, history) {
+    const identity = identityFromTarget(target)
+    if (identity === null || !isObject(epoch) || !isFiniteNumber(epoch.doneAt)) {
+      return null
+    }
+    let basisAt = isFiniteNumber(epoch.basisAt) ? epoch.basisAt : epoch.doneAt
+    if (basisAt > epoch.doneAt) {
+      basisAt = epoch.doneAt
+    }
+    let expiresAt = null
+    let lastBlockReason = null
+    if (
+      isObject(history) &&
+      history.epochId === epoch.id &&
+      (history.expiredAt === null || history.expiredAt === undefined) &&
+      isFiniteNumber(history.expiresAt) &&
+      history.expiresAt > epoch.doneAt
+    ) {
+      basisAt = isFiniteNumber(history.basisAt) ? history.basisAt : basisAt
+      if (basisAt > epoch.doneAt) {
+        basisAt = epoch.doneAt
+      }
+      expiresAt = history.expiresAt
+      lastBlockReason = normalizeBlockReason(history.lastBlockReason)
+    }
+    return {
+      kind: 'armed',
+      ...identity,
+      doneAt: epoch.doneAt,
+      basisAt,
+      expiresAt,
+      lastBlockReason,
+      expiredAt: null,
+    }
+  }
+
+  /**
+   * 저장 레코드에서 표시 이력을 만든다(cache-history RESTORE). 불량 입력은 null.
+   * @param {any} record
+   * @returns {import('./contracts.mjs').CacheHistory|null}
+   */
+  function historyFromRecord(record) {
+    return reduceCacheHistory(null, {
+      type: 'RESTORE',
+      record: {
+        doneAt: record.doneAt,
+        basisAt: record.basisAt,
+        expiresAt: record.expiresAt,
+        lastBlockReason: record.lastBlockReason,
+        expiredAt: record.expiredAt ?? null,
+      },
+    })
+  }
+
+  /**
+   * 표시 이력만 되살린다(예약은 만들지 않는다, §2-5). RESTORE_CACHE_HISTORY를 적용해
+   * phase를 EXPIRED/SUSPENDED로 세우고, entry.cacheHistory를 먼저 채워 applyReduce의
+   * sync가 그대로 저장하게 한다.
+   * @param {string} key
+   * @param {import('./contracts.mjs').CacheHistory|null} history
+   * @param {boolean} expired
+   * @returns {void}
+   */
+  function restoreCacheHistoryDisplay(key, history, expired) {
+    const entry = targets.get(key)
+    if (!entry || history === null) {
+      return
+    }
+    entry.cacheHistory = history
+    applyReduce(key, {
+      type: 'RESTORE_CACHE_HISTORY',
+      expired,
+      reason:
+        typeof history.lastBlockReason === 'string' ? history.lastBlockReason : undefined,
+    })
+  }
+
+  /**
    * epoch 메모리 연동(선택). 렐로드 대비 규칙:
-   * - ARMED이고 epoch가 아직 attempted=false이며 target 식별자가 유효하면
-   *   현재 예약을 remember한다. userDataKey/profileId/worktreeId/paneKey/ptyId는
-   *   비어 있지 않은 문자열이어야 하고, incarnationId는 비어 있지 않은 문자열 또는
-   *   null을 허용한다(epoch-memory 계약).
-   * - 복원(restoreEpochMemory)은 userDataKey/profileId/ptyId가 같으면 되고,
-   *   incarnationId가 바뀌어도(Orca 재시작) 허용한다. 복원되면 이 함수가 새
-   *   incarnationId로 다시 remember한다.
-   * - 그 밖의 모든 phase는 forget한다(없는 key는 no-op).
+   * - ARMED이고 epoch가 아직 attempted=false이며 target 식별자가 유효하면 현재
+   *   예약을 kind='armed'로 remember한다. 같은 epoch의 cacheHistory가 있으면 그
+   *   expiresAt·lastBlockReason도 함께 저장한다.
+   * - ARMED가 아니더라도 cacheHistory가 있으면 kind='history'로 저장한다(표시 전용,
+   *   어떤 경우에도 전송 예약으로 복원하지 않는다).
+   * - 이력도 유효한 ARMED도 없으면 forget한다.
+   * - 이력만 바뀐 경우(BLOCK·ADVANCE·24시간 삭제)에도 호출되며, 같은 내용이면
+   *   epoch-memory가 persist를 생략한다.
    * epochMemory가 null이면 모두 생략하고, 어떤 예외도 밖으로 내보내지 않는다.
    * @param {string} key
    * @param {any} state
@@ -346,29 +714,20 @@ export function createCoordinator({
       return
     }
     try {
-      if (state.phase === 'ARMED' && state.epoch !== null && state.epoch.attempted === false) {
-        const target = state.target
-        const record = {
-          userDataKey: target.userDataKey,
-          profileId: target.profileId,
-          worktreeId: target.worktreeId,
-          paneKey: target.paneKey,
-          ptyId: target.ptyId,
-          incarnationId: target.incarnationId,
-          doneAt: state.epoch.doneAt,
-        }
-        const hasIdentifiers =
-          typeof record.userDataKey === 'string' && record.userDataKey.length > 0 &&
-          typeof record.profileId === 'string' && record.profileId.length > 0 &&
-          typeof record.worktreeId === 'string' && record.worktreeId.length > 0 &&
-          typeof record.paneKey === 'string' && record.paneKey.length > 0 &&
-          typeof record.ptyId === 'string' && record.ptyId.length > 0 &&
-          (record.incarnationId === null ||
-            (typeof record.incarnationId === 'string' && record.incarnationId.length > 0))
-        if (hasIdentifiers && typeof record.doneAt === 'number' && Number.isFinite(record.doneAt)) {
-          epochMemory.remember(key, record)
+      const entry = targets.get(key)
+      const history = entry ? entry.cacheHistory : null
+      const target = isObject(state) ? state.target : null
+      if (isObject(state) && state.phase === 'ARMED' && isObject(state.epoch) && state.epoch.attempted === false) {
+        const armed = armedRecordFrom(target, state.epoch, history)
+        if (armed !== null) {
+          epochMemory.remember(key, armed)
           return
         }
+      }
+      const historyRecord = historyRecordFrom(target, history)
+      if (historyRecord !== null) {
+        epochMemory.remember(key, historyRecord)
+        return
       }
       epochMemory.forget(key)
     } catch {
@@ -377,12 +736,18 @@ export function createCoordinator({
   }
 
   /**
-   * 새로 만든 target에 대해 저장된 예약을 복원한다(선택). userDataKey/profileId/ptyId가
-   * 일치하고 1시간 이내의 doneAt이며 scope에 검토 필요/열린 attempt가 없으면
-   * RESTORE_EPOCH를 적용하고, ARMED가 되면 진단을 남긴다. ptyId가 같으면
-   * incarnationId가 바뀌어도(Orca 재시작) 복원한다. 전송 직전 안전 검사(에이전트
-   * 식별·idle·초안·조용한 시간)는 그대로 적용된다. 조건이 맞지 않으면 저장된 항목을
-   * 정리한다.
+   * 새로 만든 target에 대해 저장된 예약/이력을 복원한다(선택, §2-5).
+   * - userDataKey/profileId/worktreeId/paneKey/ptyId가 일치해야 한다(incarnationId
+   *   변경은 Orca 재시작으로 보고 허용).
+   * - kind='armed'이고 신선도(1시간)·budgetBlocksRestore를 통과하고 expiresAt이
+   *   아직 지나지 않았으면 RESTORE_EPOCH로 예약을 되살리고 이력도 함께 복원한다.
+   * - kind='armed'인데 expiresAt이 이미 지났으면(오프라인 만료) 예약을 버리고
+   *   expiredAt=expiresAt인 이력으로 낮춰 표시한다(전송 0건).
+   * - kind='history'는 표시 이력만 복원하고 절대 RESTORE_EPOCH하지 않는다.
+   * - needsReview·열린 attempt(budgetBlocksRestore)는 예약 복원만 차단하고 표시
+   *   이력은 복원한다(저장 레코드는 history로 낮춰 재전송 복원을 막는다).
+   * - TTL 정보가 없는 v1 armed(expiresAt=null)는 기존처럼 예약만 복원하고 이력을
+   *   추정해 만들지 않는다.
    * @param {string} key
    * @param {Record<string, any>} target
    * @returns {void}
@@ -400,32 +765,154 @@ export function createCoordinator({
     if (record === null || record === undefined) {
       return
     }
-    const matches =
-      record.userDataKey === target.userDataKey &&
-      record.profileId === target.profileId &&
-      record.ptyId === target.ptyId
-    const fresh = clock.now() - record.doneAt < EPOCH_MEMORY_MAX_AGE_MS
-    // 검토 필요/열린 attempt가 있으면 과거 예약을 되살리지 않는다(중복 전송 방지).
-    if (!matches || !fresh || budgetBlocksRestore(target)) {
+    const forget = () => {
       try {
         epochMemory.forget(key)
       } catch {
         // 정리 실패는 무시한다.
       }
+    }
+    const identity = identityFromTarget(target)
+    if (identity === null) {
+      forget()
+      return
+    }
+    const matches =
+      record.userDataKey === identity.userDataKey &&
+      record.profileId === identity.profileId &&
+      record.worktreeId === identity.worktreeId &&
+      record.paneKey === identity.paneKey &&
+      record.ptyId === identity.ptyId
+    if (!matches) {
+      forget()
+      return
+    }
+
+    const at = clock.now()
+    const expiresAt = isFiniteNumber(record.expiresAt) ? record.expiresAt : null
+    const doneAt = isFiniteNumber(record.doneAt) ? record.doneAt : null
+
+    // 표시 이력 전용 레코드: 예약은 절대 되살리지 않는다.
+    if (record.kind === 'history') {
+      if (expiresAt === null || at >= expiresAt + CACHE_HISTORY_RETENTION_MS) {
+        forget()
+        return
+      }
+      const history = historyFromRecord({ ...record, expiresAt })
+      if (history === null) {
+        forget()
+        return
+      }
+      const expired =
+        (record.expiredAt !== null && record.expiredAt !== undefined) || at >= expiresAt
+      restoreCacheHistoryDisplay(
+        key,
+        expired ? { ...history, expiredAt: expiresAt } : history,
+        expired,
+      )
+      return
+    }
+
+    // armed인데 예상 만료가 이미 지났다(오프라인 중 만료): 예약을 버리고 만료 이력으로
+    // 낮춘다. 재시작 후에도 전송 예약이 생기지 않는다.
+    if (expiresAt !== null && at >= expiresAt) {
+      if (at >= expiresAt + CACHE_HISTORY_RETENTION_MS) {
+        forget()
+        return
+      }
+      const history = historyFromRecord({ ...record, expiresAt, expiredAt: expiresAt })
+      if (history === null) {
+        forget()
+        return
+      }
+      restoreCacheHistoryDisplay(key, { ...history, expiredAt: expiresAt }, true)
+      return
+    }
+
+    const fresh = doneAt !== null && at - doneAt < EPOCH_MEMORY_MAX_AGE_MS
+
+    // v1 armed(expiresAt 없음): 기존 동작 유지. 이력은 추정해 만들지 않는다.
+    if (expiresAt === null) {
+      if (!fresh || budgetBlocksRestore(target)) {
+        forget()
+        return
+      }
+      const state = applyReduce(key, {
+        type: 'RESTORE_EPOCH',
+        doneAt,
+        basisAt: record.basisAt,
+        now: at,
+      })
+      if (state !== null && state.phase === 'ARMED') {
+        const entry = targets.get(key)
+        if (entry) {
+          entry.cacheHistory = null
+          syncEpochMemory(key, state)
+        }
+        recordEpochRestored(key, record, target)
+      }
+      return
+    }
+
+    // 예약을 되살리되 표시 이력은 남긴다.
+    const history = historyFromRecord({ ...record, expiresAt })
+    // 검토 필요/열린 attempt가 있으면 과거 예약을 되살리지 않는다(중복 전송 방지).
+    if (budgetBlocksRestore(target)) {
+      if (history !== null) {
+        restoreCacheHistoryDisplay(
+          key,
+          at >= expiresAt ? { ...history, expiredAt: expiresAt } : history,
+          at >= expiresAt,
+        )
+      } else {
+        forget()
+      }
+      return
+    }
+    if (!fresh) {
+      forget()
       return
     }
     const state = applyReduce(key, {
       type: 'RESTORE_EPOCH',
-      doneAt: record.doneAt,
-      now: clock.now(),
+      doneAt,
+      basisAt: record.basisAt,
+      now: at,
     })
-    if (state !== null && state.phase === 'ARMED') {
-      const entry = { event: 'epoch_restored', targetId: key }
-      if (record.incarnationId !== target.incarnationId) {
-        entry.code = 'incarnation_changed'
+    if (state === null || state.phase !== 'ARMED') {
+      if (history !== null) {
+        restoreCacheHistoryDisplay(
+          key,
+          at >= expiresAt ? { ...history, expiredAt: expiresAt } : history,
+          at >= expiresAt,
+        )
       }
-      diagnostics.record(entry)
+      return
     }
+    const entry = targets.get(key)
+    if (entry) {
+      // 저장된 이력의 expiresAt·lastBlockReason을 유지하고, 이후 BLOCK이 같은 epoch로
+      // 이어지도록 복원된 epoch id를 붙인다.
+      entry.cacheHistory =
+        history === null ? null : { ...history, epochId: state.epoch.id, expiredAt: null }
+      syncEpochMemory(key, state)
+    }
+    recordEpochRestored(key, record, target)
+  }
+
+  /**
+   * 예약 복원 진단을 남긴다(incarnationId가 바뀌었으면 code를 붙인다).
+   * @param {string} key
+   * @param {any} record
+   * @param {Record<string, any>} target
+   * @returns {void}
+   */
+  function recordEpochRestored(key, record, target) {
+    const entry = { event: 'epoch_restored', targetId: key }
+    if (record.incarnationId !== target.incarnationId) {
+      entry.code = 'incarnation_changed'
+    }
+    diagnostics.record(entry)
   }
 
   /**
@@ -474,6 +961,52 @@ export function createCoordinator({
   }
 
   /**
+   * target이 저장 epoch·이력 없이 사라질 때(complete catalog에서 잠시 빠짐) 저장
+   * 예약을 되살리지 않게 정리한다(§2-5). 표시 이력이 있으면 kind='history'로 낮춰
+   * 저장하고 24시간 prune에 맡긴다. 이력이 없거나 유효하지 않으면 forget한다.
+   * @param {string} key
+   * @param {any} entry 제거 직전 target entry(없으면 undefined).
+   * @returns {void}
+   */
+  function downgradeEpochMemoryOnRemoval(key, entry) {
+    if (epochMemory === null) {
+      return
+    }
+    try {
+      const history = entry ? entry.cacheHistory : null
+      const target = entry && isObject(entry.state) ? entry.state.target : null
+      const record = historyRecordFrom(target, history)
+      if (record !== null && clock.now() < record.expiresAt + CACHE_HISTORY_RETENTION_MS) {
+        epochMemory.remember(key, record)
+        return
+      }
+      epochMemory.forget(key)
+    } catch {
+      // 정리 실패는 무시한다.
+    }
+  }
+
+  /**
+   * epoch 메모리의 보존 기간 정리를 주기적으로 호출한다(§2-5). 실패는 무시한다.
+   * @returns {void}
+   */
+  function maybePruneEpochMemory() {
+    if (epochMemory === null || typeof epochMemory.prune !== 'function') {
+      return
+    }
+    const at = clock.now()
+    if (lastEpochPruneAt !== null && at - lastEpochPruneAt < EPOCH_MEMORY_PRUNE_INTERVAL_MS) {
+      return
+    }
+    lastEpochPruneAt = at
+    try {
+      epochMemory.prune(EPOCH_MEMORY_MAX_AGE_MS)
+    } catch {
+      // prune 실패는 무시한다.
+    }
+  }
+
+  /**
    * RuntimeView용 decision을 저장한다. decide 결과에 dueAt/expiresAt이 없고 epoch가
    * 남아 있으면 TTL로부터 계산해 채운다(설정 unknown 구간에서도 만료를 보여주기 위함).
    * @param {string} key
@@ -488,7 +1021,7 @@ export function createCoordinator({
     const state = entry.state
     const cfg = config ?? store.snapshot().config
     const settings = isObject(lastSettings) ? lastSettings : { known: false }
-    const policy = safePolicy(state.target)
+    const policy = safePolicy(state.target, settings.ttlMs)
     const raw = scheduler.decide(state, {
       now: clock.now(),
       settings: {
@@ -521,7 +1054,7 @@ export function createCoordinator({
     ) {
       const margin = marginFor(settings.ttlMs, config)
       if (margin !== null) {
-        expiresAt = state.epoch.doneAt + settings.ttlMs
+        expiresAt = (state.epoch.basisAt ?? state.epoch.doneAt) + settings.ttlMs
         dueAt = expiresAt - margin
       }
     }
@@ -531,21 +1064,123 @@ export function createCoordinator({
   /**
    * store.isAllowedByPolicy를 안전하게 호출한다(scope/profileId 미확정 시 throw 금지).
    * @param {Record<string, any>} target
+   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed:boolean, reason:string|null}}
    */
-  function safePolicy(target) {
+  function safePolicy(target, ttlMs) {
     try {
       if (typeof target.profileId !== 'string' || target.profileId.length === 0) {
         return { allowed: false, reason: 'SETTINGS_UNKNOWN' }
       }
-      return store.isAllowedByPolicy(scopeOf(target))
+      return store.isAllowedByPolicy(scopeOf(target), { ttlMs: ttlMs ?? null })
     } catch {
       return { allowed: false, reason: 'STORAGE_FAILED' }
     }
   }
 
+  /**
+   * 영속 budget이 검토 필요(needsReview)인지 확인한다. getBudget이 없거나 실패하면
+   * false(검토 필요 아님)로 본다. projection의 review 우선 판정에 쓴다(§2-1).
+   * @param {Record<string, any>} target
+   * @returns {boolean}
+   */
+  function needsReviewFor(target) {
+    try {
+      if (typeof store.getBudget !== 'function') {
+        return false
+      }
+      const budget = store.getBudget(scopeOf(target))
+      return isObject(budget) && budget.needsReview === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 표시 gate에서 `PARTIAL_OR_UNKNOWN_SEND`(검토 필요) 뒤에 가려진 off 조건을
+   * 확인한다(§2-2). isAllowedByPolicy는 needsReview를 연속 상한·memoryPaused보다
+   * 먼저 검사하므로, 검토 필요 자체를 표시에서 예외로 둘 때 이 두 조건을 별도로
+   * 확인해야 기존 off 조건을 잃지 않는다. 확인할 수 없으면 보수적으로 off(true)다.
+   *
+   * store.snapshot()은 target마다 다시 부르지 않는다(§성능). 호출자가 한 번 읽은
+   * `gateInfo`를 넘긴다. snapshot을 읽지 못했으면 gateInfo=null이고 off(true)다.
+   * @param {{memoryPaused:boolean, config:any}|null} gateInfo 한 번 읽은 snapshot 요약.
+   * @param {Record<string, any>} target
+   * @param {number|null} ttlMs
+   * @returns {boolean} true면 표시를 꺼야 하는 숨은 조건이 있다.
+   */
+  function displayHiddenOff(gateInfo, target, ttlMs) {
+    if (!isObject(gateInfo)) {
+      return true
+    }
+    if (gateInfo.memoryPaused === true) {
+      return true
+    }
+    try {
+      if (typeof store.getBudget !== 'function') {
+        return false
+      }
+      const budget = store.getBudget(scopeOf(target))
+      const charged = isObject(budget) && isFiniteNumber(budget.charged) ? budget.charged : 0
+      const max = capFor(ttlMs ?? null, gateInfo.config ?? null)
+      return max !== 0 && charged >= max
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * 탭 표시용 활성 조건(indicatorOn)을 계산한다(§2-2). 실제 전송 gate(safePolicy·
+   * assertAllowed)와 분리되며 정책 판정 자체를 바꾸지 않는다. 기존 paused/settings/
+   * connection/cwarm/scope/상한/storage 실패 조건을 유지하되, `PARTIAL_OR_UNKNOWN_SEND`
+   * (검토 필요)는 표시를 끄는 이유에서 제외한다(그 뒤에 가려진 off 조건은 보존).
+   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, settingsEnabled:boolean, connectionOk:boolean, gateInfo?:{memoryPaused:boolean, config:any}|null}} gates
+   * @param {Record<string, any>} target
+   * @param {number|null} ttlMs
+   * @returns {boolean}
+   */
+  function computeIndicatorOn(gates, target, ttlMs) {
+    if (
+      gates.cwarmBlocked ||
+      gates.paused ||
+      !gates.settingsKnown ||
+      !gates.settingsEnabled ||
+      !gates.connectionOk
+    ) {
+      return false
+    }
+    const policy = safePolicy(target, ttlMs)
+    if (policy.allowed === true) {
+      return true
+    }
+    if (policy.reason === UNKNOWN_SEND_REASON) {
+      return !displayHiddenOff(gates.gateInfo ?? null, target, ttlMs)
+    }
+    return false
+  }
+
+  /**
+   * 한 target의 캐시 상태를 projection한다(§2-1). RuntimeView terminal과 제목 표시기
+   * desired가 같은 값을 쓰도록 하는 단일 진입점이다.
+   * @param {any} entry targets Map 항목.
+   * @returns {ReturnType<typeof projectCacheStatus>}
+   */
+  function projectEntry(entry) {
+    const target = entry.state.target
+    const decision = entry.decision
+    return projectCacheStatus({
+      state: entry.state,
+      history: entry.cacheHistory ?? null,
+      now: clock.now(),
+      needsReview: needsReviewFor(target),
+      dueAt: decision ? decision.dueAt ?? null : null,
+      expiredBy: entry.expiredBy ?? null,
+      observed: entry.observed === true,
+    })
+  }
+
   // -------------------------------------------------------------------------
-  // 탭 제목 표시기(실험 옵션)
+  // 탭 제목 표시기
   // -------------------------------------------------------------------------
 
   /**
@@ -620,8 +1255,9 @@ export function createCoordinator({
    *   확인이 비동기이므로 tick을 막지 않게 내부 async 함수로 감싼다.
    * @param {object} config
    * @param {boolean} catalogFailed
+   * @param {{memoryPaused:boolean, config:any}|null} [gateInfo] 호출자가 한 번 읽은 snapshot 요약(§성능).
    */
-  function updateTitleIndicator(config, catalogFailed) {
+  function updateTitleIndicator(config, catalogFailed, gateInfo = null) {
     if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
       return
     }
@@ -632,20 +1268,22 @@ export function createCoordinator({
       return
     }
     const removeOnly = catalogIncomplete || catalogFailed
-    fireAndForget(reconcileTitleIndicator(config, seq, removeOnly))
+    fireAndForget(reconcileTitleIndicator(config, seq, removeOnly, gateInfo))
   }
 
   /**
    * 실제 전송 게이트와 같은 cwarm 조건을 반영해 desired를 만든다. cwarmDisabled()
    * 예외는 false로 취급한다(assertAllowed와 동일). respectCwarmDisabled=true이고
-   * cwarm.disabled가 있으면 모든 target을 on=false로 보낸다. ⚡는 phase(ARMED)와
-   * 무관하게 "이 탭이 keepalive 대상으로 켜져 있음"을 뜻한다.
+   * cwarm.disabled가 있으면 모든 target을 on=false로 보낸다. on(=indicatorOn)은
+   * phase와 무관하게 "이 탭이 캐시 유지 대상으로 켜져 있음"을 뜻한다. cacheState는
+   * RuntimeView와 같은 projection 결과다(§2-1, §2-2).
    * @param {object} config
    * @param {number} seq updateTitleIndicator가 부여한 순번. 더 새 호출이 있으면 버린다.
    * @param {boolean} removeOnly 불완전 catalog면 off 제거만 수행한다.
+   * @param {{memoryPaused:boolean, config:any}|null} [gateInfo] 호출자가 한 번 읽은 snapshot 요약.
    * @returns {Promise<void>}
    */
-  async function reconcileTitleIndicator(config, seq, removeOnly = false) {
+  async function reconcileTitleIndicator(config, seq, removeOnly = false, gateInfo = null) {
     let cwarmBlocked = false
     if (config.respectCwarmDisabled === true) {
       try {
@@ -660,11 +1298,21 @@ export function createCoordinator({
     if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
       return
     }
+    // getRuntimeView의 indicatorOn이 같은 gate를 동기적으로 쓰도록 캐시한다.
+    cwarmBlockedCache = cwarmBlocked
     const settingsKnown = isObject(lastSettings) && lastSettings.known === true
     const settingsEnabled = settingsKnown && lastSettings.enabled === true
     const connectionOk = connection.state === 'connected'
-    const paused = config.paused === true
-    /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean}>} */
+    const gates = {
+      cwarmBlocked,
+      paused: config.paused === true,
+      settingsKnown,
+      settingsEnabled,
+      connectionOk,
+      gateInfo,
+    }
+    const ttlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean, cacheState:string}>} */
     const desired = []
     for (const entry of targets.values()) {
       if (entry.meta.supported !== true) {
@@ -676,19 +1324,14 @@ export function createCoordinator({
         continue
       }
       const leafId = typeof entry.meta.leafId === 'string' ? entry.meta.leafId : null
-      const on =
-        !cwarmBlocked &&
-        !paused &&
-        settingsKnown &&
-        settingsEnabled &&
-        connectionOk &&
-        safePolicy(target).allowed === true
+      const display = projectEntry(entry)
       desired.push({
         worktreeId: target.worktreeId,
         tabId,
         leafId,
         handle: target.handle,
-        on,
+        on: computeIndicatorOn(gates, target, ttlMs),
+        cacheState: display.cacheState,
       })
     }
     fireAndForget(titleIndicator.reconcile(desired, removeOnly ? { removeOnly: true } : undefined))
@@ -760,6 +1403,7 @@ export function createCoordinator({
         }
         try {
           epochMemory.prune(EPOCH_MEMORY_MAX_AGE_MS)
+          lastEpochPruneAt = clock.now()
         } catch {
           // prune 실패는 무시한다.
         }
@@ -871,7 +1515,6 @@ export function createCoordinator({
     // 다음 reconcile의 식별자 불일치 forget과 bootstrap의 prune이 정리한다.
     targets.clear()
     skipUntil.clear()
-    pendingRealTurn.clear()
     currentProfileId = null
     settingsInitialized = false
     connection = { state: 'starting', reason: null }
@@ -932,7 +1575,8 @@ export function createCoordinator({
 
     // 이번 tick에서 쓸 config를 한 번만 읽는다. store.snapshot()은 전체 상태를
     // structuredClone+freeze 하므로 target마다 반복 호출하지 않는다.
-    let tickConfig = store.snapshot().config
+    let tickSnapshot = store.snapshot()
+    let tickConfig = tickSnapshot.config
 
     // a. clock gap 검사.
     const now = clock.now()
@@ -985,7 +1629,8 @@ export function createCoordinator({
     await drainEvents()
 
     // 위 await 동안 대시보드에서 바뀐 config를 반영하도록 target 루프 직전에 다시 읽는다.
-    tickConfig = store.snapshot().config
+    tickSnapshot = store.snapshot()
+    tickConfig = tickSnapshot.config
 
     // e. supported target 결정.
     const candidates = []
@@ -1032,13 +1677,56 @@ export function createCoordinator({
           candidates.push({ key, dueAt: decision.dueAt ?? 0 })
         }
       }
+
+      // due를 지난 뒤 실제 전송을 막은 결정(정책 차단·catalog 불완전)은 그 reason을
+      // 이력에 남긴다(§2-3). 만료 전 단순 대기(reason null)나 EXPIRED/NO_FRESH_TURN는
+      // 기록하지 않는다. attempt 중(attempted=true)에는 덮지 않는다.
+      const finalDecision = entry.decision
+      const blockAt = clock.now()
+      if (
+        finalDecision &&
+        finalDecision.kind === 'wait' &&
+        entry.state.epoch !== null &&
+        entry.state.epoch.attempted === false &&
+        typeof finalDecision.dueAt === 'number' &&
+        blockAt >= finalDecision.dueAt
+      ) {
+        recordBlockReason(key, finalDecision.reason, entry.state.epoch.id, blockAt)
+      }
     }
+
+    // e2. 관측 이력 전진: 모든 target에서 실제 expiresAt 경과와 24시간 정리를 반영한다.
+    advanceCacheHistories(clock.now())
+
+    // e3. epoch 메모리 보존 정리를 주기적으로 수행한다(매 tick 호출하지 않음).
+    maybePruneEpochMemory()
 
     // f. 동시 1개 전송.
     maybeSend(candidates)
 
-    // g. 탭 제목 ⚡ 표시(실험 옵션). await하지 않아 tick을 막지 않는다.
-    updateTitleIndicator(tickConfig, catalogReadFailed)
+    // g. cwarm 표시 gate 캐시를 탭 제목 표시기 옵션과 무관하게 tick에서 갱신한다(§2-2).
+    // 옵션이 꺼져 있으면 reconcileTitleIndicator가 갱신하지 않아 초기값(false)이 남아
+    // getRuntimeView의 indicatorOn이 실제(cwarm.disabled로 전송 차단)와 달라진다.
+    // 옵션이 켜져 있으면 reconcile이 같은 정보를 얻으므로 여기서 중복 조회하지 않는다.
+    if (tickConfig.tabTitleIndicator !== true) {
+      if (tickConfig.respectCwarmDisabled === true) {
+        try {
+          cwarmBlockedCache = (await cwarmDisabled()) === true
+        } catch {
+          cwarmBlockedCache = false
+        }
+      } else {
+        cwarmBlockedCache = false
+      }
+    }
+
+    const gateInfo = {
+      memoryPaused: isObject(tickSnapshot) && tickSnapshot.memoryPaused === true,
+      config: tickConfig,
+    }
+
+    // h. 탭 제목 ⚡ 표시. await하지 않아 tick을 막지 않는다.
+    updateTitleIndicator(tickConfig, catalogReadFailed, gateInfo)
   }
 
   /**
@@ -1110,7 +1798,6 @@ export function createCoordinator({
       // profileId 불일치로 forget되고, 시작 시 prune도 정리한다.
       targets.clear()
       skipUntil.clear()
-      pendingRealTurn.clear()
       currentProfileId = profileId
       changed = true
     }
@@ -1187,7 +1874,14 @@ export function createCoordinator({
       }
       const entry = targets.get(key)
       if (!entry) {
-        targets.set(key, { state: scheduler.initialTargetState(target), decision: null, meta })
+        targets.set(key, {
+          state: scheduler.initialTargetState(target),
+          decision: null,
+          meta,
+          cacheHistory: null,
+          observed: false,
+          expiredBy: null,
+        })
         // 새 target을 만들었을 때만 저장된 예약을 복원한다(전환/삭제 후 재생성 포함).
         restoreEpochMemory(key, target)
       } else {
@@ -1212,9 +1906,11 @@ export function createCoordinator({
     if (catalog.complete === true) {
       for (const key of [...targets.keys()]) {
         if (!seen.has(key)) {
+          const entry = targets.get(key)
           targets.delete(key)
-          pendingRealTurn.delete(key)
-          forgetEpochMemory(key)
+          // 잠시 사라진 target: 예약은 되살리지 않게 정리하되 표시 이력은 history로
+          // 낮춰 24시간 prune에 맡긴다(§2-5).
+          downgradeEpochMemoryOnRemoval(key, entry)
         }
       }
     }
@@ -1403,11 +2099,11 @@ export function createCoordinator({
       if (settings.enabled !== true || settings.profileId !== target.profileId) {
         return { allowed: false, reason: 'APP_TIMER_OFF' }
       }
-      const policy = safePolicy(target)
+      const policy = safePolicy(target, settings.ttlMs)
       if (policy.allowed !== true) {
         // 이번 전송의 attempt가 이미 예약된 뒤(gate2/gate3)라면 reserveAttempt가
-        // charged를 +1 했으므로 상한(maxConsecutiveKeepalives)에 정확히 도달하면
-        // LIMIT_REACHED가 온다. 예약 성공은 곧 저장 성공이므로, 예약 이후의
+        // charged를 +1 했으므로 TTL별 상한(maxConsecutiveKeepalives5m/1h)에 정확히
+        // 도달하면 LIMIT_REACHED가 온다. 예약 성공은 곧 저장 성공이므로, 예약 이후의
         // LIMIT_REACHED만 허용으로 취급한다(그 앞 검사인 paused/scope/needsReview는
         // isAllowedByPolicy가 LIMIT_REACHED보다 먼저 검사해 이미 통과했다는 뜻).
         // 단 memoryPaused(저장 실패) 검사는 LIMIT 뒤에 있으므로 snapshot으로 함께
@@ -1504,11 +2200,28 @@ export function createCoordinator({
       })
     } else {
       skipUntil.set(key, clock.now() + tickMs)
+      const skipReason =
+        isObject(result) && typeof result.reason === 'string' ? result.reason : 'SETTINGS_UNKNOWN'
       diagnostics.record({
         event: 'safety_skipped',
-        code: isObject(result) && typeof result.reason === 'string' ? result.reason : 'SETTINGS_UNKNOWN',
+        code: skipReason,
         targetId: key,
       })
+      // 실행 시작 때의 key·target identity·generation·epochId가 모두 그대로일 때만
+      // 차단 원인을 기록한다(§2-3). 새 턴 뒤 도착한 옛 결과는 이력과 epoch가 달라
+      // 무시된다.
+      const current = targets.get(key)
+      if (
+        current &&
+        current.state.generation === gen &&
+        current.state.epoch !== null &&
+        current.state.epoch.id === epochId &&
+        current.state.target.handle === target.handle &&
+        current.state.target.ptyId === target.ptyId &&
+        current.state.target.incarnationId === target.incarnationId
+      ) {
+        recordBlockReason(key, skipReason, epochId, clock.now())
+      }
     }
   }
 
@@ -1653,28 +2366,10 @@ export function createCoordinator({
       diagnostics.record({ event: 'epoch_armed', targetId: key })
     }
 
-    // 탭 제목 ⚡ 표시: 자체 keepalive 턴이 아닌 실제 턴이 done이 되면 1회 새로 고친다.
-    if (hookState === 'working') {
-      if (after.selfTurnSeq > before.selfTurnSeq) {
-        // 자체 keepalive 턴은 실제 턴 완료로 보지 않는다.
-        pendingRealTurn.delete(key)
-      } else if (after.budgetResetSeq > before.budgetResetSeq) {
-        // 실제(사람/기타) 턴 시작: 이 target의 다음 done에서 제목을 새로 고친다.
-        pendingRealTurn.add(key)
-      }
-    } else if (hookState === 'done' && pendingRealTurn.has(key)) {
-      pendingRealTurn.delete(key)
-      const tabId = typeof entry.meta.tabId === 'string' ? entry.meta.tabId : null
-      const worktreeId = typeof after.target.worktreeId === 'string' ? after.target.worktreeId : null
-      if (
-        tabId !== null &&
-        worktreeId !== null &&
-        titleIndicator !== null &&
-        typeof titleIndicator.onTurnCompleted === 'function'
-      ) {
-        fireAndForget(titleIndicator.onTurnCompleted(`${worktreeId}:${tabId}`))
-      }
-    }
+    // 실제 턴 완료만을 이유로 하는 제목 refresh rename은 제거했다(§2-6). 같은 기호에서는
+    // pane 순서·handle·phase 변화로 rename하지 않는다. 제목은 tick의 reconcile이
+    // projection 결과(cacheState)에 따라 갱신한다. titleIndicator.onTurnCompleted는
+    // 호환용 no-op으로 남아 있지만 여기서 호출하지 않는다.
   }
 
   /**
@@ -1732,7 +2427,11 @@ export function createCoordinator({
     // 다음 tick을 앞당기지 않는다. 진행 중 전송은 assertAllowed가 막으며, paste 이후
     // abort로 uncertain을 만들지 않는다.
     diagnostics.record({ event: 'policy_changed' })
-    updateTitleIndicator(store.snapshot().config, titleIndicatorCatalogFailed)
+    const snap = store.snapshot()
+    updateTitleIndicator(snap.config, titleIndicatorCatalogFailed, {
+      memoryPaused: snap.memoryPaused === true,
+      config: snap.config,
+    })
   }
 
   function onWorktreeRemoved(payload) {
@@ -1747,7 +2446,6 @@ export function createCoordinator({
       const entry = targets.get(key)
       if (entry && entry.state.target.worktreeId === worktreeId) {
         targets.delete(key)
-        pendingRealTurn.delete(key)
         forgetEpochMemory(key)
       }
     }
@@ -1764,10 +2462,14 @@ export function createCoordinator({
     }
     const key = keyFor(worktreeId, paneKey)
     if (targets.has(key)) {
+      // applyReduce가 phase를 UNKNOWN으로 되돌리고 syncEpochMemory가 관측 이력을
+      // kind='history'로 저장한다. 여기서 forget하면 재시작 뒤 24시간 보존 이력이
+      // 유실되므로(target이 존재할 때) 지우지 않는다.
       applyReduce(key, { type: 'REVIEW_CLEARED' })
+    } else {
+      // target이 없으면 저장된 예약/이력을 정리한다.
+      forgetEpochMemory(key)
     }
-    // 검토가 해제됐으므로 이전 예약을 복원 후보로 남기지 않는다.
-    forgetEpochMemory(key)
   }
 
   async function currentWorktreeId() {
@@ -1799,6 +2501,30 @@ export function createCoordinator({
    * @returns {RuntimeView}
    */
   function getRuntimeView() {
+    // 표시 gate(indicatorOn)에 필요한 값을 한 번만 읽는다. store.snapshot()은 전체
+    // 상태를 복제하므로 target마다 반복 호출하지 않는다(§2-2, §성능).
+    let gateSnapshot = null
+    try {
+      gateSnapshot = store.snapshot()
+    } catch {
+      gateSnapshot = null
+    }
+    const gateConfig = isObject(gateSnapshot) ? gateSnapshot.config : null
+    const settingsKnown = isObject(lastSettings) && lastSettings.known === true
+    const settingsEnabled = settingsKnown && lastSettings.enabled === true
+    const gateTtlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    const gateInfo =
+      gateSnapshot === null
+        ? null
+        : { memoryPaused: gateSnapshot.memoryPaused === true, config: gateConfig }
+    const gateBase = {
+      cwarmBlocked: cwarmBlockedCache,
+      paused: isObject(gateConfig) && gateConfig.paused === true,
+      settingsKnown,
+      settingsEnabled,
+      connectionOk: connection.state === 'connected',
+      gateInfo,
+    }
     /** @type {Map<string, any>} */
     const groups = new Map()
     for (const [key, entry] of targets) {
@@ -1824,16 +2550,34 @@ export function createCoordinator({
       if (group.branch === null && entry.meta.branch) {
         group.branch = entry.meta.branch
       }
+      const display = projectEntry(entry)
+      // dueAt은 실행 가능한 예약(kept/scheduled)이 있을 때만 노출한다. 이력 복원만으로는
+      // 만들지 않으며, 전송 중/만료/중단 상태에서는 null이다(§2-1).
+      const dueAt =
+        display.cacheStatus === 'scheduled' && entry.decision && isFiniteNumber(entry.decision.dueAt)
+          ? entry.decision.dueAt
+          : null
+      // expiresAt은 관측 이력을 우선한다(예약이 취소돼도 유지, §2-1). TTL 정보 없이
+      // 복원된 옛 예약(v1)처럼 이력이 없을 때만 decision의 계산값으로 보완한다.
+      const decisionExpiresAt =
+        entry.decision && isFiniteNumber(entry.decision.expiresAt) ? entry.decision.expiresAt : null
       group.terminals.push({
         worktreeId: target.worktreeId,
         paneKey: target.paneKey,
         title: entry.meta.title ?? null,
         phase: entry.state.phase,
         reason: entry.decision ? entry.decision.reason ?? null : entry.state.reason ?? null,
-        dueAt: entry.decision ? entry.decision.dueAt ?? null : null,
-        expiresAt: entry.decision ? entry.decision.expiresAt ?? null : null,
+        dueAt,
+        expiresAt: display.expiresAt ?? decisionExpiresAt,
         supported: entry.meta.supported === true,
         unsupportedReason: entry.meta.unsupportedReason ?? null,
+        cacheState: display.cacheState,
+        cacheStatus: display.cacheStatus,
+        reservationNote: display.reservationNote,
+        indicatorOn: computeIndicatorOn(gateBase, target, gateTtlMs),
+        expiredAt: display.expiredAt,
+        expireCause: display.expireCause,
+        blockedReason: display.blockedReason,
       })
     }
 
@@ -1892,6 +2636,20 @@ export function createCoordinator({
 
   function getRpc() {
     return rpc
+  }
+
+  /**
+   * 테스트 전용 내부 조회: target key의 표시 이력을 복사해 돌려준다(§2-3). 제품
+   * 경로(RuntimeView/대시보드)에는 노출하지 않는다. target이 없으면 null.
+   * @param {string} key
+   * @returns {import('./contracts.mjs').CacheHistory|null}
+   */
+  function __debugCacheHistory(key) {
+    const entry = targets.get(key)
+    if (!entry || entry.cacheHistory === null || entry.cacheHistory === undefined) {
+      return null
+    }
+    return { ...entry.cacheHistory }
   }
 
   // -------------------------------------------------------------------------
@@ -2001,6 +2759,7 @@ export function createCoordinator({
     onReviewCleared,
     onPolicyChanged,
     getRpc,
+    __debugCacheHistory,
   }
 }
 

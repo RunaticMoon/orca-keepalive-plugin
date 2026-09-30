@@ -143,18 +143,11 @@ test('snapshot: 연결 전(userDataKey/profileId null)이면 worktrees는 빈 �
   assert.equal('schemaVersion' in snap.config, false);
 });
 
-test('snapshot: config.tabTitleIndicator는 기본 false, config patch로 켜진다', async () => {
+test('snapshot: config.tabTitleIndicator는 기본 true, config patch로 끌 수 있다', async () => {
   const { store } = await newStore();
   const { model } = makeModel({ store, runtime: runtimeView() });
 
   let snap = model.snapshot();
-  assert.equal(snap.config.tabTitleIndicator, false);
-
-  snap = await model.dispatch({
-    type: 'config',
-    patch: { tabTitleIndicator: true },
-    expectedRevision: snap.revision,
-  });
   assert.equal(snap.config.tabTitleIndicator, true);
 
   snap = await model.dispatch({
@@ -163,6 +156,33 @@ test('snapshot: config.tabTitleIndicator는 기본 false, config patch로 켜진
     expectedRevision: snap.revision,
   });
   assert.equal(snap.config.tabTitleIndicator, false);
+
+  snap = await model.dispatch({
+    type: 'config',
+    patch: { tabTitleIndicator: true },
+    expectedRevision: snap.revision,
+  });
+  assert.equal(snap.config.tabTitleIndicator, true);
+});
+
+test('snapshot: config에 TTL별 상한과 active를 투영한다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView() });
+
+  let snap = model.snapshot();
+  assert.equal(snap.config.maxConsecutiveKeepalives5m, 8);
+  assert.equal(snap.config.maxConsecutiveKeepalives1h, 3);
+  // appTimer.ttlMs=300000(5분)이므로 5m 상한이 active.
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 8);
+  assert.equal('maxConsecutiveKeepalives' in snap.config, false);
+
+  // TTL 미상이면 보수적으로 두 값 중 작은 값.
+  const unknownTimer = runtimeView({
+    appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null, reason: 'settings_unknown' },
+  });
+  const { model: unknownModel } = makeModel({ store, runtime: unknownTimer });
+  snap = unknownModel.snapshot();
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 3);
 });
 
 test('snapshot: 같은 label 워크트리 2개와 split terminal은 각각 다른 targetId', async () => {
@@ -302,6 +322,158 @@ test('snapshot: 진단은 최근 50개만 {at,level,event,code?}로 매핑', asy
 });
 
 /* ------------------------------------------------------------------ */
+/* 캐시 표시 필드 (K, §2-1)                                            */
+/* ------------------------------------------------------------------ */
+
+test('snapshot: 캐시 표시 필드를 allowlist로 전달한다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [
+          term({
+            cacheState: 'kept',
+            cacheStatus: 'scheduled',
+            indicatorOn: true,
+            expiresAt: 111_000,
+            expiredAt: null,
+            expireCause: 'DRAFT_PRESENT',
+            blockedReason: 'OUTPUT_ACTIVE',
+            dueAt: 100_000,
+          }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const terminal = model.snapshot().worktrees[0].terminals[0];
+  assert.equal(terminal.cacheState, 'kept');
+  assert.equal(terminal.cacheStatus, 'scheduled');
+  assert.equal(terminal.indicatorOn, true);
+  assert.equal(terminal.expiresAt, 111_000);
+  assert.equal(terminal.expiredAt, null);
+  assert.equal(terminal.expireCause, 'DRAFT_PRESENT');
+  assert.equal(terminal.blockedReason, 'OUTPUT_ACTIVE');
+  assert.equal(terminal.dueAt, 100_000);
+  // 호환용 기존 필드는 그대로 유지한다.
+  assert.equal(terminal.phase, 'ARMED');
+  assert.equal(terminal.effectiveEnabled, true);
+});
+
+test('snapshot: 누락·불량 캐시 필드는 none/no-reservation/null로 정규화', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [
+          // 캐시 필드가 아예 없는 기본 terminal.
+          term(),
+          term({
+            paneKey: 'p2',
+            cacheState: 'BOGUS',
+            cacheStatus: 'nope',
+            indicatorOn: 'yes',
+            expiresAt: 'not-a-number',
+            expiredAt: Number.NaN,
+            dueAt: Number.POSITIVE_INFINITY,
+            expireCause: 'NOT_ALLOWED',
+            blockedReason: 'also-not-allowed',
+          }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const [missing, bad] = model.snapshot().worktrees[0].terminals;
+  for (const terminal of [missing, bad]) {
+    assert.equal(terminal.cacheState, 'none');
+    assert.equal(terminal.cacheStatus, 'no-reservation');
+    assert.equal(terminal.indicatorOn, false);
+    assert.equal(terminal.expiresAt, null);
+    assert.equal(terminal.expiredAt, null);
+    assert.equal(terminal.dueAt, null);
+    assert.equal(terminal.expireCause, null);
+    assert.equal(terminal.blockedReason, null);
+  }
+});
+
+test('snapshot: reservationNote 허용값만 전달하고 그 밖은 null', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [
+          term({ paneKey: 'p1', cacheStatus: 'no-reservation', reservationNote: 'initial' }),
+          term({ paneKey: 'p2', cacheStatus: 'no-reservation', reservationNote: 'safety-cutoff' }),
+          term({ paneKey: 'p3', cacheStatus: 'no-reservation', reservationNote: 'BOGUS' }),
+          term({ paneKey: 'p4', cacheStatus: 'no-reservation' }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const [initial, cutoff, bogus, missing] = model.snapshot().worktrees[0].terminals;
+  assert.equal(initial.reservationNote, 'initial');
+  assert.equal(cutoff.reservationNote, 'safety-cutoff');
+  assert.equal(bogus.reservationNote, null);
+  assert.equal(missing.reservationNote, null);
+});
+
+test('snapshot: 알 수 없는 캐시 문자열·민감정보를 노출하지 않는다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [
+          term({
+            cacheState: 'SECRET_STATE',
+            cacheStatus: 'SECRET_STATUS',
+            expireCause: 'SECRET_CAUSE',
+            blockedReason: 'SECRET_BLOCK',
+            draft: 'SECRET_DRAFT',
+            secretTitle: 'SECRET_TITLE',
+          }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+
+  const json = JSON.stringify(model.snapshot());
+  for (const secret of ['SECRET_STATE', 'SECRET_STATUS', 'SECRET_CAUSE', 'SECRET_BLOCK', 'SECRET_DRAFT', 'SECRET_TITLE']) {
+    assert.equal(json.includes(secret), false, `${secret} 미노출`);
+  }
+  const terminal = model.snapshot().worktrees[0].terminals[0];
+  assert.equal(terminal.cacheState, 'none');
+  assert.equal(terminal.cacheStatus, 'no-reservation');
+  assert.equal(terminal.expireCause, null);
+  assert.equal(terminal.blockedReason, null);
+});
+
+test('snapshot: needsReview budget은 cacheState/cacheStatus를 review로 우선한다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        terminals: [term({ cacheState: 'kept', cacheStatus: 'scheduled', indicatorOn: true })],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime });
+  await store.markReview({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE, paneKey: PANE });
+
+  const terminal = model.snapshot().worktrees[0].terminals[0];
+  assert.equal(terminal.needsReview, true);
+  assert.equal(terminal.cacheState, 'review');
+  assert.equal(terminal.cacheStatus, 'review');
+  // 표시기 활성 조건(indicatorOn)은 coordinator 계산값을 그대로 유지한다.
+  assert.equal(terminal.indicatorOn, true);
+});
+
+/* ------------------------------------------------------------------ */
 /* 게이트 사유 우선순위                                                */
 /* ------------------------------------------------------------------ */
 
@@ -384,7 +556,7 @@ test('게이트: 정책 사유(GLOBAL_PAUSED/SCOPE_DISABLED)와 worktree의 budg
   await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }, null);
 
   // worktree scope의 LIMIT_REACHED는 무시하고 effective는 유지
-  await store.updateConfig({ maxConsecutiveKeepalives: 1 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 1, maxConsecutiveKeepalives1h: 1 });
   await store.reserveAttempt({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }, 1);
   snap = model.snapshot();
   assert.equal(store.isAllowedByPolicy({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }).reason, 'LIMIT_REACHED');
@@ -395,7 +567,7 @@ test('게이트: 정책 사유(GLOBAL_PAUSED/SCOPE_DISABLED)와 worktree의 budg
 test('게이트: terminal scope의 budget 사유는 그대로 반영', async () => {
   const { store } = await newStore();
   const { model } = makeModel({ store, runtime: runtimeView() });
-  await store.updateConfig({ maxConsecutiveKeepalives: 1 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 1, maxConsecutiveKeepalives1h: 1 });
   await store.reserveAttempt({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE, paneKey: PANE }, 1);
 
   const snap = model.snapshot();
@@ -770,19 +942,19 @@ test('statusSummary: 전역 1행 + 워크트리별 켜짐/꺼짐(기본값/직�
   assert.equal(lines[0], '켜짐 · 타이머 켜짐(5분) · 연결됨 · 워크트리 3개');
   assert.deepEqual(lines.slice(1), [
     'docs 꺼짐(기본값)',
-    '⚡ feat-x 켜짐(직접 설정)',
+    'feat-x 켜짐(직접 설정)',
     'legacy 꺼짐(직접 설정)',
   ]);
 });
 
-test('statusSummary: 기본값이 켜짐이면 상속 워크트리는 ⚡ 켜짐(기본값)', async () => {
+test('statusSummary: 기본값이 켜짐이면 상속 워크트리는 켜짐(기본값)으로 표시', async () => {
   const { store } = await newStore();
   await store.updateConfig({ defaultWorktreeEnabled: true });
   const runtime = runtimeView({ worktrees: [wt({ label: 'main' })] });
   const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
 
   const lines = model.statusSummary().text.split('\n');
-  assert.equal(lines[1], '⚡ main 켜짐(기본값)');
+  assert.equal(lines[1], 'main 켜짐(기본값)');
 });
 
 test('statusSummary: 프로젝트 이름을 제목으로, branch를 보조로 표시', async () => {
@@ -801,7 +973,7 @@ test('statusSummary: 프로젝트 이름을 제목으로, branch를 보조로 �
   const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
 
   const lines = model.statusSummary().text.split('\n');
-  assert.equal(lines[1], '⚡ route-dashboard (main) 켜짐(기본값)');
+  assert.equal(lines[1], 'route-dashboard (main) 켜짐(기본값)');
 });
 
 test('statusSummary: branch가 없거나 label과 같으면 보조 표시를 생략', async () => {
@@ -816,8 +988,8 @@ test('statusSummary: branch가 없거나 label과 같으면 보조 표시를 생
   const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
 
   const lines = model.statusSummary().text.split('\n').slice(1);
-  assert.equal(lines[0], '⚡ main 켜짐(기본값)');
-  assert.equal(lines[1], '⚡ docs 켜짐(기본값)');
+  assert.equal(lines[0], 'main 켜짐(기본값)');
+  assert.equal(lines[1], 'docs 켜짐(기본값)');
 });
 
 test('snapshot: worktree branch 필드를 전달하고 없으면 null', async () => {
@@ -848,7 +1020,7 @@ test('statusSummary: 현재 워크트리를 ▶로 맨 앞에 표시하고 없�
   await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }, true);
 
   const current = model.statusSummary({ currentWorktreeId: WORKTREE }).text.split('\n').slice(1);
-  assert.deepEqual(current, ['▶ ⚡ main 켜짐(직접 설정)', 'feat-x 꺼짐(기본값)']);
+  assert.deepEqual(current, ['▶ main 켜짐(직접 설정)', 'feat-x 꺼짐(기본값)']);
 
   // 알 수 없는/없는 현재 워크트리면 ▶ 없이 스냅숏 순서 그대로.
   const unknown = model.statusSummary({ currentWorktreeId: 'no-such-worktree' }).text;
@@ -872,7 +1044,7 @@ test('statusSummary: 일시정지 중에는 켜둔 워크트리를 켜짐(일시
 
   const lines = model.statusSummary({ currentWorktreeId: 'w-on' }).text.split('\n');
   assert.ok(lines[0].startsWith('꺼짐(일시정지) · '));
-  assert.deepEqual(lines.slice(1), ['▶ ⚡ main 켜짐(일시정지 중)', 'docs 꺼짐(기본값)']);
+  assert.deepEqual(lines.slice(1), ['▶ main 켜짐(일시정지 중)', 'docs 꺼짐(기본값)']);
 });
 
 test('statusSummary: 가장 이른 dueAt을 serverNow 기준 상대 시간으로 표시', async () => {
@@ -896,8 +1068,8 @@ test('statusSummary: 가장 이른 dueAt을 serverNow 기준 상대 시간으로
   await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-b' }, true);
 
   const lines = model.statusSummary().text.split('\n').slice(1);
-  assert.equal(lines[0], '⚡ main 켜짐(직접 설정) · 다음 전송 3분 12초 후');
-  assert.equal(lines[1], '⚡ docs 켜짐(직접 설정) · 다음 전송 1시간 5분 후');
+  assert.equal(lines[0], 'main 켜짐(직접 설정) · 다음 전송 3분 12초 후');
+  assert.equal(lines[1], 'docs 켜짐(직접 설정) · 다음 전송 1시간 5분 후');
 });
 
 test('statusSummary: 꺼진 워크트리와 일시정지 중에는 다음 전송을 표시하지 않는다', async () => {
@@ -914,22 +1086,25 @@ test('statusSummary: 꺼진 워크트리와 일시정지 중에는 다음 전송
   await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-b' }, false);
 
   const lines = model.statusSummary().text.split('\n').slice(1);
-  assert.equal(lines[0], '⚡ main 켜짐(직접 설정) · 다음 전송 3분 12초 후');
+  assert.equal(lines[0], 'main 켜짐(직접 설정) · 다음 전송 3분 12초 후');
   assert.equal(lines[1], 'docs 꺼짐(직접 설정)');
 
   await store.setPaused(true);
   const pausedLines = model.statusSummary().text.split('\n').slice(1);
-  assert.equal(pausedLines[0], '⚡ main 켜짐(일시정지 중)');
+  assert.equal(pausedLines[0], 'main 켜짐(일시정지 중)');
 });
 
-test('statusSummary: needsReview 터미널 수를 확인 필요 N으로 표시', async () => {
+test('statusSummary: needsReview budget은 ⚠️ 확인 필요로 우선 표시', async () => {
   const { store } = await newStore();
   const runtime = runtimeView({
     worktrees: [
       wt({
         worktreeId: 'w-a',
         label: 'main',
-        terminals: [term({ worktreeId: 'w-a' }), term({ worktreeId: 'w-a', paneKey: 'p2' })],
+        terminals: [
+          term({ worktreeId: 'w-a', indicatorOn: true, cacheState: 'none', cacheStatus: 'no-reservation' }),
+          term({ worktreeId: 'w-a', paneKey: 'p2', indicatorOn: true, cacheState: 'kept', cacheStatus: 'scheduled' }),
+        ],
       }),
     ],
   });
@@ -938,7 +1113,71 @@ test('statusSummary: needsReview 터미널 수를 확인 필요 N으로 표시',
   await store.markReview({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-a', paneKey: PANE });
 
   const line = model.statusSummary().text.split('\n')[1];
-  assert.equal(line, '⚡ main 켜짐(직접 설정) · 확인 필요 1');
+  // review가 kept보다 우선한다(§2-2). kept 1개는 개수로만 남는다.
+  assert.equal(line, 'main 켜짐(직접 설정) · ⚠️ 유지 중 1 · 만료 0 · 확인 필요 1');
+});
+
+test('statusSummary: 설정만 켜짐이고 예약이 없으면 💤 유지 중 아님으로 표시', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        worktreeId: 'w-a',
+        label: 'main',
+        terminals: [term({ worktreeId: 'w-a', indicatorOn: true, cacheState: 'none', cacheStatus: 'no-reservation' })],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
+  await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-a' }, true);
+
+  const line = model.statusSummary().text.split('\n')[1];
+  assert.equal(line, 'main 켜짐(직접 설정) · 💤 유지 중 아님 · 만료 0 · 확인 필요 0');
+  assert.equal(line.includes('⚡'), false, '설정만 켜짐으로는 ⚡를 붙이지 않는다');
+});
+
+test('statusSummary: kept·expired·review 개수를 캐시 상태 기호와 함께 표시', async () => {
+  const { store } = await newStore();
+  const nowMs = 1_000_000;
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        worktreeId: 'w-a',
+        label: 'main',
+        terminals: [
+          term({ worktreeId: 'w-a', indicatorOn: true, cacheState: 'kept', cacheStatus: 'scheduled', expiresAt: nowMs + 60_000 }),
+          term({ worktreeId: 'w-a', paneKey: 'p2', indicatorOn: true, cacheState: 'kept', cacheStatus: 'scheduled' }),
+          term({ worktreeId: 'w-a', paneKey: 'p3', indicatorOn: true, cacheState: 'none', cacheStatus: 'expired', expiredAt: nowMs - 1 }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime, now: () => nowMs });
+  await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-a' }, true);
+
+  const line = model.statusSummary().text.split('\n')[1];
+  assert.equal(line, 'main 켜짐(직접 설정) · ⚡ 유지 중 2 · 만료 1 · 확인 필요 0');
+});
+
+test('statusSummary: indicatorOn이 아닌 터미널은 캐시 문구에 합산하지 않는다', async () => {
+  const { store } = await newStore();
+  const runtime = runtimeView({
+    worktrees: [
+      wt({
+        worktreeId: 'w-a',
+        label: 'main',
+        terminals: [
+          term({ worktreeId: 'w-a', indicatorOn: false, cacheState: 'kept', cacheStatus: 'scheduled' }),
+          term({ worktreeId: 'w-a', paneKey: 'p2', cacheState: 'kept', cacheStatus: 'scheduled' }),
+        ],
+      }),
+    ],
+  });
+  const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
+  await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: 'w-a' }, true);
+
+  const line = model.statusSummary().text.split('\n')[1];
+  assert.equal(line, 'main 켜짐(직접 설정)');
 });
 
 test('statusSummary: 워크트리가 없으면 대상 워크트리 없음', async () => {

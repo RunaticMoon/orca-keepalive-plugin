@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { startDashboard } from '../src/dashboard-server.mjs';
+import { createStateStore } from '../src/state-store.mjs';
+import { createDashboardModel } from '../src/dashboard-model.mjs';
 
 const CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
@@ -512,3 +514,153 @@ test('returns JSON snapshots and never emits CORS headers', async () => {
     assertSecurityHeaders(res.headers);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 캐시 상태 표시 필드: 실제 dashboard-model snapshot을 HTTP로 전달
+// ---------------------------------------------------------------------------
+
+/** 메모리 Map 기반 fake host storage(제품 상태 저장소용). */
+function createMemoryHost() {
+  const storage = new Map();
+  async function hostCall(method, params = {}) {
+    if (method === 'storage.get') {
+      return { value: storage.has(params.key) ? structuredClone(storage.get(params.key)) : undefined };
+    }
+    if (method === 'storage.set') {
+      storage.set(params.key, structuredClone(params.value));
+      return { ok: true };
+    }
+    throw new Error(`unknown method ${method}`);
+  }
+  return { hostCall, storage };
+}
+
+test('GET /api/state는 캐시 상태 필드를 전달하고 알 수 없는 문자열·초안 텍스트를 새 필드로 노출하지 않는다', async () => {
+  const DRAFT_TEXT = 'draft-secret: 사용자가 입력한 초안';
+  const SCREEN_TEXT = 'screen-secret: 캡처된 화면 원문';
+  const UNKNOWN_REASON = 'SOMETHING_UNKNOWN_XYZ';
+  const UNKNOWN_STATE = 'draft-secret-state';
+  const UNKNOWN_STATUS = 'draft-secret-status';
+
+  const { hostCall } = createMemoryHost();
+  const store = createStateStore({ hostCall });
+  await store.load();
+
+  const runtime = {
+    userDataKey: 'u'.repeat(64),
+    profileId: 'p1',
+    connection: { state: 'connected', reason: null },
+    appTimer: {
+      known: true,
+      enabled: true,
+      ttlMs: 300000,
+      source: 'sqlite',
+      readAt: 1,
+      reason: null,
+    },
+    worktrees: [
+      {
+        worktreeId: 'worktree-abc',
+        label: 'main',
+        branch: 'main',
+        terminals: [
+          {
+            worktreeId: 'worktree-abc',
+            paneKey: 'pane-kept',
+            title: 'claude #1',
+            phase: 'ARMED',
+            reason: null,
+            dueAt: 5000,
+            expiresAt: 9000,
+            supported: true,
+            unsupportedReason: null,
+            cacheState: 'kept',
+            cacheStatus: 'scheduled',
+            indicatorOn: true,
+            expiredAt: 9000,
+            expireCause: 'DRAFT_PRESENT',
+            blockedReason: 'OUTPUT_ACTIVE',
+            // 노출되면 안 되는 원시 문자열. snapshot 어디에도 새 필드로 나오면 안 된다.
+            draft: DRAFT_TEXT,
+            screen: SCREEN_TEXT,
+          },
+          {
+            worktreeId: 'worktree-abc',
+            paneKey: 'pane-unknown',
+            title: 'claude #2',
+            phase: 'ARMED',
+            reason: null,
+            supported: true,
+            unsupportedReason: null,
+            cacheState: UNKNOWN_STATE,
+            cacheStatus: UNKNOWN_STATUS,
+            indicatorOn: 'yes',
+            expiresAt: 'not-a-number',
+            expiredAt: Number.POSITIVE_INFINITY,
+            expireCause: UNKNOWN_REASON,
+            blockedReason: DRAFT_TEXT,
+          },
+        ],
+      },
+    ],
+  };
+
+  const model = createDashboardModel({
+    store,
+    getRuntimeView: () => runtime,
+    getDiagnostics: () => [],
+    now: () => 1000,
+  });
+
+  const assetsDir = await makeAssets();
+  const result = await startDashboard({
+    getSnapshot: () => model.snapshot(),
+    dispatch: async () => ({}),
+    assetsDir,
+  });
+  try {
+    const res = await request(result.port, {
+      path: '/api/state',
+      headers: { Authorization: `Bearer ${result.token}` },
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.text);
+    const terminals = (body.worktrees ?? []).flatMap((worktree) => worktree.terminals ?? []);
+    assert.equal(terminals.length, 2);
+
+    const kept = terminals.find((terminal) => terminal.title === 'claude #1');
+    assert.ok(kept, '첫 터미널이 있어야 한다');
+    assert.equal(kept.cacheState, 'kept');
+    assert.equal(kept.cacheStatus, 'scheduled');
+    assert.equal(kept.indicatorOn, true);
+    assert.equal(kept.expiresAt, 9000);
+    assert.equal(kept.expiredAt, 9000);
+    assert.equal(kept.expireCause, 'DRAFT_PRESENT');
+    assert.equal(kept.blockedReason, 'OUTPUT_ACTIVE');
+    assert.equal(kept.dueAt, 5000);
+    assert.equal(kept.phase, 'ARMED');
+    // raw draft/screen 키는 terminal row에 없어야 한다.
+    assert.equal('draft' in kept, false, 'raw draft 키가 노출되면 안 된다');
+    assert.equal('screen' in kept, false, 'raw screen 키가 노출되면 안 된다');
+    assert.equal(res.text.includes(DRAFT_TEXT), false, '초안 텍스트가 응답에 노출되면 안 된다');
+    assert.equal(res.text.includes(SCREEN_TEXT), false, '화면 텍스트가 응답에 노출되면 안 된다');
+
+    const unknown = terminals.find((terminal) => terminal.title === 'claude #2');
+    assert.ok(unknown, '둘째 터미널이 있어야 한다');
+    assert.equal(unknown.cacheState, 'none', '알 수 없는 cacheState는 none으로 정규화');
+    assert.equal(unknown.cacheStatus, 'no-reservation', '알 수 없는 cacheStatus는 기본값으로 정규화');
+    assert.equal(unknown.indicatorOn, false, 'boolean이 아닌 indicatorOn은 false');
+    assert.equal(unknown.expiresAt, null);
+    assert.equal(unknown.expiredAt, null, '비유한 expiredAt은 null');
+    assert.equal(unknown.expireCause, null, 'allowlist 밖 reason은 null');
+    assert.equal(unknown.blockedReason, null, '초안 텍스트를 blockedReason으로 노출하지 않는다');
+    assert.equal(res.text.includes(UNKNOWN_REASON), false);
+    assert.equal(res.text.includes(UNKNOWN_STATE), false);
+    assert.equal(res.text.includes(UNKNOWN_STATUS), false);
+    assertSecurityHeaders(res.headers);
+  } finally {
+    await result.close();
+    await rm(assetsDir, { recursive: true, force: true });
+  }
+});
+

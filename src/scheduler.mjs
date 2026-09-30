@@ -8,13 +8,17 @@
  *
  * 시간 모델:
  * - 관측한 fresh working→done이 epoch를 연다.
- * - expiresAt = epoch.doneAt + ttlMs, dueAt = expiresAt - marginFor(ttlMs).
+ * - expiresAt = epoch.basisAt + ttlMs, dueAt = expiresAt - marginFor(ttlMs).
+ *   basisAt은 턴의 마지막 working 이벤트 수신 시각(≈마지막 API 요청 시작)이며,
+ *   없거나 doneAt과 TIMING.basisMaxGapMs 넘게 차이 나면 doneAt을 쓴다.
  * - dueAt..(expiresAt - TIMING.minimumRemainingMs) 사이에 keepalive를 epoch당 1회 시도한다.
  *
  * 내부 전용 입력 type(contracts.MACHINE_INPUT_TYPES에는 없지만 여기서 허용):
  * - `REVIEW_CLEARED`: NEEDS_REVIEW를 해제한다.
  * - `EXPIRE`: 'expire' 결정 뒤 epoch를 닫는다.
- * - `RESTORE_EPOCH`: 리로드 전 저장한 doneAt으로 초기 상태에 epoch를 복원한다.
+ * - `RESTORE_EPOCH`: 리로드 전 저장한 doneAt(및 basisAt)으로 초기 상태에 epoch를 복원한다.
+ * - `RESTORE_CACHE_HISTORY`: 표시 이력 전용 복원. 초기 상태에 만료/취소 phase만 세우고
+ *   예약(epoch/attempt)은 만들지 않는다.
  *
  * @module scheduler
  */
@@ -26,10 +30,12 @@ import { ALLOWED_TTLS, HOOK_STATES, TIMING } from './contracts.mjs';
  */
 
 /**
- * epoch. doneAt은 첫 인정 done의 receivedAt.
+ * epoch. doneAt은 첫 인정 done의 receivedAt, basisAt은 캐시 TTL 기준 시각
+ * (마지막 working 이벤트 수신 시각. 없거나 doneAt과 3분 넘게 차이 나면 doneAt).
  * @typedef {Object} SchedulerEpoch
  * @property {number} id 내부 단조 정수.
  * @property {number} doneAt
+ * @property {number} basisAt
  * @property {boolean} attempted
  */
 
@@ -50,6 +56,7 @@ import { ALLOWED_TTLS, HOOK_STATES, TIMING } from './contracts.mjs';
  * @property {SchedulerPhase} phase
  * @property {'working'|'blocked'|'waiting'|'done'|null} lastHook
  * @property {number|null} lastHookAt
+ * @property {number|null} lastWorkingAt 마지막 working 이벤트 receivedAt. epoch basisAt 계산에 쓴다.
  * @property {boolean} seenWorking
  * @property {number} epochSeq
  * @property {SchedulerEpoch|null} epoch
@@ -117,6 +124,25 @@ export function marginFor(ttlMs, config) {
 }
 
 /**
+ * epoch의 캐시 TTL 기준 시각을 돌려준다.
+ * lastWorkingAt이 유한수이고 doneAt 이하이며 doneAt과의 간격이 TIMING.basisMaxGapMs
+ * 이하이면 그 값을, 아니면 doneAt을 쓴다(도구별 working 이벤트를 못 받은 긴 턴 보호).
+ * @param {unknown} lastWorkingAt
+ * @param {number} doneAt
+ * @returns {number}
+ */
+export function cacheBasisAt(lastWorkingAt, doneAt) {
+  if (
+    isFiniteNumber(lastWorkingAt) &&
+    lastWorkingAt <= doneAt &&
+    doneAt - lastWorkingAt <= TIMING.basisMaxGapMs
+  ) {
+    return lastWorkingAt;
+  }
+  return doneAt;
+}
+
+/**
  * 새 target의 초기 상태. 첫 fresh working을 보기 전에는 예약하지 않는다.
  * @param {Object} target
  * @returns {SchedulerState}
@@ -127,6 +153,7 @@ export function initialTargetState(target) {
     phase: 'UNKNOWN',
     lastHook: null,
     lastHookAt: null,
+    lastWorkingAt: null,
     seenWorking: false,
     epochSeq: 0,
     epoch: null,
@@ -168,6 +195,8 @@ function reduceHook(state, input) {
   next.lastHookAt = receivedAt;
 
   if (hookState === 'working') {
+    // 첫 working과 중복 working 모두 마지막 working 시각을 갱신한다.
+    next.lastWorkingAt = receivedAt;
     if (state.lastHook === 'working') {
       // 중복 working: lastHookAt만 갱신한다.
       return next;
@@ -232,8 +261,11 @@ function reduceHook(state, input) {
   next.lastHook = 'done';
 
   if (state.seenWorking === false) {
-    // 첫 done은 예약하지 않는다.
-    next.reason = 'NO_FRESH_TURN';
+    // 첫 done은 예약하지 않는다. 초기 관측 부재(UNKNOWN)에서만 안내 문구를 갱신하고,
+    // 복원된 만료/중단 이력(EXPIRED/SUSPENDED)의 phase·reason은 덮지 않는다.
+    if (state.phase === 'UNKNOWN') {
+      next.reason = 'NO_FRESH_TURN';
+    }
     return next;
   }
   if (
@@ -255,7 +287,13 @@ function reduceHook(state, input) {
 
   const epochSeq = state.epochSeq + 1;
   next.epochSeq = epochSeq;
-  next.epoch = { id: epochSeq, doneAt: receivedAt, attempted: false };
+  next.epoch = {
+    id: epochSeq,
+    doneAt: receivedAt,
+    basisAt: cacheBasisAt(state.lastWorkingAt, receivedAt),
+    attempted: false,
+  };
+  next.lastWorkingAt = null;
   next.phase = 'ARMED';
   next.reason = null;
   return next;
@@ -492,14 +530,14 @@ function reduceExpire(state, input) {
 }
 
 /**
- * 리로드 복원: 저장해 둔 마지막 done 시각으로 epoch를 되살린다.
+ * 리로드 복원: 저장해 둔 마지막 done 시각과 캐시 기준 시각으로 epoch를 되살린다.
  * 예약 이력이 전혀 없는 초기 상태에서만 적용하며, 조건이 맞지 않으면 그대로 반환한다.
  * @param {SchedulerState} state
- * @param {{doneAt?:number, now?:number}} input
+ * @param {{doneAt?:number, basisAt?:number, now?:number}} input
  * @returns {SchedulerState}
  */
 function reduceRestoreEpoch(state, input) {
-  const { doneAt, now } = input;
+  const { doneAt, basisAt, now } = input;
   const eligible =
     isFiniteNumber(doneAt) &&
     isFiniteNumber(now) &&
@@ -518,9 +556,42 @@ function reduceRestoreEpoch(state, input) {
   next.lastHookAt = Math.max(state.lastHookAt ?? -Infinity, doneAt);
   const epochSeq = state.epochSeq + 1;
   next.epochSeq = epochSeq;
-  next.epoch = { id: epochSeq, doneAt, attempted: false };
+  next.epoch = { id: epochSeq, doneAt, basisAt: cacheBasisAt(basisAt, doneAt), attempted: false };
   next.phase = 'ARMED';
   next.reason = null;
+  return next;
+}
+
+/**
+ * 표시 이력 전용 복원(§2-5): 예약 이력이 전혀 없는 초기 상태에서만 저장된 만료/취소
+ * 상태를 되살린다. 예약(epoch/attempt)은 만들지 않고, seenWorking=false와 모든 단조
+ * 카운터를 그대로 둔다. 조건이 맞지 않으면 상태를 변경하지 않고 반환한다.
+ * - expired=true: 만료 이력 → EXPIRED/EXPIRED.
+ * - expired=false: 만료 전 취소 이력 → SUSPENDED(입력 reason이 문자열이면 그 값,
+ *   아니면 NO_FRESH_TURN).
+ * @param {SchedulerState} state
+ * @param {{expired?:boolean, reason?:string, at?:number}} input
+ * @returns {SchedulerState}
+ */
+function reduceRestoreCacheHistory(state, input) {
+  const eligible =
+    typeof input.expired === 'boolean' &&
+    state.phase === 'UNKNOWN' &&
+    state.epoch === null &&
+    state.attempt === null &&
+    state.seenWorking === false &&
+    state.lastHook !== 'working';
+  if (!eligible) {
+    return copyState(state);
+  }
+  const next = copyState(state);
+  if (input.expired === true) {
+    next.phase = 'EXPIRED';
+    next.reason = 'EXPIRED';
+  } else {
+    next.phase = 'SUSPENDED';
+    next.reason = typeof input.reason === 'string' ? input.reason : 'NO_FRESH_TURN';
+  }
   return next;
 }
 
@@ -564,6 +635,8 @@ export function reduceTarget(state, input) {
       return reduceExpire(state, input);
     case 'RESTORE_EPOCH':
       return reduceRestoreEpoch(state, input);
+    case 'RESTORE_CACHE_HISTORY':
+      return reduceRestoreCacheHistory(state, input);
     default:
       return copyState(state);
   }
@@ -597,7 +670,7 @@ export function decide(state, env) {
     return { kind: 'wait', reason: 'SETTINGS_UNKNOWN' };
   }
 
-  const expiresAt = state.epoch.doneAt + settings.ttlMs;
+  const expiresAt = (state.epoch.basisAt ?? state.epoch.doneAt) + settings.ttlMs;
   const dueAt = expiresAt - margin;
 
   if (state.epoch.attempted) {

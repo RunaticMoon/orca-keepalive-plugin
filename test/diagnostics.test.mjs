@@ -212,6 +212,60 @@ test('어떤 입력 비밀도 snapshot/log/파일에 남지 않는다', async ()
   })
 })
 
+test('캐시 상태 진단도 초안·화면 텍스트를 새로 기록하지 않는다', async () => {
+  await withTmpDir(async (dir) => {
+    const DRAFT = 'draft text: 사용자가 입력한 초안 원문'
+    const SCREEN = 'screen text: 캡처된 화면 원문'
+    const lines = []
+    const diag = createDiagnostics({
+      now: fixedNow,
+      dir,
+      log: (line) => lines.push(line),
+      hashSalt: 'beef',
+    })
+
+    // 캐시 상태 경로(§2-3)에서 나올 수 있는 event/code 위치로 원시 문자열을 밀어넣는다.
+    diag.record({
+      event: 'epoch_armed',
+      code: 'DRAFT_PRESENT',
+      targetId: DRAFT,
+      detail: { ttlMs: 300000, draft: DRAFT, screen: SCREEN, tail: SCREEN },
+    })
+    diag.record({ event: 'epoch_expired', code: 'DRAFT_PRESENT', targetId: SCREEN })
+    diag.record({
+      event: 'safety_skipped',
+      code: DRAFT,
+      targetId: DRAFT,
+      detail: { phase_code: SCREEN, count: 1 },
+    })
+    diag.record({ event: 'turn_observed', code: SCREEN })
+    await diag.close()
+
+    const snapshot = diag.snapshot()
+    const serialized = JSON.stringify(snapshot)
+    assert.equal(serialized.includes(DRAFT), false, '초안 텍스트가 snapshot에 남으면 안 된다')
+    assert.equal(serialized.includes(SCREEN), false, '화면 텍스트가 snapshot에 남으면 안 된다')
+    assert.equal(lines.join('\n').includes(DRAFT), false)
+    assert.equal(lines.join('\n').includes(SCREEN), false)
+    const file = await readFile(join(dir, 'events.jsonl'), 'utf8')
+    assert.equal(file.includes(DRAFT), false)
+    assert.equal(file.includes(SCREEN), false)
+
+    // 캐시 상태 reason enum은 그대로 유지되고, detail은 허용 key의 숫자만 남는다.
+    assert.equal(snapshot[0].event, 'epoch_armed')
+    assert.equal(snapshot[0].code, 'DRAFT_PRESENT')
+    assert.deepEqual(snapshot[0].detail, { ttlMs: 300000 })
+    assert.equal('draft' in snapshot[0].detail, false)
+    assert.equal('screen' in snapshot[0].detail, false)
+    assert.equal('tail' in snapshot[0].detail, false)
+
+    // 원시 문자열 code는 other로, 문자열 detail은 버려진다.
+    const skipped = snapshot.find((entry) => entry.event === 'safety_skipped')
+    assert.equal(skipped.code, 'other')
+    assert.deepEqual(skipped.detail, { count: 1 })
+  })
+})
+
 test('record는 동기 반환이고 log를 entry별 JSON 한 줄로 호출한다', () => {
   const lines = []
   const diag = createDiagnostics({ now: fixedNow, log: (line) => lines.push(line) })

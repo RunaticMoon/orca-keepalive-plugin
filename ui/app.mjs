@@ -45,7 +45,7 @@ export const REASON_TEXT = Object.freeze({
   WRONG_RUNTIME:
     '다른 Orca 런타임에 연결되어 있습니다. 이 창에서 대시보드를 다시 여세요.',
   NO_FRESH_TURN:
-    '최근에 완료된 작업이 없어 캐시 만료 시점을 알 수 없습니다.',
+    '현재 유효한 예약이 없습니다. 새 작업의 시작과 완료가 관측되면 예약합니다.',
   NO_AGENT:
     '에이전트가 실행되지 않은 일반 터미널입니다.',
   UNSUPPORTED_AGENT:
@@ -63,7 +63,7 @@ export const REASON_TEXT = Object.freeze({
   OUTPUT_ACTIVE:
     '최근 출력이 있어 조용해질 때까지 기다립니다.',
   DRAFT_PRESENT:
-    '입력창에 초안이 있어 전송하지 않습니다. 초안을 지우면 다시 동작합니다.',
+    '입력창 초안이 감지되어 전송하지 않았습니다. 입력창을 확인하세요.',
   SCREEN_UNKNOWN:
     '터미널 화면을 읽지 못해 전송하지 않습니다.',
   INPUT_QUIET_WINDOW:
@@ -87,6 +87,88 @@ export const REASON_TEXT = Object.freeze({
   CATALOG_INCOMPLETE:
     'Orca 터미널 목록이 불완전해 자동 전송을 멈췄습니다. 목록이 복구되면 다시 동작합니다.',
 });
+
+/** Last recorded send block, rather than a claim about why expiry occurred. */
+export const EXPIRE_CAUSE_TEXT = Object.freeze({
+  DRAFT_PRESENT: '입력창 초안이 감지되어 전송하지 못함',
+  INPUT_QUIET_WINDOW: '최근 입력 후 대기 시간 때문에 전송하지 못함',
+  OUTPUT_ACTIVE: '최근 출력이 계속되어 전송하지 못함',
+  INTERACTIVE_WAIT: '권한·입력 응답 대기로 전송하지 못함',
+  BUSY: '에이전트 작업 중으로 판단되어 전송하지 못함',
+  UNKNOWN_WAIT: '대기 상태를 확인하지 못해 전송하지 못함',
+  SCREEN_UNKNOWN: '화면을 확인하지 못해 전송하지 못함',
+  GLOBAL_PAUSED: '전체 일시정지로 전송하지 못함',
+  SCOPE_DISABLED: '대상 설정이 꺼져 전송하지 못함',
+  APP_TIMER_OFF: '캐시 타이머가 꺼져 전송하지 못함',
+  SETTINGS_UNKNOWN: '타이머 설정을 확인하지 못해 전송하지 못함',
+  CWARM_DISABLED: 'cwarm 중지 설정으로 전송하지 못함',
+  LIMIT_REACHED: '연속 전송 상한에 도달해 전송하지 못함',
+  STORAGE_FAILED: '상태 저장 실패로 전송하지 못함',
+  CATALOG_INCOMPLETE: '대상 목록을 확인하지 못해 전송하지 못함',
+  RUNTIME_UNAVAILABLE: 'Orca 런타임에 연결하지 못해 전송하지 못함',
+  WRONG_RUNTIME: '다른 Orca 런타임에 연결되어 전송하지 못함',
+  NO_AGENT: '에이전트가 없어 전송하지 못함',
+  UNSUPPORTED_AGENT: '지원하지 않는 에이전트라 전송하지 못함',
+  UNSUPPORTED_HOST: '지원하지 않는 실행 환경이라 전송하지 못함',
+  NOT_CONNECTED: '터미널 연결이 끊겨 전송하지 못함',
+  STALE_TARGET: '대상 터미널이 변경되어 전송하지 못함',
+});
+
+const CACHE_STATUSES = new Set(['working', 'scheduled', 'sending', 'awaiting-turn', 'expired', 'no-reservation', 'interactive-wait', 'suspended', 'review']);
+
+/** Local wall time relative to the snapshot clock; old dates include month/day. */
+export function formatCacheTime(at, now) {
+  if (at === null || !Number.isFinite(at)) return PLACEHOLDER;
+  const date = new Date(at);
+  const today = new Date(now);
+  if (!Number.isFinite(date.getTime())) return PLACEHOLDER;
+  const pad = (n) => String(n).padStart(2, '0');
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const sameDay = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth() && date.getDate() === today.getDate();
+  return sameDay ? clock : `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${clock}`;
+}
+
+function fullCacheTime(at) {
+  if (at === null || !Number.isFinite(at)) return '';
+  return new Intl.DateTimeFormat('ko-KR', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    second: '2-digit', timeZoneName: 'short',
+  }).format(new Date(at));
+}
+
+/** User-facing status is selected from the cache contract, never from phase alone. */
+export function cacheStatusDisplay(terminal, now) {
+  if (terminal.supported === false) {
+    return terminal.reason === 'NO_AGENT'
+      ? { category: 'none', label: '대상 아님', text: '캐시 유지 대상 아님 · 일반 터미널' }
+      : { category: 'none', label: '미지원', text: `캐시 유지 미지원 · ${Object.hasOwn(REASON_TEXT, terminal.reason) ? reasonText(terminal.reason) : '이 터미널에서는 캐시 유지를 지원하지 않습니다.'}` };
+  }
+  const status = terminal.needsReview === true || terminal.cacheState === 'review'
+    ? 'review'
+    : CACHE_STATUSES.has(terminal.cacheStatus) ? terminal.cacheStatus : 'no-reservation';
+  const time = (at) => formatCacheTime(at, now);
+  const expiry = terminal.expiresAt;
+  const expired = terminal.expiredAt ?? expiry;
+  const cause = EXPIRE_CAUSE_TEXT[terminal.expireCause] ?? '전송 차단 사유 기록 없음';
+  if (status === 'working') return { category: 'kept', label: '유지 중', text: '캐시 유지 중 · 작업 진행 중' };
+  if (status === 'scheduled') return { category: 'kept', label: '유지 중', text: `캐시 유지 중 · 만료 예정 ${time(expiry)}`, at: expiry };
+  if (status === 'sending') return { category: 'kept', label: '유지 중', text: '캐시 유지 중 · 유지 메시지 전송 중' };
+  if (status === 'awaiting-turn') return { category: 'kept', label: '유지 중', text: '캐시 유지 중 · 작업 시작 확인 중' };
+  if (status === 'expired') return { category: 'expired', label: '만료', text: `캐시 만료됨 · ${time(expired)} · ${cause}`, at: expired, cause: true };
+  if (status === 'interactive-wait') return { category: 'stopped', label: '유지 중단', text: '유지 중단 · 권한·입력 응답 대기' };
+  if (status === 'suspended') return { category: 'stopped', label: '유지 중단', text: `유지 중단 · ${Object.hasOwn(REASON_TEXT, terminal.reason) ? reasonText(terminal.reason) : '현재 예약이 중단되었습니다.'}` };
+  if (status === 'review') return { category: 'review', label: '확인 필요', text: '확인 필요 · 전송 결과를 확인하세요' };
+  if (terminal.reservationNote === 'safety-cutoff' && expiry !== null) {
+    return { category: 'none', label: '예약 없음', text: `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 ${time(expiry)}`, at: expiry };
+  }
+  return {
+    category: 'none', label: '예약 없음',
+    text: terminal.reservationNote === 'initial'
+      ? '예약 없음 · 플러그인 시작 후 아직 작업의 시작과 완료를 관측하지 못함'
+      : '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다',
+  };
+}
 
 /** Short labels for every diagnostic event in `src/contracts.mjs`. */
 export const DIAGNOSTIC_EVENT_TEXT = Object.freeze({
@@ -271,6 +353,7 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
    */
   const mapTerminal = (terminal) => {
     const expiresAt = finiteOrNull(terminal.expiresAt);
+    const expiredAt = finiteOrNull(terminal.expiredAt);
     const dueAt = finiteOrNull(terminal.dueAt);
     const remainingMs = expiresAt === null ? null : expiresAt - now;
     const dueInMs = dueAt === null ? null : dueAt - now;
@@ -284,6 +367,14 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
       id: typeof terminal.id === 'string' ? terminal.id : '',
       title: typeof terminal.title === 'string' ? terminal.title : '',
       phase: typeof terminal.phase === 'string' ? terminal.phase : 'UNKNOWN',
+      cacheState: ['kept', 'none', 'review'].includes(terminal.cacheState) ? terminal.cacheState : 'none',
+      cacheStatus: CACHE_STATUSES.has(terminal.cacheStatus) ? terminal.cacheStatus : 'no-reservation',
+      reservationNote: terminal.cacheStatus === 'no-reservation' && ['initial', 'safety-cutoff'].includes(terminal.reservationNote)
+        ? terminal.reservationNote : null,
+      indicatorOn: terminal.indicatorOn === true,
+      expiredAt,
+      expireCause: typeof terminal.expireCause === 'string' && Object.hasOwn(EXPIRE_CAUSE_TEXT, terminal.expireCause) ? terminal.expireCause : null,
+      blockedReason: typeof terminal.blockedReason === 'string' && Object.hasOwn(EXPIRE_CAUSE_TEXT, terminal.blockedReason) ? terminal.blockedReason : null,
       enabledOverride: override,
       scopeValue: override === null ? 'inherit' : override ? 'on' : 'off',
       effectiveEnabled: terminal.effectiveEnabled === true,
@@ -369,14 +460,23 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
       })
     : [];
 
-  const maxConsecutive = finiteOrNull(rawConfig.maxConsecutiveKeepalives);
+  const maxConsecutive5m = finiteOrNull(rawConfig.maxConsecutiveKeepalives5m);
+  const maxConsecutive1h = finiteOrNull(rawConfig.maxConsecutiveKeepalives1h);
+  const configuredLimits = [maxConsecutive5m, maxConsecutive1h].filter((limit) => limit !== null);
+  const finiteLimits = configuredLimits.filter((limit) => limit > 0);
+  const fallbackLimit = finiteLimits.length > 0
+    ? Math.min(...finiteLimits)
+    : configuredLimits.length > 0 ? 0 : null;
+  const maxConsecutive = finiteOrNull(rawConfig.maxConsecutiveKeepalivesActive)
+    ?? (timer.ttlMs === 300000 ? maxConsecutive5m : timer.ttlMs === 3600000 ? maxConsecutive1h : null)
+    ?? fallbackLimit;
   return {
     revision: finiteOrNull(snap.revision),
     serverNow,
     now,
     paused,
     pauseLabel: paused ? '재개' : '일시정지',
-    maxConsecutiveKeepalives: maxConsecutive,
+    maxConsecutiveKeepalivesActive: maxConsecutive,
     maxConsecutiveText:
       maxConsecutive === null ? PLACEHOLDER : maxConsecutive === 0 ? '무제한' : String(maxConsecutive),
     appTimer: {
@@ -503,7 +603,8 @@ function boot() {
       margin5m: byId('cfg-margin5m'),
       margin1h: byId('cfg-margin1h'),
       quietOutput: byId('cfg-quiet-output'),
-      maxConsecutive: byId('cfg-max-consecutive'),
+      maxConsecutive5m: byId('cfg-max-consecutive-5m'),
+      maxConsecutive1h: byId('cfg-max-consecutive-1h'),
       defaultWorktree: byId('cfg-default-worktree'),
       respectCwarm: byId('cfg-respect-cwarm'),
       tabTitleIndicator: byId('cfg-tab-title-indicator'),
@@ -792,8 +893,8 @@ function boot() {
           head.appendChild(inherit);
         }
         const effective = el('span', 'worktree-effective',
-          `적용 ${worktree.effectiveEnabled ? '● 켜짐' : '○ 꺼짐'}`);
-        effective.title = `실제 적용: ${worktree.effectiveEnabled ? '켜짐' : '꺼짐'}`;
+          `유지 설정 ${worktree.effectiveEnabled ? '켜짐' : '꺼짐'}`);
+        effective.title = `워크트리 유지 설정: ${worktree.effectiveEnabled ? '켜짐' : '꺼짐'}`;
         if (worktree.reasonText) {
           effective.title += ` — ${worktree.reasonText}`;
         }
@@ -835,25 +936,30 @@ function boot() {
     const title = el('span', 'terminal-title', terminal.title || '(제목 없음)');
     title.title = terminal.title || '(제목 없음)';
     head.appendChild(title);
-    head.appendChild(el('span', 'badge badge-phase', terminal.phase));
+    const display = cacheStatusDisplay(terminal, vm.now);
     const status = el('div', 'terminal-status');
-    status.appendChild(
-      el(
-        'span',
-        terminal.effectiveEnabled ? 'terminal-applied is-on' : 'terminal-applied',
-        `${terminal.effectiveEnabled ? '●' : '○'} 적용 ${terminal.effectiveEnabled ? '켜짐' : '꺼짐'}`,
-      ),
-    );
+    const primary = el('div', 'terminal-cache-status');
+    primary.appendChild(el('span', `badge badge-cache badge-cache-${display.category}`, display.label));
+    const stateText = el('span', 'terminal-cache-text', display.text);
+    if (display.at !== undefined) stateText.title = fullCacheTime(display.at);
+    primary.appendChild(stateText);
+    status.appendChild(primary);
+    if (display.cause) {
+      status.appendChild(el('span', 'terminal-cause-note', '마지막으로 기록된 전송 차단 사유입니다.'));
+    }
+    const setting = el('div', 'terminal-setting');
+    setting.appendChild(el('span', 'terminal-applied', `유지 설정 ${terminal.effectiveEnabled ? '켜짐' : '꺼짐'}`));
     if (!terminal.supported && terminal.reason !== 'NO_AGENT') {
       const readonly = el('span', 'readonly-note', '읽기 전용 · 미지원');
       readonly.title = `지원하지 않는 대상이라 읽기 전용입니다.${terminal.reasonText ? ` ${terminal.reasonText}` : ''}`;
-      status.appendChild(readonly);
+      setting.appendChild(readonly);
     }
-    if (terminal.reasonText) {
+    if (terminal.reasonText && (terminal.cacheStatus === 'no-reservation' || !terminal.supported)) {
       const reason = el('span', 'terminal-reason', terminal.reasonText);
       reason.title = terminal.reasonText;
-      status.appendChild(reason);
+      setting.appendChild(reason);
     }
+    status.appendChild(setting);
     row.appendChild(head);
     row.appendChild(status);
 
@@ -892,14 +998,11 @@ function boot() {
     actions.appendChild(reset);
 
     const meta = el('div', 'terminal-meta');
-    const expiry = el(
-      'span',
-      terminal.expired ? 'terminal-expiry is-expired' : 'terminal-expiry',
-      `예상 캐시 만료: ${terminal.remainingText}`,
-    );
-    meta.appendChild(expiry);
-    const due = el('span', 'terminal-due', `다음 keepalive: ${terminal.dueText}`);
-    meta.appendChild(due);
+    let dueEl = null;
+    if (terminal.dueAt !== null) {
+      dueEl = el('span', 'terminal-due', `다음 keepalive: ${terminal.dueText}`);
+      meta.appendChild(dueEl);
+    }
     const budget = el(
       'span',
       'terminal-budget',
@@ -907,17 +1010,12 @@ function boot() {
     );
     meta.appendChild(budget);
     row.appendChild(meta);
-    countdowns.push({
-      expiryEl: expiry,
-      dueEl: due,
-      expiresAt: terminal.expiresAt,
-      dueAt: terminal.dueAt,
-    });
+    countdowns.push({ stateText, terminal, dueEl });
 
     if (terminal.needsReview) {
       const warning = el('span', 'review-warning', '⚠ 확인 필요');
       warning.title = '전송 결과 확인 필요: 터미널 입력창을 확인하세요.';
-      status.appendChild(warning);
+      setting.appendChild(warning);
       const clear = el('button', 'btn compact-button review-action', '다음 작업부터 재개');
       clear.type = 'button';
       clear.setAttribute('aria-label', `다음 작업부터 재개: ${terminal.title || terminal.id}`);
@@ -973,7 +1071,8 @@ function boot() {
     setValue(nodes.cfg.margin5m, msToSeconds(config.margin5mMs));
     setValue(nodes.cfg.margin1h, msToSeconds(config.margin1hMs));
     setValue(nodes.cfg.quietOutput, config.quietOutputMs ?? '');
-    setValue(nodes.cfg.maxConsecutive, config.maxConsecutiveKeepalives ?? '');
+    setValue(nodes.cfg.maxConsecutive5m, config.maxConsecutiveKeepalives5m ?? '');
+    setValue(nodes.cfg.maxConsecutive1h, config.maxConsecutiveKeepalives1h ?? '');
     setChecked(nodes.cfg.defaultWorktree, config.defaultWorktreeEnabled);
     setChecked(nodes.cfg.respectCwarm, config.respectCwarmDisabled);
     setChecked(nodes.cfg.tabTitleIndicator, config.tabTitleIndicator);
@@ -1009,17 +1108,21 @@ function boot() {
     const margin1hMs = seconds(nodes.cfg.margin1h, '1시간 TTL 여유');
     if (margin1hMs instanceof Error) return margin1hMs;
 
-    const integer = (node, label) => {
+    const integer = (node, label, max = Infinity) => {
       const raw = node && node.value !== '' ? Number(node.value) : NaN;
-      if (!Number.isFinite(raw) || raw < 0 || !Number.isInteger(raw)) {
-        return new Error(`${label} 값을 0 이상의 정수로 입력하세요.`);
+      if (!Number.isFinite(raw) || raw < 0 || raw > max || !Number.isInteger(raw)) {
+        return new Error(max === Infinity
+          ? `${label} 값을 0 이상의 정수로 입력하세요.`
+          : `${label} 값을 0~${max} 범위의 정수로 입력하세요.`);
       }
       return raw;
     };
     const quietOutputMs = integer(nodes.cfg.quietOutput, '출력 조용 기준');
     if (quietOutputMs instanceof Error) return quietOutputMs;
-    const maxConsecutiveKeepalives = integer(nodes.cfg.maxConsecutive, '연속 keepalive 상한');
-    if (maxConsecutiveKeepalives instanceof Error) return maxConsecutiveKeepalives;
+    const maxConsecutiveKeepalives5m = integer(nodes.cfg.maxConsecutive5m, '연속 keepalive 상한 (5분 TTL)', 1000);
+    if (maxConsecutiveKeepalives5m instanceof Error) return maxConsecutiveKeepalives5m;
+    const maxConsecutiveKeepalives1h = integer(nodes.cfg.maxConsecutive1h, '연속 keepalive 상한 (1시간 TTL)', 1000);
+    if (maxConsecutiveKeepalives1h instanceof Error) return maxConsecutiveKeepalives1h;
 
     const runtimeRaw = nodes.cfg.runtimePath ? nodes.cfg.runtimePath.value.trim() : '';
     return {
@@ -1027,7 +1130,8 @@ function boot() {
       margin5mMs,
       margin1hMs,
       quietOutputMs,
-      maxConsecutiveKeepalives,
+      maxConsecutiveKeepalives5m,
+      maxConsecutiveKeepalives1h,
       defaultWorktreeEnabled: nodes.cfg.defaultWorktree ? nodes.cfg.defaultWorktree.checked : false,
       respectCwarmDisabled: nodes.cfg.respectCwarm ? nodes.cfg.respectCwarm.checked : false,
       tabTitleIndicator: nodes.cfg.tabTitleIndicator ? nodes.cfg.tabTitleIndicator.checked : false,
@@ -1073,15 +1177,15 @@ function boot() {
   function renderCountdowns() {
     if (!snapshot) return;
     const elapsed = Date.now() - receivedAt;
+    const now = snapshot.serverNow + elapsed;
     for (const item of countdowns) {
-      const remaining =
-        item.expiresAt === null ? null : item.expiresAt - (snapshot.serverNow + elapsed);
-      item.expiryEl.textContent = `예상 캐시 만료: ${formatRemaining(remaining)}`;
-      item.expiryEl.classList.toggle('is-expired', remaining !== null && remaining <= 0);
-      const due = item.dueAt === null ? null : item.dueAt - (snapshot.serverNow + elapsed);
-      item.dueEl.textContent = `다음 keepalive: ${
-        due !== null && due <= 0 ? '임박' : formatRemaining(due)
-      }`;
+      const display = cacheStatusDisplay(item.terminal, now);
+      item.stateText.textContent = display.text;
+      item.stateText.title = display.at === undefined ? '' : fullCacheTime(display.at);
+      if (item.dueEl) {
+        const due = item.terminal.dueAt - now;
+        item.dueEl.textContent = `다음 keepalive: ${due <= 0 ? '임박' : formatRemaining(due)}`;
+      }
     }
   }
 
