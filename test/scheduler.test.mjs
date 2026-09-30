@@ -2,7 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { TIMING } from '../src/contracts.mjs';
-import { decide, initialTargetState, marginFor, reduceTarget } from '../src/scheduler.mjs';
+import {
+  cacheBasisAt,
+  decide,
+  initialTargetState,
+  marginFor,
+  reduceTarget,
+} from '../src/scheduler.mjs';
 
 const TARGET = Object.freeze({
   targetId: 't1',
@@ -104,6 +110,7 @@ test('initialTargetState는 계약 shape을 만든다', () => {
     phase: 'UNKNOWN',
     lastHook: null,
     lastHookAt: null,
+    lastWorkingAt: null,
     seenWorking: false,
     epochSeq: 0,
     epoch: null,
@@ -133,7 +140,7 @@ test('fresh working→done이 ARMED epoch를 연다', () => {
   assert.equal(state.seenWorking, true);
   state = reduce(state, hook('done', 2000));
   assert.equal(state.phase, 'ARMED');
-  assert.deepEqual(state.epoch, { id: 1, doneAt: 2000, attempted: false });
+  assert.deepEqual(state.epoch, { id: 1, doneAt: 2000, basisAt: 1000, attempted: false });
   assert.equal(state.epochSeq, 1);
   assert.equal(state.reason, null);
 });
@@ -615,7 +622,7 @@ test('RESTORE_EPOCH: 초기 상태에서 복원하면 ARMED epoch를 만들고 d
   const done = 1_000_000;
   const state = reduce(initialTargetState(TARGET), restore(done, done + 1000));
   assert.equal(state.phase, 'ARMED');
-  assert.deepEqual(state.epoch, { id: 1, doneAt: done, attempted: false });
+  assert.deepEqual(state.epoch, { id: 1, doneAt: done, basisAt: done, attempted: false });
   assert.equal(state.epochSeq, 1);
   assert.equal(state.seenWorking, true);
   assert.equal(state.lastHook, 'done');
@@ -718,4 +725,133 @@ test('deepFreeze한 state에 RESTORE_EPOCH를 적용해도 throw하지 않는다
   assert.doesNotThrow(() => reduce(frozen, restore(2000, 3000)));
   const rejected = deepFreeze(armed(2000));
   assert.doesNotThrow(() => reduce(rejected, restore(3000, 4000)));
+});
+
+// ---------------------------------------------------------------------------
+// cacheBasisAt / basisAt: 캐시 TTL은 마지막 API 요청 시작(마지막 working) 기준
+// ---------------------------------------------------------------------------
+
+test('cacheBasisAt: 유효하면 lastWorkingAt, 아니면 doneAt', () => {
+  assert.equal(cacheBasisAt(1000, 2000), 1000);
+  assert.equal(cacheBasisAt(2000, 2000), 2000);
+  assert.equal(cacheBasisAt(2000 - TIMING.basisMaxGapMs, 2000), 2000 - TIMING.basisMaxGapMs);
+  // 간격이 상한을 넘으면 doneAt으로 되돌아간다.
+  assert.equal(cacheBasisAt(2000 - TIMING.basisMaxGapMs - 1, 2000), 2000);
+  // doneAt보다 미래이거나 비유한수면 doneAt.
+  assert.equal(cacheBasisAt(3000, 2000), 2000);
+  assert.equal(cacheBasisAt(null, 2000), 2000);
+  assert.equal(cacheBasisAt(undefined, 2000), 2000);
+  assert.equal(cacheBasisAt(NaN, 2000), 2000);
+  assert.equal(cacheBasisAt('1000', 2000), 2000);
+});
+
+test('basisAt (a): 도구별 working이 있으면 마지막 working 시각을 쓴다', () => {
+  const t0 = 1_000_000;
+  let state = reduce(initialTargetState(TARGET), hook('working', t0));
+  state = reduce(state, hook('working', t0 + 100_000));
+  state = reduce(state, hook('done', t0 + 160_000));
+
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.doneAt, t0 + 160_000);
+  assert.equal(state.epoch.basisAt, t0 + 100_000);
+
+  const result = decideWith(state, t0 + 100_000);
+  const expiresAt = t0 + 100_000 + TTL_5M;
+  const dueAt = expiresAt - 60_000;
+  assert.equal(result.expiresAt, expiresAt);
+  assert.equal(result.dueAt, dueAt);
+  assert.equal(result.nextAt, dueAt);
+});
+
+test('basisAt (b): 중간 도구 working이 없으면 첫 working 시각(doneAt 아님)', () => {
+  const t0 = 1_000_000;
+  let state = reduce(initialTargetState(TARGET), hook('working', t0));
+  state = reduce(state, hook('done', t0 + 20_000));
+
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.basisAt, t0);
+  assert.equal(state.epoch.doneAt, t0 + 20_000);
+});
+
+test('basisAt (c): 간격이 3분을 넘으면 doneAt으로 되돌아간다', () => {
+  const t0 = 1_000_000;
+  let state = reduce(initialTargetState(TARGET), hook('working', t0));
+  state = reduce(state, hook('done', t0 + 200_000));
+
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.basisAt, t0 + 200_000);
+  assert.equal(state.epoch.basisAt, state.epoch.doneAt);
+});
+
+test('basisAt (d): 자체 keepalive 턴도 working 수신 시각을 기준으로 한다', () => {
+  let state = awaitingTurn(3_100);
+  state = reduce(state, hook('working', 13_100));
+  assert.equal(state.selfTurnSeq, 1);
+  state = reduce(state, hook('done', 14_100));
+
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.doneAt, 14_100);
+  assert.equal(state.epoch.basisAt, 13_100);
+});
+
+test('basisAt (f): epoch를 만들면 lastWorkingAt을 비우고, 못 만들면 유지한다', () => {
+  const t0 = 1_000_000;
+
+  // epoch를 만들면 lastWorkingAt을 비운다.
+  let state = reduce(initialTargetState(TARGET), hook('working', t0));
+  assert.equal(state.lastWorkingAt, t0);
+  state = reduce(state, hook('done', t0 + 1000));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.lastWorkingAt, null);
+  assert.equal(state.epoch.basisAt, t0);
+
+  // 중복 working도 마지막 시각으로 갱신한다.
+  let selfState = awaitingTurn(3_100);
+  selfState = reduce(selfState, hook('working', 13_100));
+  selfState = reduce(selfState, hook('working', 13_200));
+  assert.equal(selfState.lastWorkingAt, 13_200);
+
+  // epoch를 만들지 않는 done 분기(mainAgent 미완료)는 lastWorkingAt을 유지한다.
+  const kept = reduce(selfState, hook('done', 13_300, { mainAgentState: 'working' }));
+  assert.equal(kept.epoch, null);
+  assert.equal(kept.lastWorkingAt, 13_200);
+});
+
+test('basisAt (e): RESTORE_EPOCH는 잘못된 basisAt을 doneAt으로 정규화한다', () => {
+  const done = 1_000_000;
+
+  const withBasis = reduce(
+    initialTargetState(TARGET),
+    { type: 'RESTORE_EPOCH', doneAt: done, basisAt: done - 5000, now: done + 1000 },
+  );
+  assert.equal(withBasis.epoch.basisAt, done - 5000);
+
+  const withoutBasis = reduce(
+    initialTargetState(TARGET),
+    { type: 'RESTORE_EPOCH', doneAt: done, now: done + 1000 },
+  );
+  assert.equal(withoutBasis.epoch.basisAt, done);
+
+  const futureBasis = reduce(
+    initialTargetState(TARGET),
+    { type: 'RESTORE_EPOCH', doneAt: done, basisAt: done + 1, now: done + 1000 },
+  );
+  assert.equal(futureBasis.epoch.basisAt, done);
+
+  const tooOldBasis = reduce(
+    initialTargetState(TARGET),
+    { type: 'RESTORE_EPOCH', doneAt: done, basisAt: done - TIMING.basisMaxGapMs - 1, now: done + 1000 },
+  );
+  assert.equal(tooOldBasis.epoch.basisAt, done);
+});
+
+test('RESTORE_EPOCH 복원 뒤 중복 working/done은 basisAt을 유지한다', () => {
+  const done = 1_000_000;
+  let state = reduce(
+    initialTargetState(TARGET),
+    { type: 'RESTORE_EPOCH', doneAt: done, basisAt: done - 5000, now: done + 100 },
+  );
+  assert.equal(state.lastWorkingAt, null);
+  state = reduce(state, hook('done', done + 9000));
+  assert.equal(state.epoch.basisAt, done - 5000);
 });

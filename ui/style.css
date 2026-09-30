@@ -548,11 +548,15 @@ input[type="checkbox"] {
 }
 
 .field-description {
-  grid-column: 2;
+  grid-column: 1;
   margin: 0;
   color: var(--muted);
   font-size: 0.85rem;
   line-height: 1.5;
+}
+
+.field-check-described .field-description {
+  grid-column: 2;
 }
 
 .form-actions {

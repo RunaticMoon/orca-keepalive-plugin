@@ -593,8 +593,9 @@ test('working→done→due에서 정확히 1회 전송, 자체 turn은 budget �
 
   let term = viewTerminal(h)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.expiresAt, t0 + 1000 + TTL_5M)
-  assert.equal(term.dueAt, t0 + 1000 + TTL_5M - MARGIN_5M)
+  // basisAt은 마지막 working 수신 시각(t0)이므로 완료 시각(t0+1000)이 아니다.
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
 
   await advanceToDue(h)
   assert.equal(h.sendCalls.length, 1)
@@ -625,7 +626,8 @@ test('working→done→due에서 정확히 1회 전송, 자체 turn은 budget �
   await h.clock.settle()
   term = viewTerminal(h)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.expiresAt, turnAt + 100 + TTL_5M)
+  // 자체 턴도 마지막 working 수신 시각(turnAt)이 basisAt이다.
+  assert.equal(term.expiresAt, turnAt + TTL_5M)
   assert.equal(h.store.getBudget(SCOPE).charged, 1)
 })
 
@@ -768,7 +770,11 @@ test('assertAllowed: 정책 off를 반영한다', async () => {
 
 test('assertAllowed: cwarm disabled 파일을 반영한다', async () => {
   const { gates } = await runGateProbe(() => createHarness({ cwarmDisabled: true }), () => {})
-  assert.equal(gates.length, 1)
+  // skipped 전송은 예약을 소진하지 않아 다음 tick에서 다시 검사할 수 있다.
+  // 상한 근거: skipUntil은 실패 tick + tickMs(2000ms)에 재시도를 허용하고
+  // advanceToDue의 창은 dueAt + tickMs + 100ms이므로, due tick의 검사 1회와
+  // 그다음 tick의 재시도 1회만 창 안에 든다(최대 2회, 1..2).
+  assert.ok(gates.length >= 1 && gates.length <= 2, `gates=${gates.length}`)
   assert.deepEqual(gates[0], { allowed: false, reason: 'CWARM_DISABLED' })
 })
 
@@ -794,17 +800,20 @@ test('due 대상 3개여도 in-flight는 항상 1개이고 순차 실행된다',
   const h = createHarness({ terminals: rows })
   let active = 0
   let maxActive = 0
-  h.setSendBehavior(async () => {
+  h.setSendBehavior(async (args) => {
     active += 1
     maxActive = Math.max(maxActive, active)
     await new Promise((resolve) => h.clock.setTimeout(resolve, 50))
     active -= 1
+    // 실제 전송처럼 예약 단계를 거쳐 epoch를 소진한다(재시도로 인한 중복 제거).
+    const attemptId = `probe-${args.target.worktreeId}`
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
     return {
-      kind: 'skipped',
-      reason: 'PROBE',
-      attemptId: null,
+      kind: 'submitted',
+      reason: null,
+      attemptId,
       at: h.clock.now(),
-      framesSent: 0,
+      framesSent: 2,
     }
   })
   await startHarness(h)
@@ -817,6 +826,8 @@ test('due 대상 3개여도 in-flight는 항상 1개이고 순차 실행된다',
   await h.clock.advance(dueAt - h.clock.now() + 3 * 2000 + 500)
   assert.equal(maxActive, 1)
   assert.equal(h.sendCalls.length, 3)
+  const sentWorktrees = new Set(h.sendCalls.map((call) => call.target.worktreeId))
+  assert.deepEqual([...sentWorktrees].sort(), ['w1', 'w2', 'w3'])
 })
 
 // ---------------------------------------------------------------------------
@@ -1037,8 +1048,33 @@ test('getRuntimeView: 계약 shape과 dueAt/expiresAt', async () => {
   await arm(h, t0)
   term = viewTerminal(h)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.dueAt, t0 + 1000 + TTL_5M - MARGIN_5M)
-  assert.equal(term.expiresAt, t0 + 1000 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+})
+
+test('basisAt: working→working(도구)→done이면 예약 dueAt이 마지막 working 기준이다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  const t0 = h.clock.now()
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+
+  // 도구 호출마다 오는 working 이벤트. 다음 API 요청 시작(≈마지막 working)이다.
+  await h.clock.advance(100_000)
+  const t1 = h.clock.now()
+  worktreeEvent(h, 'w1', 'working', t1)
+  await h.clock.settle()
+
+  await h.clock.advance(60_000)
+  const t2 = h.clock.now()
+  worktreeEvent(h, 'w1', 'done', t2)
+  await h.clock.settle()
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, t1 + TTL_5M)
+  assert.equal(term.dueAt, t1 + TTL_5M - MARGIN_5M)
 })
 
 test('getRuntimeView: label은 projectName, branch는 branchName을 쓴다', async () => {
@@ -1783,7 +1819,7 @@ test('turn-start 미관측: store.markReview 실패도 tick을 막지 않고 진
 })
 
 // ---------------------------------------------------------------------------
-// 19. 탭 제목 ⚡ 표시기(실험 옵션) 연결
+// 19. 탭 제목 ⚡ 표시기 연결
 // ---------------------------------------------------------------------------
 
 test('title indicator: 옵션 off면 매 tick reconcile([])를 호출한다', async () => {
@@ -1793,6 +1829,8 @@ test('title indicator: 옵션 off면 매 tick reconcile([])를 호출한다', as
   assert.ok(indicator, 'rpc 준비 후 표시기를 생성해야 한다')
   assert.equal(indicator.calls.load, 1, 'load를 1회 호출한다')
 
+  // 기본값은 true이므로 명시적으로 끄고 off 동작을 검증한다.
+  await h.store.updateConfig({ tabTitleIndicator: false })
   await h.clock.advance(h.tickMs)
   assert.ok(indicator.calls.reconcile.length >= 1)
   assert.deepEqual(indicator.calls.reconcile.at(-1), [])
@@ -2338,6 +2376,7 @@ test('epochMemory: 첫 done 뒤 ARMED이면 remember한다', async () => {
     ptyId: 'pty1',
     incarnationId: 'inc1',
     doneAt: t0 + 1000,
+    basisAt: t0,
   })
   assert.equal(epochMemory.store.has(EPOCH_KEY), true)
 })
@@ -2374,8 +2413,9 @@ test('epochMemory: 같은 ptyId·incarnationId target은 새 인스턴스에서 
 
   const term = viewTerminal(h2)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.expiresAt, doneAt + TTL_5M)
-  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+  // 복원 시에도 basisAt(마지막 working t0)이 doneAt(t0+1000)보다 우선한다.
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
 
   const restored = h2.diagEvents.filter((entry) => entry.event === 'epoch_restored')
   assert.equal(restored.length, 1)
@@ -2402,8 +2442,8 @@ test('epochMemory: incarnationId가 달라도(Orca 재시작) 같은 ptyId면 �
 
   const term = viewTerminal(h2)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.expiresAt, doneAt + TTL_5M)
-  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
   assert.equal(epochMemory.store.has(EPOCH_KEY), true)
   assert.equal(epochMemory.calls.forget.length, forgetBefore)
 
@@ -2496,8 +2536,8 @@ test('epochMemory: incarnationId null도 remember되고 같은 ptyId·null로 �
 
   const term = viewTerminal(h2)
   assert.equal(term.phase, 'ARMED')
-  assert.equal(term.expiresAt, doneAt + TTL_5M)
-  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
   assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 1)
 })
 

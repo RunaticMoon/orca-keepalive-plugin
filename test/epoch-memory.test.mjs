@@ -494,3 +494,69 @@ test('load: 상한 초과 저장값을 정리하면 persist 예약', async () =>
   assert.equal(memory.get('k0'), null);
   assert.notEqual(memory.get('k3'), null);
 });
+
+// ---------------------------------------------------------------------------
+// basisAt
+// ---------------------------------------------------------------------------
+
+test('basisAt: 유효한 값은 round-trip 되고 옛 레코드(없음)도 그대로 로드된다', async () => {
+  const host = createFakeHost();
+  const first = createEpochMemory({ hostCall: host.hostCall, now: () => 111 });
+  first.remember('with', rec({ doneAt: 5000, basisAt: 4000 }));
+  first.remember('without', rec({ doneAt: 6000 }));
+  await first.flush();
+
+  assert.equal(host.read().entries.with.basisAt, 4000);
+  assert.equal('basisAt' in host.read().entries.without, false);
+
+  const second = createEpochMemory({ hostCall: host.hostCall });
+  await second.load();
+  assert.equal(second.get('with').basisAt, 4000);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(second.get('without'), 'basisAt'),
+    false,
+  );
+  assert.equal(second.get('without').doneAt, 6000);
+});
+
+test('basisAt: load 시 잘못된 값(doneAt 초과·비수치·null)은 생략한다', async () => {
+  const host = createFakeHost({
+    initial: {
+      version: 1,
+      entries: {
+        future: { ...rec({ doneAt: 1000, basisAt: 2000 }), savedAt: 7 },
+        nonNumeric: { ...rec({ doneAt: 1000, basisAt: 'x' }), savedAt: 7 },
+        nullish: { ...rec({ doneAt: 1000, basisAt: null }), savedAt: 7 },
+        valid: { ...rec({ doneAt: 1000, basisAt: 500 }), savedAt: 7 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  for (const key of ['future', 'nonNumeric', 'nullish']) {
+    const record = memory.get(key);
+    assert.notEqual(record, null);
+    assert.equal(Object.prototype.hasOwnProperty.call(record, 'basisAt'), false);
+    assert.equal(record.doneAt, 1000);
+  }
+  assert.equal(memory.get('valid').basisAt, 500);
+});
+
+test('remember: basisAt만 바뀌어도 다시 persist한다', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 4000 }));
+  await memory.flush();
+  const before = host.setCount();
+
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 4000 }));
+  await memory.flush();
+  assert.equal(host.setCount(), before, '같은 내용이면 persist 없음');
+
+  memory.remember('k1', rec({ doneAt: 5000, basisAt: 3000 }));
+  await memory.flush();
+  assert.equal(host.setCount(), before + 1);
+  assert.equal(host.read().entries.k1.basisAt, 3000);
+});

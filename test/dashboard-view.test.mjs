@@ -44,7 +44,9 @@ function makeSnapshot(overrides = {}) {
       margin1hMs: 60000,
       quietOutputMs: 5000,
       observedInputQuietMs: 5000,
-      maxConsecutiveKeepalives: 3,
+      maxConsecutiveKeepalives5m: 8,
+      maxConsecutiveKeepalives1h: 3,
+      maxConsecutiveKeepalivesActive: 8,
       respectCwarmDisabled: true,
       logLevel: 'info',
       runtimeUserDataPath: null,
@@ -176,7 +178,27 @@ test('toViewModel: base snapshot flattens worktrees, terminals and timers', () =
   assert.equal(t1.dueText, '3:20');
   assert.equal(t1.expired, false);
   assert.equal(t1.reasonText, reasonText('BUSY'));
-  assert.equal(vm.maxConsecutiveText, '3');
+  assert.equal(vm.maxConsecutiveText, '8');
+});
+
+test('toViewModel: 현재 TTL의 상한을 표시하고 active 값이 우선한다', () => {
+  const snap = makeSnapshot();
+  delete snap.config.maxConsecutiveKeepalivesActive;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '8');
+
+  snap.appTimer.ttlMs = 3600000;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '3');
+
+  snap.config.maxConsecutiveKeepalivesActive = 0;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '무제한');
+
+  delete snap.config.maxConsecutiveKeepalivesActive;
+  snap.appTimer.ttlMs = null;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '3');
+  snap.config.maxConsecutiveKeepalives1h = 0;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '8', '0은 무제한이므로 유한한 상한을 선택');
+  snap.config.maxConsecutiveKeepalives5m = 0;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '무제한');
 });
 
 test('toViewModel: worktree branch를 보조 텍스트로 전달', () => {
@@ -560,7 +582,7 @@ test('index.html: tab title indicator has a checkbox, visible label, and linked 
   assert.match(input, /\baria-describedby="cfg-tab-title-indicator-description"/);
   assert.match(
     indexHtml,
-    /<label\s+for="cfg-tab-title-indicator">탭 이름에 ⚡ 표시 \(실험\)<\/label>/,
+    /<label\s+for="cfg-tab-title-indicator">탭 이름에 ⚡ 표시<\/label>/,
   );
   const description = indexHtml.match(
     /<p\s+id="cfg-tab-title-indicator-description"[^>]*>([\s\S]*?)<\/p>/,
@@ -569,6 +591,20 @@ test('index.html: tab title indicator has a checkbox, visible label, and linked 
     description,
     'keepalive가 적용되는 Claude 터미널의 탭 이름 앞에 ⚡를 붙여 칸반·워크트리 카드에서 보이게 합니다. Orca에는 사용자가 직접 바꾼 탭 이름으로 저장되므로, 켜져 있는 동안 자동 탭 이름 갱신이 멈추고(작업이 끝날 때 다시 맞춤), 끄면 자동 이름으로 돌아갑니다. 직접 붙인 탭 이름은 유지되지 않을 수 있습니다.',
   );
+});
+
+test('config form: TTL별 상한 입력과 도움말이 연결되고 레거시 입력은 없다', () => {
+  for (const [ttl, name] of [['5m', 'maxConsecutiveKeepalives5m'], ['1h', 'maxConsecutiveKeepalives1h']]) {
+    const id = `cfg-max-consecutive-${ttl}`;
+    const input = indexHtml.match(new RegExp(`<input\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];
+    assert.ok(input, `${ttl} input`);
+    assert.match(input, new RegExp(`\\bname="${name}"`));
+    assert.match(input, /\bmax="1000"/);
+    assert.match(input, new RegExp(`\\baria-describedby="${id}-description"`));
+    assert.match(indexHtml, new RegExp(`<label for="${id}">연속 keepalive 상한`));
+    assert.match(indexHtml, new RegExp(`<p id="${id}-description"`));
+  }
+  assert.doesNotMatch(indexHtml, /\bname="maxConsecutiveKeepalives"/);
 });
 
 test('config form: missing, true, and false snapshots render; Save sends changed checkbox value', async () => {
@@ -622,8 +658,12 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     await settle();
 
     const checkbox = nodes.get('cfg-tab-title-indicator');
+    const limit5m = nodes.get('cfg-max-consecutive-5m');
+    const limit1h = nodes.get('cfg-max-consecutive-1h');
     const form = nodes.get('config-form');
     assert.equal(checkbox.checked, false, 'missing field defaults to off');
+    assert.equal(limit5m.value, '8');
+    assert.equal(limit1h.value, '3');
 
     state = { ...state, config: { ...state.config, tabTitleIndicator: true } };
     intervals[0]();
@@ -636,6 +676,11 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     assert.equal(checkbox.checked, false);
 
     checkbox.checked = true;
+    limit5m.value = '1001';
+    form.listeners.get('submit')({ preventDefault() {} });
+    assert.equal(actions.length, 0, '범위 밖 상한은 제출하지 않음');
+    limit5m.value = '6';
+    limit1h.value = '2';
     form.listeners.get('change')();
     let prevented = false;
     form.listeners.get('submit')({ preventDefault() { prevented = true; } });
@@ -645,6 +690,9 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     assert.equal(actions[0].type, 'config');
     assert.equal(actions[0].expectedRevision, 7);
     assert.equal(actions[0].patch.tabTitleIndicator, true);
+    assert.equal(actions[0].patch.maxConsecutiveKeepalives5m, 6);
+    assert.equal(actions[0].patch.maxConsecutiveKeepalives1h, 2);
+    assert.equal(Object.hasOwn(actions[0].patch, 'maxConsecutiveKeepalives'), false);
   } finally {
     for (const [key, value] of Object.entries(globals)) {
       if (value === undefined) delete globalThis[key];

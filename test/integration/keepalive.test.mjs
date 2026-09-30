@@ -352,7 +352,8 @@ test('scenario 1: timer off는 0, on 후 기존 idle 0, 새 turn due에서 paste
     assert.equal(h.sendFrames().length, 0, 'timer on만으로 기존 idle에 전송하지 않는다')
 
     const doneAt2 = await h.arm()
-    const dueAt = doneAt2 + DUE_5M
+    // basisAt은 done 이벤트 1초 전의 마지막 working 시각이므로 due도 1초 앞당겨진다.
+    const dueAt = doneAt2 - 1000 + DUE_5M
     await h.advanceTo(dueAt - 1000)
     await h.settleSend()
     assert.equal(h.sendFrames().length, 0, 'due 1초 전에는 0')
@@ -383,7 +384,8 @@ test('scenario 2: TTL 1h는 done+3480s 부근에서 전송한다', async () => {
   try {
     await h.start()
     const doneAt = await h.arm()
-    const dueAt = doneAt + DUE_1H
+    // basisAt은 done 이벤트 1초 전의 마지막 working 시각이므로 due도 1초 앞당겨진다.
+    const dueAt = doneAt - 1000 + DUE_1H
 
     await h.advanceTo(dueAt - 1000)
     await h.settleSend()
@@ -406,6 +408,23 @@ test('scenario 3: 자체 순환 3회 후 4번째 0, 비자체 turn이면 budget 
   try {
     await h.start()
 
+    // 5분 TTL 상한을 3으로 명시해 기본값(8)과 무관하게 경계를 검증한다.
+    const dashboard = await h.openDashboard()
+    assert.equal(dashboard.status, 200)
+    const configured = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { maxConsecutiveKeepalives5m: 3, maxConsecutiveKeepalives1h: 3 },
+        expectedRevision: dashboard.state.revision,
+      },
+    })
+    assert.equal(configured.status, 200, 'cap 3 config POST 성공')
+
     let expected = 0
     for (let index = 0; index < 3; index += 1) {
       const doneAt = await h.arm()
@@ -423,7 +442,7 @@ test('scenario 3: 자체 순환 3회 후 4번째 0, 비자체 turn이면 budget 
     const doneAt4 = await h.arm()
     await h.advanceTo(doneAt4 + DUE_5M + TICK_MS)
     await h.settleSend()
-    assert.equal(h.sendFrames().length, 6, '기본 상한 3회 후 4번째는 전송 0')
+    assert.equal(h.sendFrames().length, 6, '설정한 상한 3회 후 4번째는 전송 0')
 
     // 자체 turn이 아닌 fresh working(15초 밖)은 budget을 0으로 reset한다.
     await h.advanceTo(h.clock.now() + 20000)
@@ -734,7 +753,7 @@ test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래�
     await h.start()
     const dashboard = await h.openDashboard()
     assert.equal(dashboard.status, 200)
-    assert.equal(dashboard.state.config.tabTitleIndicator, false)
+    assert.equal(dashboard.state.config.tabTitleIndicator, true, '기본값은 켜짐(true)')
 
     const on = await requestJson({
       method: 'POST',
@@ -893,8 +912,9 @@ test('scenario 14: deactivate→재activate 뒤 저장된 예약을 ARMED로 복
 
     const restored = await h.waitForTerminal((terminal) => terminal.phase === 'ARMED')
     assert.ok(restored, '재activate 뒤 ARMED로 복원되어야 한다')
-    assert.equal(restored.dueAt, doneAt + DUE_5M, 'dueAt = doneAt + TTL - margin')
-    assert.equal(restored.expiresAt, doneAt + TTL_5M)
+    // 저장된 basisAt(마지막 working = done 1초 전)이 복원돼 예약 시각 계산에 쓰인다.
+    assert.equal(restored.dueAt, doneAt - 1000 + DUE_5M, 'dueAt = basisAt + TTL - margin')
+    assert.equal(restored.expiresAt, doneAt - 1000 + TTL_5M)
 
     const dashboard = await h.openDashboard()
     assert.equal(dashboard.status, 200)

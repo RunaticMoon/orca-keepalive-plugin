@@ -10,7 +10,7 @@
 /**
  * 사용자 설정(플러그인 자체). §5.2 JSON과 shape이 같다.
  * @typedef {Object} Config
- * @property {1} schemaVersion
+ * @property {2} schemaVersion
  * @property {string|null} runtimeUserDataPath 같은 Orca 인스턴스를 찾기 위한 절대 경로 override. null이면 후보 경로를 쓴다.
  * @property {boolean} paused 전역 일시정지(플러그인 자체).
  * @property {boolean} defaultWorktreeEnabled worktree override가 없을 때의 기본값.
@@ -19,10 +19,11 @@
  * @property {number} margin1hMs 1시간 TTL용 여유(정수 ms).
  * @property {number} quietOutputMs 출력이 조용해야 하는 최소 시간(정수 ms).
  * @property {number} observedInputQuietMs 관측된 입력 변화 이후 대기 시간(정수 ms).
- * @property {number} maxConsecutiveKeepalives 연속 keepalive 상한(0=무제한).
+ * @property {number} maxConsecutiveKeepalives5m 5분 TTL 연속 keepalive 상한(0=무제한).
+ * @property {number} maxConsecutiveKeepalives1h 1시간 TTL 연속 keepalive 상한(0=무제한).
  * @property {boolean} respectCwarmDisabled ~/.claude/cwarm.disabled 존재 시 전송 차단.
  * @property {'debug'|'info'|'warn'|'error'} logLevel
- * @property {boolean} tabTitleIndicator 실험 옵션. keepalive 적용 Claude 터미널 탭 이름 앞에 ⚡ 표시.
+ * @property {boolean} tabTitleIndicator keepalive 적용 Claude 터미널 탭 이름 앞에 ⚡ 표시.
  */
 
 /**
@@ -89,8 +90,9 @@
  * @typedef {Object} TargetEpoch
  * @property {number} id 내부 단조 정수.
  * @property {number} doneAt 첫 인정 done의 receivedAt.
+ * @property {number} basisAt 캐시 TTL 기준 시각. 턴의 마지막 working 이벤트 수신 시각(≈마지막 API 요청 시작)이며, 없거나 완료 시각과 3분 넘게 차이 나면 doneAt.
  * @property {number} dueAt expiresAt - margin.
- * @property {number} expiresAt doneAt + ttlMs.
+ * @property {number} expiresAt basisAt + ttlMs.
  * @property {boolean} attempted 이 epoch에서 mutation을 예약했는지.
  */
 
@@ -415,6 +417,7 @@ export const TIMING = deepFreeze({
   minSendSpacingMs: 2000,
   clockGapMs: 10000,
   clockSkewMs: 5000,
+  basisMaxGapMs: 180000,
 });
 
 /**

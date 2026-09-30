@@ -374,9 +374,12 @@ export function renderStatus(snapshot, options = {}) {
   const connection = snap.connection && typeof snap.connection === 'object' ? snap.connection : {};
   const currentHash =
     typeof options.currentWorktreeHash === 'string' ? options.currentWorktreeHash : null;
-  const maxConsecutive = Number.isFinite(config.maxConsecutiveKeepalives)
-    ? config.maxConsecutiveKeepalives
-    : null;
+  // 현재 TTL 기준 유효 상한(dashboard-model이 계산). 없으면 5m 값으로 폴백한다.
+  const maxConsecutive = Number.isFinite(config.maxConsecutiveKeepalivesActive)
+    ? config.maxConsecutiveKeepalivesActive
+    : Number.isFinite(config.maxConsecutiveKeepalives5m)
+      ? config.maxConsecutiveKeepalives5m
+      : null;
 
   const lines = [];
   lines.push(`Cache Keepalive: ${config.paused === true ? '꺼짐 (일시정지)' : '켜짐'}`);
@@ -422,9 +425,15 @@ export function summarizeSnapshot(snapshot, options = {}) {
   const timer = snap.appTimer && typeof snap.appTimer === 'object' ? snap.appTimer : {};
   const currentHash =
     typeof options.currentWorktreeHash === 'string' ? options.currentWorktreeHash : null;
-  const maxConsecutive = Number.isFinite(config.maxConsecutiveKeepalives)
-    ? config.maxConsecutiveKeepalives
+  const maxConsecutive5m = Number.isFinite(config.maxConsecutiveKeepalives5m)
+    ? config.maxConsecutiveKeepalives5m
     : null;
+  const maxConsecutive1h = Number.isFinite(config.maxConsecutiveKeepalives1h)
+    ? config.maxConsecutiveKeepalives1h
+    : null;
+  const maxConsecutiveActive = Number.isFinite(config.maxConsecutiveKeepalivesActive)
+    ? config.maxConsecutiveKeepalivesActive
+    : maxConsecutive5m;
 
   const worktrees = (Array.isArray(snap.worktrees) ? snap.worktrees : []).map((worktree) => {
     const wt = worktree && typeof worktree === 'object' ? worktree : {};
@@ -458,7 +467,9 @@ export function summarizeSnapshot(snapshot, options = {}) {
     revision: Number.isSafeInteger(snap.revision) ? snap.revision : 0,
     paused: config.paused === true,
     defaultWorktreeEnabled: config.defaultWorktreeEnabled === true,
-    maxConsecutiveKeepalives: maxConsecutive,
+    maxConsecutiveKeepalives5m: maxConsecutive5m,
+    maxConsecutiveKeepalives1h: maxConsecutive1h,
+    maxConsecutiveKeepalivesActive: maxConsecutiveActive,
     appTimer: {
       known: timer.known === true,
       enabled: timer.enabled === true,

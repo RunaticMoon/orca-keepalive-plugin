@@ -20,7 +20,7 @@
 
 import crypto from 'node:crypto';
 
-import { parseConfig, parseConfigPatch } from './config.mjs';
+import { parseConfig, parseConfigPatch, capFor, CONFIG_SCHEMA_VERSION } from './config.mjs';
 import { STATE_LIMITS } from './contracts.mjs';
 
 /** host storage의 단일 key. §5.2. */
@@ -658,6 +658,15 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
       memoryPaused = false;
       lastSaveError = null;
 
+      // 저장된 원본 config가 현재 schemaVersion(CONFIG_SCHEMA_VERSION)이 아니면
+      // 로드 시 v2 마이그레이션/정규화가 일어났다고 보고 아래에서 1회 저장한다.
+      // 이미 현재 버전인 저장값은 로드만으로 다시 쓰지 않는다(불필요한 쓰기 금지).
+      // 레거시 키가 남은 저장값은 반드시 schemaVersion 1이라 이 조건에 포함된다
+      // (v2/무표기 + 레거시 키는 parseConfig가 unknown_field로 거부해 여기 도달하지 않는다).
+      const rawConfig = /** @type {Record<string, unknown>|undefined} */ (parsed.config);
+      const configMigrated =
+        isPlainObject(rawConfig) && rawConfig.schemaVersion !== CONFIG_SCHEMA_VERSION;
+
       // 재시작 시 미완료 attempt는 전송 결과 확인 필요로 승격한다. §5.3.
       let changed = false;
       for (const profile of /** @type {Array<Record<string, unknown>>} */ (state.profiles)) {
@@ -672,8 +681,14 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
           }
         }
       }
-      if (changed) {
-        state.revision = /** @type {number} */ (state.revision) + 1;
+      // needsReview 승격은 의미 있는 mutation이라 revision을 올린다. config
+      // 마이그레이션은 로드 시 정규화일 뿐이므로 revision은 그대로 두고 같은
+      // 저장 경로(persist + storage_failed 처리)를 따른다. 저장이 실패해도
+      // 메모리의 마이그레이션 결과는 유지된다.
+      if (changed || configMigrated) {
+        if (changed) {
+          state.revision = /** @type {number} */ (state.revision) + 1;
+        }
         try {
           await persist(state);
         } catch {
@@ -1031,9 +1046,10 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
   /**
    * 순수 동기 정책 판정. §5.3/§6 우선순위를 따른다.
    * @param {object} scope
+   * @param {{ttlMs?: number|null}} [options] 연속 상한을 TTL별로 고르기 위한 현재 TTL.
    * @returns {{allowed: boolean, reason: string|null}}
    */
-  function isAllowedByPolicy(scope) {
+  function isAllowedByPolicy(scope, options) {
     const norm = normalizeScope(scope);
     if (state.config.paused === true) {
       return { allowed: false, reason: 'GLOBAL_PAUSED' };
@@ -1059,7 +1075,7 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
     if (budget !== null && budget.needsReview === true) {
       return { allowed: false, reason: 'PARTIAL_OR_UNKNOWN_SEND' };
     }
-    const max = state.config.maxConsecutiveKeepalives;
+    const max = capFor(options?.ttlMs ?? null, state.config);
     const charged = budget === null ? 0 : budget.charged;
     if (max !== 0 && charged >= max) {
       return { allowed: false, reason: 'LIMIT_REACHED' };

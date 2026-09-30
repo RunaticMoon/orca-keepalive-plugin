@@ -216,7 +216,7 @@ export function createCoordinator({
   let rpc = null
   /** @type {object|null} */
   let observer = null
-  /** @type {object|null} 탭 제목 표시기(실험 옵션). rpc 준비 후 1회 생성한다. */
+  /** @type {object|null} 탭 제목 표시기. rpc 준비 후 1회 생성한다. */
   let titleIndicator = null
   let titleIndicatorCreated = false
   /** updateTitleIndicator 호출 순번. 늦게 끝난 이전 호출의 reconcile을 버린다. */
@@ -356,6 +356,7 @@ export function createCoordinator({
           ptyId: target.ptyId,
           incarnationId: target.incarnationId,
           doneAt: state.epoch.doneAt,
+          basisAt: state.epoch.basisAt,
         }
         const hasIdentifiers =
           typeof record.userDataKey === 'string' && record.userDataKey.length > 0 &&
@@ -417,6 +418,7 @@ export function createCoordinator({
     const state = applyReduce(key, {
       type: 'RESTORE_EPOCH',
       doneAt: record.doneAt,
+      basisAt: record.basisAt,
       now: clock.now(),
     })
     if (state !== null && state.phase === 'ARMED') {
@@ -488,7 +490,7 @@ export function createCoordinator({
     const state = entry.state
     const cfg = config ?? store.snapshot().config
     const settings = isObject(lastSettings) ? lastSettings : { known: false }
-    const policy = safePolicy(state.target)
+    const policy = safePolicy(state.target, settings.ttlMs)
     const raw = scheduler.decide(state, {
       now: clock.now(),
       settings: {
@@ -521,7 +523,7 @@ export function createCoordinator({
     ) {
       const margin = marginFor(settings.ttlMs, config)
       if (margin !== null) {
-        expiresAt = state.epoch.doneAt + settings.ttlMs
+        expiresAt = (state.epoch.basisAt ?? state.epoch.doneAt) + settings.ttlMs
         dueAt = expiresAt - margin
       }
     }
@@ -531,21 +533,22 @@ export function createCoordinator({
   /**
    * store.isAllowedByPolicy를 안전하게 호출한다(scope/profileId 미확정 시 throw 금지).
    * @param {Record<string, any>} target
+   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed:boolean, reason:string|null}}
    */
-  function safePolicy(target) {
+  function safePolicy(target, ttlMs) {
     try {
       if (typeof target.profileId !== 'string' || target.profileId.length === 0) {
         return { allowed: false, reason: 'SETTINGS_UNKNOWN' }
       }
-      return store.isAllowedByPolicy(scopeOf(target))
+      return store.isAllowedByPolicy(scopeOf(target), { ttlMs: ttlMs ?? null })
     } catch {
       return { allowed: false, reason: 'STORAGE_FAILED' }
     }
   }
 
   // -------------------------------------------------------------------------
-  // 탭 제목 표시기(실험 옵션)
+  // 탭 제목 표시기
   // -------------------------------------------------------------------------
 
   /**
@@ -682,7 +685,7 @@ export function createCoordinator({
         settingsKnown &&
         settingsEnabled &&
         connectionOk &&
-        safePolicy(target).allowed === true
+        safePolicy(target, settingsKnown ? lastSettings.ttlMs : null).allowed === true
       desired.push({
         worktreeId: target.worktreeId,
         tabId,
@@ -1037,7 +1040,7 @@ export function createCoordinator({
     // f. 동시 1개 전송.
     maybeSend(candidates)
 
-    // g. 탭 제목 ⚡ 표시(실험 옵션). await하지 않아 tick을 막지 않는다.
+    // g. 탭 제목 ⚡ 표시. await하지 않아 tick을 막지 않는다.
     updateTitleIndicator(tickConfig, catalogReadFailed)
   }
 
@@ -1403,11 +1406,11 @@ export function createCoordinator({
       if (settings.enabled !== true || settings.profileId !== target.profileId) {
         return { allowed: false, reason: 'APP_TIMER_OFF' }
       }
-      const policy = safePolicy(target)
+      const policy = safePolicy(target, settings.ttlMs)
       if (policy.allowed !== true) {
         // 이번 전송의 attempt가 이미 예약된 뒤(gate2/gate3)라면 reserveAttempt가
-        // charged를 +1 했으므로 상한(maxConsecutiveKeepalives)에 정확히 도달하면
-        // LIMIT_REACHED가 온다. 예약 성공은 곧 저장 성공이므로, 예약 이후의
+        // charged를 +1 했으므로 TTL별 상한(maxConsecutiveKeepalives5m/1h)에 정확히
+        // 도달하면 LIMIT_REACHED가 온다. 예약 성공은 곧 저장 성공이므로, 예약 이후의
         // LIMIT_REACHED만 허용으로 취급한다(그 앞 검사인 paused/scope/needsReview는
         // isAllowedByPolicy가 LIMIT_REACHED보다 먼저 검사해 이미 통과했다는 뜻).
         // 단 memoryPaused(저장 실패) 검사는 LIMIT 뒤에 있으므로 snapshot으로 함께

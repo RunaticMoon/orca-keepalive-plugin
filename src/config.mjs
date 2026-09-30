@@ -8,9 +8,20 @@
  * @module config
  */
 
+import { ALLOWED_TTLS } from './contracts.mjs';
+
 /** @typedef {import('./contracts.mjs').Config} Config */
 
-const ALLOWED_SCHEMA_VERSION = 1;
+/** 현재 config schema. v1 저장값은 parseConfig가 v2로 마이그레이션한다. */
+export const CONFIG_SCHEMA_VERSION = 2;
+/** v1→v2 마이그레이션 대상 schema. */
+const LEGACY_SCHEMA_VERSION = 1;
+/** v2에서 제거된 레거시 키. v1 입력/구버전 patch에서만 허용한다. */
+export const LEGACY_CONSECUTIVE_KEY = 'maxConsecutiveKeepalives';
+const CONSECUTIVE_5M_KEY = 'maxConsecutiveKeepalives5m';
+const CONSECUTIVE_1H_KEY = 'maxConsecutiveKeepalives1h';
+/** 레거시 기본값. v1 입력에서 이 값이면 새 기본값을 쓴다. */
+const LEGACY_DEFAULT_CONSECUTIVE = 3;
 const MAX_PATH_LENGTH = 4096;
 const MESSAGE_MIN_BYTES = 1;
 const MESSAGE_MAX_BYTES = 512;
@@ -50,7 +61,7 @@ export class ValidationError extends Error {
  * @type {Readonly<Config>}
  */
 export const DEFAULT_CONFIG = Object.freeze({
-  schemaVersion: 1,
+  schemaVersion: 2,
   runtimeUserDataPath: null,
   paused: false,
   defaultWorktreeEnabled: true,
@@ -59,10 +70,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   margin1hMs: 120000,
   quietOutputMs: 2500,
   observedInputQuietMs: 30000,
-  maxConsecutiveKeepalives: 3,
+  maxConsecutiveKeepalives5m: 8,
+  maxConsecutiveKeepalives1h: 3,
   respectCwarmDisabled: true,
   logLevel: 'info',
-  tabTitleIndicator: false,
+  tabTitleIndicator: true,
 });
 
 /**
@@ -79,7 +91,8 @@ const FIELD_ORDER = [
   'margin1hMs',
   'quietOutputMs',
   'observedInputQuietMs',
-  'maxConsecutiveKeepalives',
+  'maxConsecutiveKeepalives5m',
+  'maxConsecutiveKeepalives1h',
   'respectCwarmDisabled',
   'logLevel',
   'tabTitleIndicator',
@@ -210,15 +223,16 @@ function expectLogLevel(value, field) {
 }
 
 /**
- * schemaVersion은 1만 허용한다. (§5.2)
+ * schemaVersion은 1(레거시 입력)과 2를 허용한다. 검증 시점에는 이미 2로
+ * 정규화되어 있으므로 2를 반환한다. (§5.2)
  * @param {unknown} value
- * @returns {1}
+ * @returns {2}
  */
 function expectSchemaVersion(value) {
-  if (value !== ALLOWED_SCHEMA_VERSION) {
+  if (value !== LEGACY_SCHEMA_VERSION && value !== CONFIG_SCHEMA_VERSION) {
     throw new ValidationError('unsupported_schema', 'schemaVersion', `schemaVersion ${String(value)} is not supported`);
   }
-  return 1;
+  return 2;
 }
 
 /**
@@ -235,40 +249,141 @@ const FIELD_VALIDATORS = {
   margin1hMs: (value) => expectInteger(value, 'margin1hMs', 60000, 600000),
   quietOutputMs: (value) => expectInteger(value, 'quietOutputMs', 2500, 60000),
   observedInputQuietMs: (value) => expectInteger(value, 'observedInputQuietMs', 10000, 300000),
-  maxConsecutiveKeepalives: (value) => expectInteger(value, 'maxConsecutiveKeepalives', 0, 1000),
+  maxConsecutiveKeepalives5m: (value) => expectInteger(value, 'maxConsecutiveKeepalives5m', 0, 1000),
+  maxConsecutiveKeepalives1h: (value) => expectInteger(value, 'maxConsecutiveKeepalives1h', 0, 1000),
   respectCwarmDisabled: (value) => expectBoolean(value, 'respectCwarmDisabled'),
   logLevel: (value) => expectLogLevel(value, 'logLevel'),
   tabTitleIndicator: (value) => expectBoolean(value, 'tabTitleIndicator'),
 };
 
 /**
+ * v1 입력에서만 허용하는 레거시 키 validator. v2 결과에는 포함하지 않는다.
+ * @type {Record<string, (value: unknown) => unknown>}
+ */
+const LEGACY_FIELD_VALIDATORS = {
+  maxConsecutiveKeepalives: (value) => expectInteger(value, 'maxConsecutiveKeepalives', 0, 1000),
+};
+
+/**
+ * patch용 validator. 레거시 키를 허용하고 schemaVersion은 2만 받는다.
+ * @type {Record<string, (value: unknown) => unknown>}
+ */
+const PATCH_VALIDATORS = {
+  ...FIELD_VALIDATORS,
+  schemaVersion: (value) => {
+    if (value !== CONFIG_SCHEMA_VERSION) {
+      throw new ValidationError('unsupported_schema', 'schemaVersion', `schemaVersion ${String(value)} is not supported`);
+    }
+    return CONFIG_SCHEMA_VERSION;
+  },
+  ...LEGACY_FIELD_VALIDATORS,
+};
+
+/**
+ * TTL별 연속 keepalive 상한. 0은 무제한이며 capFor의 min 계산에서는 Infinity로 본다.
+ * @param {number|null|undefined} ttlMs
+ * @param {Config} config
+ * @returns {number} 정수 상한(0=무제한).
+ */
+export function capFor(ttlMs, config) {
+  if (ttlMs === ALLOWED_TTLS[0]) {
+    return config.maxConsecutiveKeepalives5m;
+  }
+  if (ttlMs === ALLOWED_TTLS[1]) {
+    return config.maxConsecutiveKeepalives1h;
+  }
+  // TTL 미상이면 두 제한 중 더 작은(보수적인) 값을 쓴다. 0(무제한)은 Infinity로 간주한다.
+  const five = config.maxConsecutiveKeepalives5m;
+  const hour = config.maxConsecutiveKeepalives1h;
+  const min = Math.min(five === 0 ? Infinity : five, hour === 0 ? Infinity : hour);
+  return min === Infinity ? 0 : min;
+}
+
+/**
  * 객체의 알 수 없는 key를 거절한다.
  * @param {Record<string, unknown>} value
  * @param {string} field
+ * @param {Record<string, unknown>} [validators] 허용 key 집합(기본 FIELD_VALIDATORS).
  * @returns {void}
  */
-function assertKnownFields(value, field) {
+function assertKnownFields(value, field, validators = FIELD_VALIDATORS) {
   for (const key of Object.keys(value)) {
-    if (!Object.prototype.hasOwnProperty.call(FIELD_VALIDATORS, key)) {
+    if (!Object.prototype.hasOwnProperty.call(validators, key)) {
       throw new ValidationError('unknown_field', key, `${field} has unknown field ${key}`);
     }
   }
 }
 
 /**
+ * v1 설정을 v2로 마이그레이션한다.
+ * - 레거시 `maxConsecutiveKeepalives`는 검증 후 제거한다. 값이 옛 기본값 3이면
+ *   버리고 새 기본값을 쓰고, 아니면 입력에 없는 새 키에 같은 값을 적용한다.
+ * - `tabTitleIndicator`는 옛 기본값(false)과 저장된 false를 구분할 수 없으므로
+ *   기본적으로 true로 강제한다(1회 켜기). `forceTabTitleIndicator:false`이면
+ *   입력 값을 그대로 둬 설정 patch 경로에서 current 값을 보존한다.
+ * - schemaVersion은 2로 맞춘다.
+ * @param {Record<string, unknown>} source
+ * @param {{forceTabTitleIndicator?: boolean}} [options]
+ * @returns {Record<string, unknown>}
+ */
+function migrateV1Config(source, { forceTabTitleIndicator = true } = {}) {
+  /** @type {Record<string, unknown>} */
+  const result = { ...source };
+  const hasLegacy = Object.prototype.hasOwnProperty.call(result, LEGACY_CONSECUTIVE_KEY);
+  if (hasLegacy) {
+    const legacy = LEGACY_FIELD_VALIDATORS[LEGACY_CONSECUTIVE_KEY](result[LEGACY_CONSECUTIVE_KEY]);
+    delete result[LEGACY_CONSECUTIVE_KEY];
+    if (legacy !== LEGACY_DEFAULT_CONSECUTIVE) {
+      if (!Object.prototype.hasOwnProperty.call(result, CONSECUTIVE_5M_KEY)) {
+        result[CONSECUTIVE_5M_KEY] = legacy;
+      }
+      if (!Object.prototype.hasOwnProperty.call(result, CONSECUTIVE_1H_KEY)) {
+        result[CONSECUTIVE_1H_KEY] = legacy;
+      }
+    }
+  }
+  result.schemaVersion = CONFIG_SCHEMA_VERSION;
+  if (forceTabTitleIndicator) {
+    result.tabTitleIndicator = true;
+  }
+  return result;
+}
+
+/**
  * 완전한 Config를 검증해 새 객체로 반환한다. 누락 필드는 DEFAULT_CONFIG로 채우고
- * 알 수 없는 key는 거절한다.
+ * 알 수 없는 key는 거절한다. schemaVersion이 1(레거시)이면 v2로 마이그레이션한 뒤
+ * 검증한다. schemaVersion이 없으면 2로 간주한다.
  * @param {unknown} value
  * @returns {Config}
  */
 export function parseConfig(value) {
+  return parseConfigInternal(value, { forceTabTitleIndicator: true });
+}
+
+/**
+ * parseConfig/parseConfigPatch가 공유하는 검증 경로. schemaVersion 1 입력이면
+ * 마이그레이션한다. `forceTabTitleIndicator`가 false면 마이그레이션 시
+ * `tabTitleIndicator`를 true로 덮지 않아 current 값을 유지한다.
+ * @param {unknown} value
+ * @param {{forceTabTitleIndicator: boolean}} options
+ * @returns {Config}
+ */
+function parseConfigInternal(value, { forceTabTitleIndicator }) {
   assertPlainObject(value, 'config');
-  assertKnownFields(/** @type {Record<string, unknown>} */ (value), 'config');
   const source = /** @type {Record<string, unknown>} */ (value);
+  const version = Object.prototype.hasOwnProperty.call(source, 'schemaVersion')
+    ? source.schemaVersion
+    : CONFIG_SCHEMA_VERSION;
+  if (version !== LEGACY_SCHEMA_VERSION && version !== CONFIG_SCHEMA_VERSION) {
+    throw new ValidationError('unsupported_schema', 'schemaVersion', `schemaVersion ${String(version)} is not supported`);
+  }
+  const migrated =
+    version === LEGACY_SCHEMA_VERSION ? migrateV1Config(source, { forceTabTitleIndicator }) : source;
+  assertKnownFields(migrated, 'config');
   /** @type {Record<string, unknown>} */
   const result = {};
   for (const field of FIELD_ORDER) {
-    const raw = Object.prototype.hasOwnProperty.call(source, field) ? source[field] : DEFAULT_CONFIG[field];
+    const raw = Object.prototype.hasOwnProperty.call(migrated, field) ? migrated[field] : DEFAULT_CONFIG[field];
     result[field] = FIELD_VALIDATORS[field](raw);
   }
   return /** @type {Config} */ (result);
@@ -276,20 +391,35 @@ export function parseConfig(value) {
 
 /**
  * patch의 key만 검증해 current에 병합한 새 Config를 반환한다.
- * schemaVersion은 1 외의 값으로 변경할 수 없다. 원본 current/patch는 변경하지 않는다.
+ * schemaVersion은 2만 허용한다(변경 금지). patch에 레거시 `maxConsecutiveKeepalives`가
+ * 오면 CLI/구버전 UI 호환을 위해 새 키 두 개에 같은 값을 설정한다(새 키가 있으면 우선).
+ * current가 v1이면 마이그레이션하되, 로드 경로와 달리 `tabTitleIndicator`는 강제로
+ * 켜지 않는다(current에 저장된 값을 유지). 원본 current/patch는 변경하지 않는다.
  * @param {unknown} patch
  * @param {unknown} current
  * @returns {Config}
  */
 export function parseConfigPatch(patch, current) {
-  const base = parseConfig(current);
+  const base = parseConfigInternal(current, { forceTabTitleIndicator: false });
   assertPlainObject(patch, 'patch');
-  assertKnownFields(/** @type {Record<string, unknown>} */ (patch), 'patch');
+  assertKnownFields(/** @type {Record<string, unknown>} */ (patch), 'patch', PATCH_VALIDATORS);
   const source = /** @type {Record<string, unknown>} */ (patch);
   /** @type {Record<string, unknown>} */
   const result = { ...base };
+  if (Object.prototype.hasOwnProperty.call(source, LEGACY_CONSECUTIVE_KEY)) {
+    const legacy = LEGACY_FIELD_VALIDATORS[LEGACY_CONSECUTIVE_KEY](source[LEGACY_CONSECUTIVE_KEY]);
+    if (!Object.prototype.hasOwnProperty.call(source, CONSECUTIVE_5M_KEY)) {
+      result[CONSECUTIVE_5M_KEY] = legacy;
+    }
+    if (!Object.prototype.hasOwnProperty.call(source, CONSECUTIVE_1H_KEY)) {
+      result[CONSECUTIVE_1H_KEY] = legacy;
+    }
+  }
   for (const key of Object.keys(source)) {
-    result[key] = FIELD_VALIDATORS[/** @type {keyof Config} */ (key)](source[key]);
+    if (key === LEGACY_CONSECUTIVE_KEY) {
+      continue;
+    }
+    result[key] = PATCH_VALIDATORS[key](source[key]);
   }
   return /** @type {Config} */ (result);
 }

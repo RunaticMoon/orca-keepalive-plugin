@@ -369,14 +369,23 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
       })
     : [];
 
-  const maxConsecutive = finiteOrNull(rawConfig.maxConsecutiveKeepalives);
+  const maxConsecutive5m = finiteOrNull(rawConfig.maxConsecutiveKeepalives5m);
+  const maxConsecutive1h = finiteOrNull(rawConfig.maxConsecutiveKeepalives1h);
+  const configuredLimits = [maxConsecutive5m, maxConsecutive1h].filter((limit) => limit !== null);
+  const finiteLimits = configuredLimits.filter((limit) => limit > 0);
+  const fallbackLimit = finiteLimits.length > 0
+    ? Math.min(...finiteLimits)
+    : configuredLimits.length > 0 ? 0 : null;
+  const maxConsecutive = finiteOrNull(rawConfig.maxConsecutiveKeepalivesActive)
+    ?? (timer.ttlMs === 300000 ? maxConsecutive5m : timer.ttlMs === 3600000 ? maxConsecutive1h : null)
+    ?? fallbackLimit;
   return {
     revision: finiteOrNull(snap.revision),
     serverNow,
     now,
     paused,
     pauseLabel: paused ? '재개' : '일시정지',
-    maxConsecutiveKeepalives: maxConsecutive,
+    maxConsecutiveKeepalivesActive: maxConsecutive,
     maxConsecutiveText:
       maxConsecutive === null ? PLACEHOLDER : maxConsecutive === 0 ? '무제한' : String(maxConsecutive),
     appTimer: {
@@ -503,7 +512,8 @@ function boot() {
       margin5m: byId('cfg-margin5m'),
       margin1h: byId('cfg-margin1h'),
       quietOutput: byId('cfg-quiet-output'),
-      maxConsecutive: byId('cfg-max-consecutive'),
+      maxConsecutive5m: byId('cfg-max-consecutive-5m'),
+      maxConsecutive1h: byId('cfg-max-consecutive-1h'),
       defaultWorktree: byId('cfg-default-worktree'),
       respectCwarm: byId('cfg-respect-cwarm'),
       tabTitleIndicator: byId('cfg-tab-title-indicator'),
@@ -973,7 +983,8 @@ function boot() {
     setValue(nodes.cfg.margin5m, msToSeconds(config.margin5mMs));
     setValue(nodes.cfg.margin1h, msToSeconds(config.margin1hMs));
     setValue(nodes.cfg.quietOutput, config.quietOutputMs ?? '');
-    setValue(nodes.cfg.maxConsecutive, config.maxConsecutiveKeepalives ?? '');
+    setValue(nodes.cfg.maxConsecutive5m, config.maxConsecutiveKeepalives5m ?? '');
+    setValue(nodes.cfg.maxConsecutive1h, config.maxConsecutiveKeepalives1h ?? '');
     setChecked(nodes.cfg.defaultWorktree, config.defaultWorktreeEnabled);
     setChecked(nodes.cfg.respectCwarm, config.respectCwarmDisabled);
     setChecked(nodes.cfg.tabTitleIndicator, config.tabTitleIndicator);
@@ -1009,17 +1020,21 @@ function boot() {
     const margin1hMs = seconds(nodes.cfg.margin1h, '1시간 TTL 여유');
     if (margin1hMs instanceof Error) return margin1hMs;
 
-    const integer = (node, label) => {
+    const integer = (node, label, max = Infinity) => {
       const raw = node && node.value !== '' ? Number(node.value) : NaN;
-      if (!Number.isFinite(raw) || raw < 0 || !Number.isInteger(raw)) {
-        return new Error(`${label} 값을 0 이상의 정수로 입력하세요.`);
+      if (!Number.isFinite(raw) || raw < 0 || raw > max || !Number.isInteger(raw)) {
+        return new Error(max === Infinity
+          ? `${label} 값을 0 이상의 정수로 입력하세요.`
+          : `${label} 값을 0~${max} 범위의 정수로 입력하세요.`);
       }
       return raw;
     };
     const quietOutputMs = integer(nodes.cfg.quietOutput, '출력 조용 기준');
     if (quietOutputMs instanceof Error) return quietOutputMs;
-    const maxConsecutiveKeepalives = integer(nodes.cfg.maxConsecutive, '연속 keepalive 상한');
-    if (maxConsecutiveKeepalives instanceof Error) return maxConsecutiveKeepalives;
+    const maxConsecutiveKeepalives5m = integer(nodes.cfg.maxConsecutive5m, '연속 keepalive 상한 (5분 TTL)', 1000);
+    if (maxConsecutiveKeepalives5m instanceof Error) return maxConsecutiveKeepalives5m;
+    const maxConsecutiveKeepalives1h = integer(nodes.cfg.maxConsecutive1h, '연속 keepalive 상한 (1시간 TTL)', 1000);
+    if (maxConsecutiveKeepalives1h instanceof Error) return maxConsecutiveKeepalives1h;
 
     const runtimeRaw = nodes.cfg.runtimePath ? nodes.cfg.runtimePath.value.trim() : '';
     return {
@@ -1027,7 +1042,8 @@ function boot() {
       margin5mMs,
       margin1hMs,
       quietOutputMs,
-      maxConsecutiveKeepalives,
+      maxConsecutiveKeepalives5m,
+      maxConsecutiveKeepalives1h,
       defaultWorktreeEnabled: nodes.cfg.defaultWorktree ? nodes.cfg.defaultWorktree.checked : false,
       respectCwarmDisabled: nodes.cfg.respectCwarm ? nodes.cfg.respectCwarm.checked : false,
       tabTitleIndicator: nodes.cfg.tabTitleIndicator ? nodes.cfg.tabTitleIndicator.checked : false,

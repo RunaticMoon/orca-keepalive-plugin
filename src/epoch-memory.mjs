@@ -33,6 +33,7 @@ export const EPOCH_MEMORY_MAX_ENTRIES = 200;
  * @property {string} ptyId
  * @property {string|null} incarnationId
  * @property {number} doneAt
+ * @property {number} [basisAt] 캐시 TTL 기준 시각. 유효하지 않으면 생략되며, 없는 옛 레코드도 그대로 로드된다.
  * @property {number} savedAt
  */
 
@@ -40,7 +41,7 @@ export const EPOCH_MEMORY_MAX_ENTRIES = 200;
 const REQUIRED_STRING_FIELDS = ['worktreeId', 'paneKey', 'userDataKey', 'profileId', 'ptyId'];
 
 /** 비교 시 사용하는 전체 record 필드. incarnationId는 null을 허용한다. */
-const RECORD_FIELDS = [...REQUIRED_STRING_FIELDS, 'incarnationId', 'doneAt', 'savedAt'];
+const RECORD_FIELDS = [...REQUIRED_STRING_FIELDS, 'incarnationId', 'doneAt', 'basisAt', 'savedAt'];
 
 /**
  * @param {unknown} value
@@ -100,6 +101,11 @@ function normalizeRecord(raw, savedAt) {
     return null;
   }
   out.doneAt = raw.doneAt;
+  // basisAt은 optional. 유효(유한수, doneAt 이하)하면 저장하고 아니면 통째로 생략한다.
+  // 생략은 레코드 전체를 버리는 이유가 되지 않는다(옛 레코드 호환).
+  if (raw.basisAt !== undefined && isFiniteNumber(raw.basisAt) && raw.basisAt <= raw.doneAt) {
+    out.basisAt = raw.basisAt;
+  }
   const effectiveSavedAt = savedAt !== undefined ? savedAt : raw.savedAt;
   if (!isFiniteNumber(effectiveSavedAt)) {
     return null;
@@ -130,7 +136,12 @@ function sameRecord(a, b) {
  * @returns {boolean}
  */
 function sameContent(a, b) {
-  return a.doneAt === b.doneAt && a.ptyId === b.ptyId && a.incarnationId === b.incarnationId;
+  return (
+    a.doneAt === b.doneAt &&
+    a.basisAt === b.basisAt &&
+    a.ptyId === b.ptyId &&
+    a.incarnationId === b.incarnationId
+  );
 }
 
 /**
@@ -361,7 +372,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
 
   /**
    * epoch를 저장한다. 검증 실패·잘못된 key는 조용히 무시한다(throw 금지).
-   * 같은 내용(doneAt·ptyId·incarnationId 동일)이면 persist를 예약하지 않는다.
+   * 같은 내용(doneAt·basisAt·ptyId·incarnationId 동일)이면 persist를 예약하지 않는다.
    * @param {string} key
    * @param {Omit<EpochRecord, 'savedAt'>} record
    * @returns {void}

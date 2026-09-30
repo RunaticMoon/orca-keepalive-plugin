@@ -52,19 +52,26 @@ A keepalive is only considered when **all** of these are true at inspection time
   input quiet window (`observedInputQuietMs`, default 30000 ms).
 - No global pause, the worktree/terminal scope is enabled, `~/.claude/cwarm.disabled`
   is absent (when `respectCwarmDisabled` is on), and the consecutive keepalive cap
-  has not been reached.
+  for the TTL currently reported by Orca's timer has not been reached (see
+  [Consecutive cap and reset](#consecutive-cap-and-reset)).
 
 If any signal is unknown, the plugin refuses to send rather than guessing.
 
 ### Send timing
 
-Timing is based on the observed completion time (`doneAt`) and the TTL reported by
-Orca's timer setting. Only two TTL values are accepted: 5 minutes and 1 hour.
+Timing is based on the **cache basis time** (`basisAt`) and the TTL reported by
+Orca's timer setting. Anthropic starts the prompt-cache TTL when the request that
+reads or writes the cache begins, and the response generation time is spent inside
+that TTL. Claude Code sends one API request per tool call, so the plugin uses the
+turn's last observed `state: 'working'` event (`basisAt`, ≈ the start of the last
+API request). If there is no such observation, or it is more than 3 minutes earlier
+than the completion event, the observed completion time (`doneAt`) is used instead.
+Only two TTL values are accepted: 5 minutes and 1 hour.
 
 | App TTL | Default margin | Target send time |
 |---|---|---|
-| `300000` ms (5 min) | `margin5mMs` = 60 s | `doneAt + TTL - 60 s` (≈ 4 minutes after completion) |
-| `3600000` ms (1 h) | `margin1hMs` = 120 s | `doneAt + TTL - 120 s` (≈ 58 minutes after completion) |
+| `300000` ms (5 min) | `margin5mMs` = 60 s | `basisAt + TTL - 60 s` (≈ 4 minutes after the last request start) |
+| `3600000` ms (1 h) | `margin1hMs` = 120 s | `basisAt + TTL - 120 s` (≈ 58 minutes after the last request start) |
 
 - **At most one keepalive mutation per cache epoch.** A keepalive that is submitted
   starts a new working→done cycle, which opens a *new* epoch, so at most roughly one
@@ -106,7 +113,16 @@ Orca's `plugins-data` and is not restored.
 
 ### Consecutive cap and reset
 
-- `maxConsecutiveKeepalives` defaults to **3**. `0` means unlimited.
+- Two caps are stored, one per TTL: `maxConsecutiveKeepalives5m` (default **8**) and
+  `maxConsecutiveKeepalives1h` (default **3**). Both are integers `0`–`1000`, where
+  `0` means unlimited. At a 5-minute TTL, 8 keepalives are about 4 minutes apart, so
+  the cache stays warm for roughly 37 minutes after the last real turn; at a 1-hour
+  TTL, 3 keepalives are about 58 minutes apart, so roughly 3 hours.
+- Which cap applies is decided by the TTL currently reported by Orca's timer
+  (`promptCacheTtlMs`, see [Send timing](#send-timing)). When the TTL cannot be read,
+  the **smaller** of the two caps is applied. The dashboard form edits the two values
+  separately (**연속 keepalive 상한 (5분 TTL)** and **(1시간 TTL)**), and the per-terminal
+  row `연속 x/상한 y` shows the cap for the current TTL.
 - The cap counts keepalives that were themselves submitted by the plugin. When a
   fresh `working` turn appears that is **not** explained by the plugin's own recent
   attempt, the budget for that target is automatically reset to 0. In practice: if
@@ -115,6 +131,11 @@ Orca's `plugins-data` and is not restored.
 - The counter is not persisted across long idle periods as a scheduled time; on
   restart, unfinished attempts are surfaced as "needs review" instead of being
   retried.
+- The counter is **shared across TTLs**: it is one number per terminal, not one per
+  TTL. If you send several keepalives at a 5-minute TTL and then switch Orca's timer
+  to a 1-hour TTL, the count may already be at or above the 1-hour cap (default **3**),
+  so the plugin stops sending on that terminal until the next real work turn resets
+  the counter.
 
 ### `cwarm.disabled`
 
@@ -380,7 +401,7 @@ These are the `DEFAULT_CONFIG` fields. The dashboard form edits a subset of them
 
 | Field | Default | Meaning |
 |---|---|---|
-| `schemaVersion` | `1` | State schema version; only `1` is accepted. |
+| `schemaVersion` | `2` | Config schema version. A stored config at version `1` is migrated to `2` on load (see [Config migration (v1 → v2)](#config-migration-v1--v2)). |
 | `runtimeUserDataPath` | `null` | Optional explicit Orca user-data directory. Editable in the form. `null` means auto-detect. |
 | `paused` | `false` | Plugin-global pause. Controlled by the pause button, not a text field. |
 | `defaultWorktreeEnabled` | `true` | Default state for worktrees without an explicit override. Editable in the form. |
@@ -389,12 +410,35 @@ These are the `DEFAULT_CONFIG` fields. The dashboard form edits a subset of them
 | `margin1hMs` | `120000` | Margin before expiry for a 1-hour TTL (60000–600000 ms). Form edits it in **seconds**. |
 | `quietOutputMs` | `2500` | Required output-quiet time before sending (2500–60000 ms). Editable in the form. |
 | `observedInputQuietMs` | `30000` | Wait after an observed draft change before sending (10000–300000 ms). Not in the form. |
-| `maxConsecutiveKeepalives` | `3` | Consecutive keepalive cap; `0` = unlimited (0–1000). Editable in the form. |
+| `maxConsecutiveKeepalives5m` | `8` | Consecutive keepalive cap for a 5-minute TTL; `0` = unlimited (0–1000). Editable in the form as **연속 keepalive 상한 (5분 TTL)**. |
+| `maxConsecutiveKeepalives1h` | `3` | Consecutive keepalive cap for a 1-hour TTL; `0` = unlimited (0–1000). Editable in the form as **연속 keepalive 상한 (1시간 TTL)**. |
 | `respectCwarmDisabled` | `true` | Honor `~/.claude/cwarm.disabled`. Editable in the form. |
-| `tabTitleIndicator` | `false` | Experimental: prefix `⚡ ` to the Orca tab title of Claude terminals where keepalive applies. Editable in the form. See [Tab title ⚡ indicator (experimental)](#tab-title--indicator-experimental). |
+| `tabTitleIndicator` | `true` | Prefix `⚡ ` to the Orca tab title of Claude terminals where keepalive applies. Editable in the form. See [Tab title ⚡ indicator](#tab-title--indicator). |
 | `logLevel` | `info` | Diagnostic level. Not in the form. |
 
 Time and counter fields are validated on the server; a rejected value is not applied.
+
+### Config migration (v1 → v2)
+
+Stored configs at `schemaVersion: 1` are migrated to `2` when they are loaded, and the
+migrated config is written back to plugin storage immediately (a single save). A config
+that is already version `2` is not rewritten on load.
+
+- The old single key `maxConsecutiveKeepalives` is split. If it was `3` (the old
+  default) the new defaults `8` / `3` are used instead; otherwise that value is
+  copied into **both** new keys. Sending the legacy key `maxConsecutiveKeepalives`
+  in a config patch is still accepted and applies the same value to both keys, so
+  older clients stay compatible.
+- `tabTitleIndicator` is turned **on** once during the upgrade, because the old
+  default (`false`) cannot be told apart from a user who had deliberately turned it
+  off. If you do not want ⚡, turn it off again in the dashboard. A config patch
+  applied while the stored config is still version `1` does **not** force it on; the
+  stored value is kept.
+
+After the upgrade the config is version `2` and stays that way, so editing settings in
+the stored config directly (see [Tab title ⚡ indicator](#tab-title--indicator)) keeps
+working. An **older** plugin version that reads a version `2` config may reject it as
+`unsupported_schema`, so downgrading needs care.
 
 ### Change notifications
 
@@ -418,9 +462,9 @@ succeeds. The palette commands (`keepalive-toggle-pause`,
 `keepalive-toggle-worktree`, and so on) post their own messages and do not use this
 path. `config`, `reset-budget`, and `clear-review` actions do not notify.
 
-### Tab title ⚡ indicator (experimental)
+### Tab title ⚡ indicator
 
-The setting **탭 이름에 ⚡ 표시 (실험)** (`tabTitleIndicator`, default off) prefixes
+The setting **탭 이름에 ⚡ 표시** (`tabTitleIndicator`, default **on**) prefixes
 `⚡ ` to the Orca tab title of every Claude terminal that is **switched on as a
 keepalive target**. It marks that the tab is on, not that a send is scheduled right
 now: a tab can show ⚡ before its next send is due. The tab title is what Kanban
@@ -439,13 +483,19 @@ A tab shows ⚡ only while all of these hold at the tick:
 When `respectCwarmDisabled` is on, an existing `~/.claude/cwarm.disabled` also turns
 ⚡ off.
 
-How to enable it:
+The option is on by default. To change it:
 
-- Dashboard → **설정** form → check **탭 이름에 ⚡ 표시 (실험)** → **저장 (Save)**.
-  This sends a `{ "type": "config", "patch": { "tabTitleIndicator": true } }` action,
-  and the value is stored in the plugin config alongside the other settings.
+- Dashboard → **설정** form → check or clear **탭 이름에 ⚡ 표시** → **저장 (Save)**.
+  This sends a `{ "type": "config", "patch": { "tabTitleIndicator": true } }` (or
+  `false`) action, and the value is stored in the plugin config alongside the other
+  settings. After an upgrade from version 1 the option is on once (see
+  [Config migration (v1 → v2)](#config-migration-v1--v2)); clear it here if you do
+  not want ⚡.
 - Or set `tabTitleIndicator` in the stored plugin config directly. There is no CLI
-  command that edits config.
+  command that edits config. (The next load migrates a version `1` config to version
+  `2` and turns ⚡ on once — see
+  [Config migration (v1 → v2)](#config-migration-v1--v2); after that the stored value
+  is used as is.)
 
 When the option is on, the plugin sets the tab's `customTitle` through the Orca
 `terminal.rename` RPC. It removes the prefix again when the option is turned off,
@@ -561,10 +611,29 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
 - **조건:** Orca의 "설정 > 에이전트 > 프롬프트 캐시 타이머"가 켜져 있어야 하며,
   대상이 `claude` 에이전트·로컬 호스트·연결된 PTY이고, 초안 없음·출력 조용·
   권한/대기 아님일 때만 보냅니다. 판정 불가는 전송하지 않습니다.
-- **타이밍:** 완료 관측 시각 기준 5분 TTL은 `완료+TTL-60초`, 1시간 TTL은
-  `완료+TTL-120초`. 캐시 epoch당 최대 1회만 보내고, 마감이 지나면 따라잡지 않습니다.
-- **상한:** 연속 keepalive 기본 3회(0=무제한). 자체 전송이 아닌 새 working 턴이
-  관측되면 카운터가 자동 초기화됩니다. `~/.claude/cwarm.disabled`를 존중합니다.
+- **타이밍:** 캐시 기준 시각(`basisAt`) 기준 5분 TTL은 `basisAt+TTL-60초`, 1시간 TTL은
+  `basisAt+TTL-120초`. `basisAt`은 턴의 마지막 `working` 이벤트 수신 시각(≈마지막 API 요청
+  시작)입니다. Anthropic 규칙상 TTL은 캐시를 읽거나 쓴 요청의 시작부터 흐르고 응답 생성
+  시간도 TTL을 소모합니다. 도구별 working 이벤트가 없거나 완료 시각(`doneAt`)과 3분 넘게
+  차이 나면 `doneAt`을 씁니다. 캐시 epoch당 최대 1회만 보내고, 마감이 지나면 따라잡지 않습니다.
+- **상한:** TTL별로 두 값 `maxConsecutiveKeepalives5m`(기본 8)·
+  `maxConsecutiveKeepalives1h`(기본 3)를 저장합니다(0=무제한, 0~1000). 5분 TTL에서는 약
+  4분 간격으로 마지막 실제 턴 이후 약 37분, 1시간 TTL에서는 약 58분 간격으로 약 3시간
+  유지됩니다. 현재 Orca 타이머 TTL에 해당하는 상한을 적용하고, TTL을 알 수 없으면 두 값 중
+  작은 쪽을 적용합니다. 대시보드 설정 폼에서 두 값을 따로 편집하며, 터미널 행 `연속 x/상한 y`는
+  현재 TTL 기준 상한을 보여줍니다. 자체 전송이 아닌 새 working 턴이
+  관측되면 카운터가 자동 초기화됩니다. 카운터는 TTL별로 따로가 아니라 터미널마다 하나로,
+  TTL과 무관하게 공유됩니다. 예를 들어 5분 TTL로 여러 번 보낸 뒤 Orca 타이머 TTL을 1시간으로
+  바꾸면 공유 카운터가 이미 1시간 상한(기본 3)에 도달해, 다음 실제 작업 턴이 카운터를 초기화할
+  때까지 그 터미널에서는 더 보내지 않습니다. `~/.claude/cwarm.disabled`를 존중합니다.
+- **설정 마이그레이션(v1→v2):** 저장된 v1 설정은 로드 시 v2로 변환되고 그 결과가 즉시 1회
+  저장됩니다(이미 v2인 저장값은 다시 쓰지 않음). 기존 저장값 `maxConsecutiveKeepalives`가 옛
+  기본값 3이면 새 기본값(8/3)을 쓰고, 3이 아니면 그 값을 두 키에 복사합니다. patch에 레거시 키를
+  보내면 두 키에 같은 값이 적용됩니다(호환). 업그레이드 시 `tabTitleIndicator`가 한 번 켜집니다
+  (옛 기본 false와 사용자가 끈 값을 구분할 수 없기 때문). 다만 저장값이 아직 v1일 때 적용하는
+  patch 경로에서는 강제로 켜지 않고 저장된 값을 유지합니다. 원치 않으면 대시보드에서 다시 끄면
+  됩니다. 새 버전 설정(v2)을 이전 버전 플러그인이 읽으면 `unsupported_schema`로 거부될 수
+  있으므로 다운그레이드에 주의하세요.
 - **설치/업데이트:** 이 저장소 자체가 커뮤니티 marketplace입니다. Orca 설정 >
   Plugins > Manage sources에서 Git URL에
   `https://github.com/RunaticMoon/orca-keepalive-plugin.git`, Git ref에 `main`을
@@ -604,13 +673,14 @@ No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22
   worktreeId·경로·토큰은 넣지 않습니다. 전역 일시정지 중 켜기는 `(전체 일시정지 중)`이
   붙고, config·예산 초기화·확인 필요 해제는 알리지 않습니다. 팔레트 명령은 자체 문구를
   씁니다.
-- **⚡ 탭 표시(실험):** 설정 `tabTitleIndicator`(기본 꺼짐)를 켜면 keepalive 대상으로
+- **⚡ 탭 표시:** 설정 `tabTitleIndicator`(기본 켜짐)가 켜져 있으면 keepalive 대상으로
   켜진 Claude 탭 이름 앞에 `⚡ `가 붙어 칸반(워크스페이스) 보드 카드에서도 보입니다.
   (실제로 전송할 탭이 아니라 켜진 탭 표시입니다.) ⚡는 전체 일시정지 아님 + Orca 앱
   타이머 켜짐 + 런타임 연결됨 + 해당 워크트리/터미널 정책 켜짐(연속 전송 상한 도달 등으로
   일시 해제될 수 있음) + (`respectCwarmDisabled`일 때) `cwarm.disabled` 없음일 때만
-  붙습니다. 대시보드 설정에서 **탭 이름에 ⚡ 표시 (실험)** 체크 후 저장하거나 저장된
-  config 값으로 켭니다(CLI의 config 명령은 없음). rename 실패는 다음 주기에 재시도하고,
+  붙습니다. 대시보드 설정에서 **탭 이름에 ⚡ 표시**를 체크/해제한 뒤 저장하거나 저장된
+  config 값으로 바꿉니다(CLI의 config 명령은 없음). v1에서 업그레이드하면 옵션이 한 번 켜지므로
+  원치 않으면 대시보드에서 끄면 됩니다. rename 실패는 다음 주기에 재시도하고,
   연속 실패가 상한(3회)에 달하면 그 탭은 이번 실행 동안 건너뜁니다. 조건이 안 맞거나
   끄면, 플러그인 종료 시 Orca 자동 이름으로 되돌립니다. 비정상 종료 뒤 남은 ⚡는 다음
   시작 시 옵션이 꺼져 있으면 제거되고, 켜져 있으면 조건에 맞는 탭에 새 handle로

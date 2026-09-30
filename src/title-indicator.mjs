@@ -1,5 +1,5 @@
 /**
- * 실험 옵션(기본 꺼짐): keepalive가 적용되는 Claude 터미널의 Orca 탭 이름 앞에
+ * 옵션(기본 켜짐): keepalive가 적용되는 Claude 터미널의 Orca 탭 이름 앞에
  * prefix("⚡ ")를 붙이는 모듈 (작업 O).
  *
  * Orca 런타임 RPC만 사용한다(주입된 `rpc`/`hostCall`). `terminal.rename`은 탭 전체의

@@ -80,7 +80,9 @@ test('load: 저장값이 없으면 revision 0 기본 상태', async () => {
   assert.equal(snap.memoryPaused, false);
   assert.equal(snap.lastSaveError, null);
   assert.equal(snap.config.paused, false);
-  assert.equal(snap.config.maxConsecutiveKeepalives, 3);
+  assert.equal(snap.config.maxConsecutiveKeepalives5m, 8);
+  assert.equal(snap.config.maxConsecutiveKeepalives1h, 3);
+  assert.equal(snap.config.tabTitleIndicator, true);
   assert.deepEqual(snap.profiles, []);
   assert.ok(Object.isFrozen(snap));
   assert.ok(Object.isFrozen(snap.config));
@@ -113,11 +115,11 @@ test('load: 유효한 저장 상태를 round-trip한다', async () => {
   assert.equal(budget.needsReview, true, '미완료 attempt는 재시작 시 review로 승격');
 });
 
-test('load: tabTitleIndicator 필드가 없는 기존 상태는 기본값 false로 채운다', async () => {
+test('load: v1 상태는 v2로 마이그레이션한다(레거시 매핑 + tabTitleIndicator 강제)', async () => {
   const legacy = {
     schemaVersion: 1,
     revision: 3,
-    config: { paused: false, defaultWorktreeEnabled: true, message: 'legacy', maxConsecutiveKeepalives: 2 },
+    config: { schemaVersion: 1, paused: false, defaultWorktreeEnabled: true, message: 'legacy', maxConsecutiveKeepalives: 2 },
     profiles: [],
   };
   const host = createFakeHost({ initial: legacy });
@@ -127,17 +129,69 @@ test('load: tabTitleIndicator 필드가 없는 기존 상태는 기본값 false�
   assert.equal(snap.memoryPaused, false);
   assert.equal(snap.lastSaveError, null);
   assert.equal(snap.revision, 3);
-  assert.equal(snap.config.tabTitleIndicator, false);
+  // L1: 로드 시 v1→v2 마이그레이션이 즉시 1회 저장된다.
+  assert.equal(
+    host.calls.filter((call) => call.method === 'storage.set').length,
+    1,
+    'v1 로드는 마이그레이션 결과를 1회 저장한다',
+  );
+  const savedAfterMigration = host.read();
+  assert.equal(savedAfterMigration.config.schemaVersion, 2);
+  assert.equal('maxConsecutiveKeepalives' in savedAfterMigration.config, false);
+  assert.equal(savedAfterMigration.config.tabTitleIndicator, true);
+  assert.equal(savedAfterMigration.revision, 3, '마이그레이션 저장은 revision을 올리지 않는다');
+  // 옛 기본값 3이 아닌 레거시 2는 새 키 두 개에 적용된다.
+  assert.equal(snap.config.maxConsecutiveKeepalives5m, 2);
+  assert.equal(snap.config.maxConsecutiveKeepalives1h, 2);
+  assert.equal('maxConsecutiveKeepalives' in snap.config, false);
   assert.equal(snap.config.message, 'legacy');
+  assert.equal(snap.config.tabTitleIndicator, true, 'v1은 false를 구분할 수 없어 true로 켠다');
 
-  // patch로 켜면 스냅숏/저장소 양쪽에 반영되고 재로드해도 유지된다.
-  await store.updateConfig({ tabTitleIndicator: true });
-  assert.equal(store.snapshot().config.tabTitleIndicator, true);
-  assert.equal(host.read().config.tabTitleIndicator, true);
+  // patch로 끄면 스냅숏/저장소 양쪽에 반영되고 재로드해도 유지된다.
+  await store.updateConfig({ tabTitleIndicator: false });
+  assert.equal(store.snapshot().config.tabTitleIndicator, false);
+  assert.equal(host.read().config.tabTitleIndicator, false);
 
   const reloaded = createStateStore({ hostCall: host.hostCall });
   const reloadedSnap = await reloaded.load();
-  assert.equal(reloadedSnap.config.tabTitleIndicator, true);
+  assert.equal(reloadedSnap.config.tabTitleIndicator, false);
+});
+
+test('load: 이미 v2인 저장값은 로드만으로 저장하지 않는다', async () => {
+  const host = createFakeHost();
+  const s1 = await newStore(host);
+  await s1.updateConfig({ message: 'v2 stored' });
+  const setsBefore = host.calls.filter((call) => call.method === 'storage.set').length;
+  assert.equal(setsBefore, 1);
+
+  const s2 = createStateStore({ hostCall: host.hostCall });
+  await s2.load();
+  const setsAfter = host.calls.filter((call) => call.method === 'storage.set').length;
+  assert.equal(setsAfter, setsBefore, '이미 v2인 저장값은 로드만으로 쓰지 않는다');
+});
+
+test('load: v1 마이그레이션 저장이 실패해도 메모리 값은 유지된다', async () => {
+  const legacy = {
+    schemaVersion: 1,
+    revision: 1,
+    config: { schemaVersion: 1, maxConsecutiveKeepalives: 2 },
+    profiles: [],
+  };
+  const host = createFakeHost({ initial: legacy });
+  host.setFail(true);
+  const store = createStateStore({ hostCall: host.hostCall });
+  const snap = await store.load();
+
+  assert.equal(snap.memoryPaused, false);
+  assert.equal(snap.lastSaveError, 'storage_failed');
+  // 저장은 실패했지만 메모리의 마이그레이션 결과는 그대로다.
+  assert.equal(snap.config.schemaVersion, 2);
+  assert.equal(snap.config.maxConsecutiveKeepalives5m, 2);
+  assert.equal(snap.config.maxConsecutiveKeepalives1h, 2);
+  assert.equal(snap.config.tabTitleIndicator, true);
+  assert.equal('maxConsecutiveKeepalives' in snap.config, false);
+  // 저장소는 갱신되지 않아 v1 그대로다.
+  assert.equal(host.read().config.schemaVersion, 1);
 });
 
 test('updateConfig: tabTitleIndicator는 boolean만 허용한다', async () => {
@@ -145,7 +199,7 @@ test('updateConfig: tabTitleIndicator는 boolean만 허용한다', async () => {
   const store = await newStore(host);
   await assert.rejects(() => store.updateConfig({ tabTitleIndicator: 'yes' }));
   await assert.rejects(() => store.updateConfig({ tabTitleIndicator: 1 }));
-  assert.equal(store.snapshot().config.tabTitleIndicator, false);
+  assert.equal(store.snapshot().config.tabTitleIndicator, true);
 });
 
 test('load: schemaVersion 불일치/손상이면 전송 금지 + 저장소 미덮어쓰기', async () => {
@@ -437,9 +491,10 @@ test('recordAttempt는 잘못된 phase를 거절한다', async () => {
 // cap / resetBudget
 // ---------------------------------------------------------------------------
 
-test('maxConsecutiveKeepalives 3 도달 시 LIMIT_REACHED, resetBudget 후 재허용', async () => {
+test('연속 상한 도달 시 LIMIT_REACHED, resetBudget 후 재허용(TTL 미상=보수적 min)', async () => {
   const host = createFakeHost();
   const store = await newStore(host);
+  // ttlMs 미지정이면 5m(8)/1h(3) 중 작은 3이 적용된다.
   for (let i = 0; i < 3; i += 1) {
     await store.reserveAttempt(T(), i, i);
   }
@@ -452,15 +507,31 @@ test('maxConsecutiveKeepalives 3 도달 시 LIMIT_REACHED, resetBudget 후 재�
   assert.equal(store.isAllowedByPolicy(T()).allowed, true);
 });
 
-test('maxConsecutiveKeepalives 0은 무제한', async () => {
+test('연속 상한 0은 무제한', async () => {
   const host = createFakeHost();
   const store = await newStore(host);
-  await store.updateConfig({ maxConsecutiveKeepalives: 0 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 0, maxConsecutiveKeepalives1h: 0 });
   for (let i = 0; i < 5; i += 1) {
     await store.reserveAttempt(T(), i, i);
   }
   assert.equal(store.getBudget(T()).charged, 5);
   assert.equal(store.isAllowedByPolicy(T()).allowed, true);
+});
+
+test('isAllowedByPolicy: ttlMs별로 다른 상한을 적용한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  // 5m=8, 1h=3. charged 5까지 예약한다.
+  for (let i = 0; i < 5; i += 1) {
+    await store.reserveAttempt(T(), i, i);
+  }
+  assert.equal(store.getBudget(T()).charged, 5);
+  // 5분 TTL은 상한 8이라 아직 허용.
+  assert.deepEqual(store.isAllowedByPolicy(T(), { ttlMs: 300000 }), { allowed: true, reason: null });
+  // 1시간 TTL은 상한 3이라 LIMIT_REACHED.
+  assert.equal(store.isAllowedByPolicy(T(), { ttlMs: 3600000 }).reason, 'LIMIT_REACHED');
+  // TTL 미상이면 보수적으로 min(8,3)=3 → LIMIT_REACHED.
+  assert.equal(store.isAllowedByPolicy(T()).reason, 'LIMIT_REACHED');
 });
 
 test('markReview는 메모리에 즉시 반영되고 저장 실패 시에도 유지된다', async () => {
@@ -529,16 +600,16 @@ test('isAllowedByPolicy 우선순위 전 케이스', async () => {
   await store.clearReview(T({ worktreeId: 'w4' }));
   assert.equal(store.isAllowedByPolicy(T({ worktreeId: 'w4' })).allowed, true);
 
-  // LIMIT_REACHED
+  // LIMIT_REACHED (TTL 미상이면 min(8,3)=3)
   await store.setWorktree(W({ worktreeId: 'w5' }), true);
   for (let i = 0; i < 3; i += 1) {
     await store.reserveAttempt(T({ worktreeId: 'w5' }), i, i);
   }
   assert.equal(store.isAllowedByPolicy(T({ worktreeId: 'w5' })).reason, 'LIMIT_REACHED');
   // cap 0이면 무제한
-  await store.updateConfig({ maxConsecutiveKeepalives: 0 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 0, maxConsecutiveKeepalives1h: 0 });
   assert.equal(store.isAllowedByPolicy(T({ worktreeId: 'w5' })).allowed, true);
-  await store.updateConfig({ maxConsecutiveKeepalives: 3 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 });
 
   // memoryPaused/state_invalid → STORAGE_FAILED
   const badHost = createFakeHost({ initial: { schemaVersion: 99 } });

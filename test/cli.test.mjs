@@ -109,7 +109,9 @@ function makeFixture(options = {}) {
         paused: state.paused,
         defaultWorktreeEnabled: true,
         message: 'keepalive',
-        maxConsecutiveKeepalives: 3,
+        maxConsecutiveKeepalives5m: 3,
+        maxConsecutiveKeepalives1h: 20,
+        maxConsecutiveKeepalivesActive: 3,
       },
       worktrees: state.worktrees,
       diagnostics: [],
@@ -287,6 +289,9 @@ test('status --json prints a JSON summary without the token', async () => {
     assert.equal(summary.worktrees[1].current, false);
     assert.equal(summary.worktrees[0].terminals[0].phase, 'AWAITING_TURN');
     assert.equal(summary.worktrees[0].terminals[0].dueInMs, 192000);
+    assert.equal(summary.maxConsecutiveKeepalives5m, 3);
+    assert.equal(summary.maxConsecutiveKeepalives1h, 20);
+    assert.equal(summary.maxConsecutiveKeepalivesActive, 3);
   });
 });
 

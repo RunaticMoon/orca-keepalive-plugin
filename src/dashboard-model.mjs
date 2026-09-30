@@ -21,7 +21,7 @@
 import crypto from 'node:crypto';
 
 import { StoreError } from './state-store.mjs';
-import { ValidationError } from './config.mjs';
+import { ValidationError, capFor } from './config.mjs';
 
 /** 허용 Action type. §7.4. */
 const ACTION_TYPES = new Set(['pause', 'worktree', 'terminal', 'config', 'reset-budget', 'clear-review', 'worktree-orca']);
@@ -391,11 +391,12 @@ export function createDashboardModel({
   /**
    * 정책 사유를 저장소에서 읽는다. scope가 유효하지 않으면 generic 사유를 돌려준다.
    * @param {{userDataKey: string, profileId: string, worktreeId: string, paneKey?: string|null}} scope
+   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed: boolean, reason: string|null}}
    */
-  function policyOf(scope) {
+  function policyOf(scope, ttlMs) {
     try {
-      const result = store.isAllowedByPolicy(scope);
+      const result = store.isAllowedByPolicy(scope, { ttlMs: ttlMs ?? null });
       if (isPlainObject(result) && typeof result.allowed === 'boolean') {
         return { allowed: result.allowed, reason: nonEmptyStringOrNull(result.reason) };
       }
@@ -575,7 +576,7 @@ export function createDashboardModel({
           isPlainObject(override) && (override.worktree === true || override.worktree === false)
             ? override.worktree
             : null;
-        const gate = worktreeGate(timer, connection, policyOf(worktreeScope));
+        const gate = worktreeGate(timer, connection, policyOf(worktreeScope, timer.ttlMs));
 
         const terminals = [];
         const rawTerminals = Array.isArray(rawWorktree.terminals) ? rawWorktree.terminals : [];
@@ -600,7 +601,7 @@ export function createDashboardModel({
             unsupportedReason,
             timer,
             connection,
-            policyOf(terminalScope),
+            policyOf(terminalScope, timer.ttlMs),
             runtimeReason,
           );
 
@@ -651,6 +652,12 @@ export function createDashboardModel({
 
     const stored = store.snapshot();
     const config = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config : {};
+    const cap5m = finiteOrNull(config.maxConsecutiveKeepalives5m);
+    const cap1h = finiteOrNull(config.maxConsecutiveKeepalives1h);
+    const capActive = capFor(timer.ttlMs, {
+      maxConsecutiveKeepalives5m: cap5m ?? 0,
+      maxConsecutiveKeepalives1h: cap1h ?? 0,
+    });
 
     return {
       revision: isPlainObject(stored) && Number.isSafeInteger(stored.revision) ? stored.revision : 0,
@@ -665,7 +672,9 @@ export function createDashboardModel({
         margin1hMs: finiteOrNull(config.margin1hMs),
         quietOutputMs: finiteOrNull(config.quietOutputMs),
         observedInputQuietMs: finiteOrNull(config.observedInputQuietMs),
-        maxConsecutiveKeepalives: finiteOrNull(config.maxConsecutiveKeepalives),
+        maxConsecutiveKeepalives5m: cap5m,
+        maxConsecutiveKeepalives1h: cap1h,
+        maxConsecutiveKeepalivesActive: capActive,
         respectCwarmDisabled: config.respectCwarmDisabled === true,
         logLevel: typeof config.logLevel === 'string' ? config.logLevel : 'info',
         runtimeUserDataPath: typeof config.runtimeUserDataPath === 'string' ? config.runtimeUserDataPath : null,

@@ -143,18 +143,11 @@ test('snapshot: 연결 전(userDataKey/profileId null)이면 worktrees는 빈 �
   assert.equal('schemaVersion' in snap.config, false);
 });
 
-test('snapshot: config.tabTitleIndicator는 기본 false, config patch로 켜진다', async () => {
+test('snapshot: config.tabTitleIndicator는 기본 true, config patch로 끌 수 있다', async () => {
   const { store } = await newStore();
   const { model } = makeModel({ store, runtime: runtimeView() });
 
   let snap = model.snapshot();
-  assert.equal(snap.config.tabTitleIndicator, false);
-
-  snap = await model.dispatch({
-    type: 'config',
-    patch: { tabTitleIndicator: true },
-    expectedRevision: snap.revision,
-  });
   assert.equal(snap.config.tabTitleIndicator, true);
 
   snap = await model.dispatch({
@@ -163,6 +156,33 @@ test('snapshot: config.tabTitleIndicator는 기본 false, config patch로 켜진
     expectedRevision: snap.revision,
   });
   assert.equal(snap.config.tabTitleIndicator, false);
+
+  snap = await model.dispatch({
+    type: 'config',
+    patch: { tabTitleIndicator: true },
+    expectedRevision: snap.revision,
+  });
+  assert.equal(snap.config.tabTitleIndicator, true);
+});
+
+test('snapshot: config에 TTL별 상한과 active를 투영한다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView() });
+
+  let snap = model.snapshot();
+  assert.equal(snap.config.maxConsecutiveKeepalives5m, 8);
+  assert.equal(snap.config.maxConsecutiveKeepalives1h, 3);
+  // appTimer.ttlMs=300000(5분)이므로 5m 상한이 active.
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 8);
+  assert.equal('maxConsecutiveKeepalives' in snap.config, false);
+
+  // TTL 미상이면 보수적으로 두 값 중 작은 값.
+  const unknownTimer = runtimeView({
+    appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null, reason: 'settings_unknown' },
+  });
+  const { model: unknownModel } = makeModel({ store, runtime: unknownTimer });
+  snap = unknownModel.snapshot();
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 3);
 });
 
 test('snapshot: 같은 label 워크트리 2개와 split terminal은 각각 다른 targetId', async () => {
@@ -384,7 +404,7 @@ test('게이트: 정책 사유(GLOBAL_PAUSED/SCOPE_DISABLED)와 worktree의 budg
   await store.setWorktree({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }, null);
 
   // worktree scope의 LIMIT_REACHED는 무시하고 effective는 유지
-  await store.updateConfig({ maxConsecutiveKeepalives: 1 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 1, maxConsecutiveKeepalives1h: 1 });
   await store.reserveAttempt({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }, 1);
   snap = model.snapshot();
   assert.equal(store.isAllowedByPolicy({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE }).reason, 'LIMIT_REACHED');
@@ -395,7 +415,7 @@ test('게이트: 정책 사유(GLOBAL_PAUSED/SCOPE_DISABLED)와 worktree의 budg
 test('게이트: terminal scope의 budget 사유는 그대로 반영', async () => {
   const { store } = await newStore();
   const { model } = makeModel({ store, runtime: runtimeView() });
-  await store.updateConfig({ maxConsecutiveKeepalives: 1 });
+  await store.updateConfig({ maxConsecutiveKeepalives5m: 1, maxConsecutiveKeepalives1h: 1 });
   await store.reserveAttempt({ userDataKey: USER, profileId: 'p1', worktreeId: WORKTREE, paneKey: PANE }, 1);
 
   const snap = model.snapshot();
