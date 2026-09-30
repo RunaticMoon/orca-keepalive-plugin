@@ -11,7 +11,7 @@ This is a **community, experimental** plugin. It is not an official Stably plugi
 - Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
 - License: MIT (see [LICENSE](LICENSE))
 - Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
-- Version: `0.1.6`
+- Version: `0.1.7`
 - Minimum Orca engine declared: `>=1.4.214`
 - Plugin API: `pluginApi 1` (`contributes` is strict)
 - Runtime: Node >=22.5 (development has been done on Node 24); no build step, no npm dependencies
@@ -86,18 +86,23 @@ entry is removed.
 
 On the next start the plugin restores an armed schedule only when the catalog still
 contains the **same terminal**: the same `userDataKey`, `profileId`, `worktreeId`, and
-`paneKey`, the same `ptyId`, a compatible `incarnationId`, and `doneAt` within the last
-hour. `incarnationId` can be absent in Orca's catalog: if both the stored and the current
-value are `null` the `ptyId` match is enough, while an entry with a value on only one
-side, or with different values, is not restored. An entry whose scope needs review (an
-open, failed, or uncertain attempt) is dropped instead of restored, and clearing the
-review also removes the record so the same keepalive cannot be sent twice. Each restore
-is reported as an `epoch_restored` diagnostic. Expiry and send conditions are otherwise
-unchanged. A terminal whose incarnation changed (for example after an Orca restart) is
-not restored and waits for the next completed turn. If the terminal finished another turn
-while the plugin was unloaded, the restored schedule is still based on the older completion
-time, so that one keepalive may be sent earlier than necessary; the idle, draft, and quiet
-checks immediately before each send still apply.
+`paneKey`, the same `ptyId`, and `doneAt` within the last hour. The `incarnationId` is
+**not** compared: a terminal whose incarnation changed (for example after an Orca restart
+or update) is restored too, and that restore is reported as an `epoch_restored` diagnostic
+with `code: 'incarnation_changed'`. An entry whose scope needs review (an open, failed, or
+uncertain attempt) is dropped instead of restored, and clearing the review also removes the
+record so the same keepalive cannot be sent twice. Expiry and send conditions are otherwise
+unchanged. After a restart the shell is new, so until Claude runs again (for example a
+session resume) the pre-send safety checks find the target unsupported and nothing is
+sent; only the schedule and expected expiry are shown. If the terminal finished another
+turn while the plugin was unloaded, the restored schedule is still based on the older
+completion time, so that one keepalive may be sent earlier than necessary; the idle,
+draft, and quiet checks immediately before each send still apply. Known limitation: after
+a restart, if you start a **new** Claude session in the same pane instead of resuming the
+old conversation, the restored schedule can send one keepalive to that new session
+(subject to the consecutive cap). Plugin reloads and marketplace updates keep the same
+identifiers and were already restorable; deleting and reinstalling the plugin clears
+Orca's `plugins-data` and is not restored.
 
 ### Consecutive cap and reset
 

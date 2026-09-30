@@ -2380,26 +2380,41 @@ test('epochMemory: 같은 ptyId·incarnationId target은 새 인스턴스에서 
   const restored = h2.diagEvents.filter((entry) => entry.event === 'epoch_restored')
   assert.equal(restored.length, 1)
   assert.equal(restored[0].targetId, EPOCH_KEY)
+  assert.equal(restored[0].code, undefined)
 })
 
-test('epochMemory: incarnationId가 다르면 복원하지 않고 forget한다', async () => {
+test('epochMemory: incarnationId가 달라도(Orca 재시작) 같은 ptyId면 복원하고 incarnation_changed를 남긴다', async () => {
   const epochMemory = createFakeEpochMemory()
   const h1 = createHarness({ epochMemory })
   await startHarness(h1)
-  await arm(h1, h1.clock.now())
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const doneAt = t0 + 1000
   await h1.coordinator.stop()
   assert.equal(epochMemory.store.has(EPOCH_KEY), true)
 
+  const forgetBefore = epochMemory.calls.forget.length
   const h2 = createHarness({
     epochMemory,
     terminals: [makeRow({ incarnationId: 'inc2' })],
   })
   await startHarness(h2)
 
-  assert.equal(viewTerminal(h2).phase, 'UNKNOWN')
-  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
-  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
-  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+  const term = viewTerminal(h2)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, doneAt + TTL_5M)
+  assert.equal(term.dueAt, doneAt + TTL_5M - MARGIN_5M)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+  assert.equal(epochMemory.calls.forget.length, forgetBefore)
+
+  const restored = h2.diagEvents.filter((entry) => entry.event === 'epoch_restored')
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].targetId, EPOCH_KEY)
+  assert.equal(restored[0].code, 'incarnation_changed')
+
+  // 복원 뒤 syncEpochMemory가 새 incarnationId로 다시 remember한다.
+  const remembered = epochMemory.calls.remember.filter((call) => call.key === EPOCH_KEY)
+  assert.equal(remembered[remembered.length - 1].record.incarnationId, 'inc2')
 })
 
 test('epochMemory: ptyId가 다르면 복원하지 않고 forget한다', async () => {
@@ -2486,7 +2501,7 @@ test('epochMemory: incarnationId null도 remember되고 같은 ptyId·null로 �
   assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 1)
 })
 
-test('epochMemory: 저장된 incarnationId null과 target inc1은 불일치라 복원하지 않고 forget한다', async () => {
+test('epochMemory: 저장된 incarnationId null과 target inc1이 달라도 같은 ptyId면 복원하고 incarnation_changed를 남긴다', async () => {
   const epochMemory = createFakeEpochMemory()
   epochMemory.store.set(EPOCH_KEY, {
     worktreeId: 'w1',
@@ -2502,10 +2517,15 @@ test('epochMemory: 저장된 incarnationId null과 target inc1은 불일치라 �
   const h = createHarness({ epochMemory })
   await startHarness(h)
 
-  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
-  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
-  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
-  assert.equal(h.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, 1000000 + TTL_5M)
+  assert.equal(term.dueAt, 1000000 + TTL_5M - MARGIN_5M)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+
+  const restored = h.diagEvents.filter((entry) => entry.event === 'epoch_restored')
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].code, 'incarnation_changed')
 })
 
 test('epochMemory: needsReview scope는 복원하지 않고 forget하며 clearReview 뒤에도 전송하지 않는다', async () => {

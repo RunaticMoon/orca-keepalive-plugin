@@ -332,6 +332,9 @@ export function createCoordinator({
    *   현재 예약을 remember한다. userDataKey/profileId/worktreeId/paneKey/ptyId는
    *   비어 있지 않은 문자열이어야 하고, incarnationId는 비어 있지 않은 문자열 또는
    *   null을 허용한다(epoch-memory 계약).
+   * - 복원(restoreEpochMemory)은 userDataKey/profileId/ptyId가 같으면 되고,
+   *   incarnationId가 바뀌어도(Orca 재시작) 허용한다. 복원되면 이 함수가 새
+   *   incarnationId로 다시 remember한다.
    * - 그 밖의 모든 phase는 forget한다(없는 key는 no-op).
    * epochMemory가 null이면 모두 생략하고, 어떤 예외도 밖으로 내보내지 않는다.
    * @param {string} key
@@ -374,9 +377,12 @@ export function createCoordinator({
   }
 
   /**
-   * 새로 만든 target에 대해 저장된 예약을 복원한다(선택). target 식별자가 일치하고
-   * 1시간 이내의 doneAt이며 scope에 검토 필요/열린 attempt가 없으면 RESTORE_EPOCH를
-   * 적용하고, ARMED가 되면 진단을 남긴다. 조건이 맞지 않으면 저장된 항목을 정리한다.
+   * 새로 만든 target에 대해 저장된 예약을 복원한다(선택). userDataKey/profileId/ptyId가
+   * 일치하고 1시간 이내의 doneAt이며 scope에 검토 필요/열린 attempt가 없으면
+   * RESTORE_EPOCH를 적용하고, ARMED가 되면 진단을 남긴다. ptyId가 같으면
+   * incarnationId가 바뀌어도(Orca 재시작) 복원한다. 전송 직전 안전 검사(에이전트
+   * 식별·idle·초안·조용한 시간)는 그대로 적용된다. 조건이 맞지 않으면 저장된 항목을
+   * 정리한다.
    * @param {string} key
    * @param {Record<string, any>} target
    * @returns {void}
@@ -397,8 +403,7 @@ export function createCoordinator({
     const matches =
       record.userDataKey === target.userDataKey &&
       record.profileId === target.profileId &&
-      record.ptyId === target.ptyId &&
-      record.incarnationId === target.incarnationId
+      record.ptyId === target.ptyId
     const fresh = clock.now() - record.doneAt < EPOCH_MEMORY_MAX_AGE_MS
     // 검토 필요/열린 attempt가 있으면 과거 예약을 되살리지 않는다(중복 전송 방지).
     if (!matches || !fresh || budgetBlocksRestore(target)) {
@@ -415,7 +420,11 @@ export function createCoordinator({
       now: clock.now(),
     })
     if (state !== null && state.phase === 'ARMED') {
-      diagnostics.record({ event: 'epoch_restored', targetId: key })
+      const entry = { event: 'epoch_restored', targetId: key }
+      if (record.incarnationId !== target.incarnationId) {
+        entry.code = 'incarnation_changed'
+      }
+      diagnostics.record(entry)
     }
   }
 

@@ -209,7 +209,7 @@ userDataKey는 realpath(userData)의 SHA-256. 사용자 경로 문자열을 HTTP
 
 storage 쓰기는 단일 직렬 queue, revision 증가, 저장 성공 뒤 UI 성공 응답. OFF/pause는 먼저 메모리에서 전송을 막은 다음 저장하고, 저장 실패 시 메모리 pause 유지 + 오류 표시. ON/reset/config 변경은 저장 성공 전 적용하지 않는다. reset은 budget만 초기화하고 예약은 새 완료 관측을 기다린다. 재개도 과거 만료 epoch를 부활시키지 않는다.
 
-paste 직전 attempt 예약과 charged 증가를 저장하여 crash 후 같은 attempt를 다시 보내지 않는다. 명백히 `accepted:false,bytesWritten:0`이면 마지막 attempt를 refused로 기록하고 budget 차감 복원 가능. 쓰기 이후 오류/응답 유실은 가능 전송으로 계산하며 needsReview=true. receipt만으로 confirmed를 올리지 않고 working 관측 후 올린다. restart 시 미완료 attempt는 “전송 결과 확인 필요”로 차단한다. 시간 예약은 디스크에서 복원하지 않는다.
+paste 직전 attempt 예약과 charged 증가를 저장하여 crash 후 같은 attempt를 다시 보내지 않는다. 명백히 `accepted:false,bytesWritten:0`이면 마지막 attempt를 refused로 기록하고 budget 차감 복원 가능. 쓰기 이후 오류/응답 유실은 가능 전송으로 계산하며 needsReview=true. receipt만으로 confirmed를 올리지 않고 working 관측 후 올린다. restart 시 미완료 attempt는 “전송 결과 확인 필요”로 차단한다. 시간 예약은 디스크에서 복원하지 않는다(예외: §5.6 `epochs-v1` 리로드 epoch 메모리).
 
 **지휘자 결정(설계 수정)**: 연속 상한은 “keepalive만으로 이어진 연속 횟수”다. 자체 attempt의 Enter accepted 이후 15초 turn-start 확인 창 안의 첫 fresh working은 자체 turn으로 보고 budget을 유지한다. 그 외의 fresh working(사람 입력이든 다른 자동화든 실제 작업 turn)은 해당 target의 charged/confirmed를 0으로 자동 reset한다(needsReview는 유지, 자동 해제하지 않음). 사람과 다른 자동화를 구분하지 못해도 ‘실제 작업이 있었다’는 의미로 충분하다. 자체 메시지 발생 working/done은 후속 epoch를 만들고 budget을 유지한다. state-store에 `resetBudget(scope)`를 재사용하며 scheduler는 Decision/reducer 결과에 `budgetReset:true` 플래그를 반환해 coordinator가 저장하도록 한다.
 
@@ -267,10 +267,11 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 
 리로드(플러그인 on/off, worker 재기동)는 메모리의 epoch 예약을 잃는다. `src/epoch-memory.mjs`가 ARMED이고 아직 전송하지 않은 epoch의 `doneAt`을 host storage의 key `epochs-v1`에 저장하고, 다시 시작할 때 복원 후보로 제공한다. `state-v1`(설정·budget journal)과 다른 key이며 revision/409 검사와 무관하다.
 
-- 저장 형식 `{version:1, entries:{[key]: {worktreeId,paneKey,userDataKey,profileId,ptyId,incarnationId,doneAt,savedAt}}}`. key는 `worktreeId + "\u0000" + paneKey`이고, 나머지 식별자(userDataKey·profileId·ptyId·incarnationId)는 레코드 필드로 비교한다. 최대 200개이며 `doneAt`이 오래된 항목부터 제거한다.
+- 저장 형식 `{version:1, entries:{[key]: {worktreeId,paneKey,userDataKey,profileId,ptyId,incarnationId,doneAt,savedAt}}}`. key는 `worktreeId + "\u0000" + paneKey`이고, 나머지 식별자(userDataKey·profileId·ptyId)는 레코드 필드로 비교한다. `incarnationId`는 저장만 하고 복원 조건으로 비교하지 않으며, 바뀐 경우 진단 code로만 알린다. 최대 200개이며 `doneAt`이 오래된 항목부터 제거한다.
 - 시작 시 `now - doneAt >= 1시간`인 항목을 버린다. load 실패/형식 오류/항목 오류는 빈 상태로 시작하며 throw하지 않는다.
 - 저장은 변경 시 직렬 coalesce이고 `storage.set` 실패는 삼킨 뒤 다음 변경 때 재시도한다. 자동 전송 상태(`state-v1`) 저장과 독립이며 복원 실패가 전송을 막지 않는다.
-- coordinator는 epoch가 ARMED이고 아직 전송 전일 때만 `remember`하고, 작업중 관측·전송 시도(attempt 예약)·만료·대상 변경 등 ARMED가 아니게 되면 `forget`한다. 복원 시 catalog에서 같은 `userDataKey`·`profileId`·`worktreeId`·`paneKey`이고 `doneAt`이 1시간 이내인 터미널을 찾는다. `ptyId`는 같아야 하고, `incarnationId`는 저장값과 현재값이 모두 null이면 `ptyId` 일치로 복원하며 한쪽만 있거나 다르면 복원하지 않는다. 해당 scope가 needsReview(열린 attempt·불확실 전송)이면 복원하지 않고 기록을 삭제하며, 검토 해제 시에도 그 기록을 삭제해 중복 전송을 막는다. 조건을 만족하면 scheduler `RESTORE_EPOCH` 입력으로 ARMED 예약을 되살리고 `epoch_restored` 진단을 남긴다. 그 외(예: Orca 재시작으로 incarnation이 바뀐 터미널)는 다음 완료를 기다린다.
+- coordinator는 epoch가 ARMED이고 아직 전송 전일 때만 `remember`하고, 작업중 관측·전송 시도(attempt 예약)·만료·대상 변경 등 ARMED가 아니게 되면 `forget`한다. 복원 시 catalog에서 같은 `userDataKey`·`profileId`·`worktreeId`·`paneKey`이고 `doneAt`이 1시간 이내인 터미널을 찾는다. `ptyId`는 같아야 한다. **`incarnationId`는 비교하지 않는다** — 달라도(Orca 재시작·업데이트) 복원한다. 복원 시 incarnation이 바뀌었으면 `epoch_restored` 진단에 `code: 'incarnation_changed'`를 붙인다. 해당 scope가 needsReview(열린 attempt·불확실 전송)이면 복원하지 않고 기록을 삭제하며, 검토 해제 시에도 그 기록을 삭제해 중복 전송을 막는다. 조건을 만족하면 scheduler `RESTORE_EPOCH` 입력으로 ARMED 예약을 되살리고 `epoch_restored` 진단을 남긴다. 재시작 뒤 셸은 새로 뜨므로 Claude가 다시 실행(예: 세션 재개)되기 전에는 전송 직전 안전 검사에서 대상이 지원되지 않아 전송되지 않고, 예약·예상 만료 시각만 표시된다.
+- 재시작 뒤 같은 pane에서 이전 대화가 아니라 새 Claude 세션을 시작하면 복원된 예약에 따라 그 새 세션에 keepalive가 한 번 갈 수 있다(연속 상한 적용). 플러그인 리로드·마켓플레이스 업데이트는 식별자가 유지되어 복원되지만, 플러그인 삭제·재설치는 Orca가 plugins-data를 지우므로 복원되지 않는다.
 
 ## 6. 모듈과 인터페이스
 
@@ -418,7 +419,7 @@ DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readA
 
 ## 8. 로그·진단과 장애 처리
 
-진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown, title_indicator, notify_failed, event_unresolved, target_reset, first_done_ignored, epoch_restored. 신규 진단의 code는 `event_unresolved`(invalid_payload | catalog_failed | no_match | no_target; 같은 (target,code)는 60초에 1회만 기록하고 dedupe Map 상한 256), `target_reset`(incarnation_changed | pty_changed | handle_changed), `first_done_ignored`(NO_FRESH_TURN — working을 보지 못한 채 받은 첫 done), `epoch_restored`(§5.6 리로드 복원)이다. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
+진단 event allowlist: bootstrap_started, runtime_connected, runtime_unavailable, settings_unknown, settings_changed, target_unsupported, epoch_armed, epoch_expired, safety_skipped, attempt_reserved, paste_accepted, submit_accepted, turn_observed, send_uncertain, policy_changed, shutdown, title_indicator, notify_failed, event_unresolved, target_reset, first_done_ignored, epoch_restored. 신규 진단의 code는 `event_unresolved`(invalid_payload | catalog_failed | no_match | no_target; 같은 (target,code)는 60초에 1회만 기록하고 dedupe Map 상한 256), `target_reset`(incarnation_changed | pty_changed | handle_changed), `first_done_ignored`(NO_FRESH_TURN — working을 보지 못한 채 받은 첫 done), `epoch_restored`(§5.6 리로드 복원; incarnation이 바뀐 복원은 `incarnation_changed`)이다. 전송 본문/화면/사용자 초안/metadata token/URL token은 기록하지 않는다. target은 hashed ID, reason은 정해진 enum으로만 기록한다. 외부 error.message를 그대로 기록하지 않고 code로 매핑한다.
 
 host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cache-keepalive/logs/events.jsonl`에 plugin 전용 파일 기록(1 MiB×3, chmod 0600·디렉터리 0700 best effort). 앱 프로필/설정 파일에는 쓰지 않는다. Windows ACL은 chmod로 보장되지 않으므로 기존 사용자 data 디렉터리 경계를 따른다. 파일 logger 실패는 ring/host log로 대체하고 전송 상태 저장 실패와 구별한다. 알림은 동일 reason당 5분에 1회, 큰 상태 전환에만 발생; 매 tick 알림 금지.
 
