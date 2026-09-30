@@ -6,7 +6,7 @@ import { createStateStore } from '../src/state-store.mjs'
 import { createTitleIndicator } from '../src/title-indicator.mjs'
 import { sendKeepalive } from '../src/guarded-send.mjs'
 import { createDashboardModel } from '../src/dashboard-model.mjs'
-import { TIMING } from '../src/contracts.mjs'
+import { CACHE_HISTORY_RETENTION_MS, TIMING } from '../src/contracts.mjs'
 import * as scheduler from '../src/scheduler.mjs'
 
 const DEFAULT_MESSAGE =
@@ -2610,4 +2610,337 @@ test('event_unresolved: catalog 재조회 실패는 catalog_failed를 기록한�
   const recorded = unresolvedEvents(h, 'catalog_failed')
   assert.equal(recorded.length, 1)
   assert.equal(recorded[0].targetId, eventKey('ghost', 'tab:leaf'))
+})
+
+// ---------------------------------------------------------------------------
+// 24. cacheHistory: 표시 전용 캐시 관측 이력(§2-3, 작업 G)
+// ---------------------------------------------------------------------------
+
+test('cacheHistory: fresh working→done에서 OPEN하고 expiresAt을 계산한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.epochId, 1)
+  assert.equal(hist.doneAt, t0 + 1000)
+  assert.equal(hist.basisAt, t0)
+  assert.equal(hist.expiresAt, t0 + TTL_5M)
+  assert.equal(hist.lastBlockReason, null)
+  assert.equal(hist.expiredAt, null)
+})
+
+test('cacheHistory: due 이후 DRAFT_PRESENT 반복 skip은 유지하고 다른 이유로 교체한다', async () => {
+  const h = createHarness()
+  let skipReason = 'DRAFT_PRESENT'
+  h.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: skipReason,
+    attemptId: null,
+    at: h.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+
+  assert.ok(h.sendCalls.length >= 1)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'DRAFT_PRESENT')
+
+  // 같은 reason이 반복돼도 마지막 차단 이유는 유지된다.
+  await h.clock.advance(h.tickMs * 2)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'DRAFT_PRESENT')
+
+  // 다른 이유가 오면 교체된다.
+  skipReason = 'OUTPUT_ACTIVE'
+  await h.clock.advance(h.tickMs)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'OUTPUT_ACTIVE')
+})
+
+test('cacheHistory: 새 턴 뒤 도착한 옛 skipped 결과는 이력을 오염시키지 않는다', async () => {
+  const h = createHarness()
+  let release = null
+  h.setSendBehavior(
+    () =>
+      new Promise((resolve) => {
+        release = () =>
+          resolve({
+            kind: 'skipped',
+            reason: 'DRAFT_PRESENT',
+            attemptId: null,
+            at: h.clock.now(),
+            framesSent: 0,
+          })
+      }),
+  )
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  assert.equal(h.sendCalls.length, 1)
+  assert.ok(h.coordinator.__debugCacheHistory(EPOCH_KEY))
+
+  // 전송이 진행 중인 사이 새 실제 working 턴이 관측된다 → CLEAR.
+  worktreeEvent(h, 'w1', 'working', h.clock.now() + 100)
+  await h.clock.settle()
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+
+  // 뒤늦게 옛 skipped 결과가 도착해도 이력은 다시 생기지 않는다.
+  release()
+  await h.clock.settle()
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+test('cacheHistory: 10초 조기 EXPIRE에는 expiredAt이 없고 실제 만료 tick에서 확정한다', async () => {
+  const h = createHarness()
+  // 전송은 항상 안전 skip으로 두어 예약만 소진하고 phase는 ARMED로 유지한다.
+  h.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: 'OUTPUT_ACTIVE',
+    attemptId: null,
+    at: h.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const expiresAt = t0 + TTL_5M
+
+  // expiresAt 10초 전을 지나 다음 tick에서 조기 EXPIRE가 일어난다.
+  await h.clock.advance(expiresAt - TIMING.minimumRemainingMs - h.clock.now() + h.tickMs)
+  assert.equal(viewTerminal(h).phase, 'EXPIRED')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).expiredAt, null)
+
+  // 실제 expiresAt을 지나면 tick의 ADVANCE가 expiredAt을 확정한다.
+  await h.clock.advance(TIMING.minimumRemainingMs + h.tickMs * 2)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).expiredAt, expiresAt)
+})
+
+test('cacheHistory: 새 실제 working은 이력을 CLEAR한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  assert.ok(h.coordinator.__debugCacheHistory(EPOCH_KEY))
+
+  worktreeEvent(h, 'w1', 'working', t0 + 2000)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+test('cacheHistory: blocked/waiting으로 예약이 취소돼도 이력은 남는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+})
+
+test('cacheHistory: 정책 폐기(POLICY_INVALIDATED)는 이력을 남기고 폐기 사유를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: false,
+    ttlMs: TTL_5M,
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.epochId, before.epochId)
+  assert.equal(after.lastBlockReason, 'APP_TIMER_OFF')
+})
+
+test('cacheHistory: SEND_REFUSED로 예약이 취소돼도 이력은 남는다', async () => {
+  const h = createHarness()
+  h.setSendBehavior(async (args) => {
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    await args.journal.refuseAttempt(attemptId)
+    return { kind: 'refused', reason: 'OUTPUT_ACTIVE', attemptId, at: h.clock.now(), framesSent: 0 }
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  await advanceToDue(h)
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+})
+
+test('cacheHistory: CLOCK_GAP으로 예약이 취소돼도 이력은 남는다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  h.clock.jumpWall(20000)
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(viewTerminal(h).phase, 'EXPIRED')
+  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+})
+
+test('cacheHistory: due 이후 정책 차단 사유를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await h.store.setWorktree({ userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1' }, false)
+  await advanceToDue(h)
+
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'SCOPE_DISABLED')
+})
+
+test('cacheHistory: catalog 불완전으로 due 전송이 막히면 CATALOG_INCOMPLETE를 기록한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+
+  h.observer.state.complete = false
+  await h.clock.advance(h.tickMs)
+  await advanceToDue(h)
+
+  assert.equal(h.sendCalls.length, 0)
+  assert.equal(
+    h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason,
+    'CATALOG_INCOMPLETE',
+  )
+})
+
+test('cacheHistory: 설정 TTL이 바뀌면 살아 있는 이력을 RETIME한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.equal(before.expiresAt, t0 + TTL_5M)
+
+  const TTL_1H = 3600000
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: true,
+    ttlMs: TTL_1H,
+    revision: 2,
+    source: 'sqlite',
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+
+  const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.equal(after.epochId, before.epochId)
+  assert.equal(after.expiresAt, t0 + TTL_1H)
+})
+
+test('cacheHistory: TTL을 모르면 OPEN을 보류하고, 알게 되면 OPEN한다', async () => {
+  const h = createHarness({
+    settings: { known: true, profileId: 'p1', enabled: true, ttlMs: undefined, readAt: 0 },
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  // TTL을 몰라 이력을 열지 않는다.
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: true,
+    ttlMs: TTL_5M,
+    revision: 2,
+    source: 'sqlite',
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.expiresAt, hist.basisAt + TTL_5M)
+})
+
+test('cacheHistory: 만료 후 24시간이 지나면 이력을 지운다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+
+  // wall/mono를 함께 점프해 clock gap으로 오인되지 않게 한 뒤 tick을 1회 진행한다.
+  const jump = hist.expiresAt + CACHE_HISTORY_RETENTION_MS - h.clock.now() + h.tickMs
+  h.clock.jumpWall(jump)
+  h.clock.jumpMono(jump)
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+test('cacheHistory: ptyId가 바뀌면 이력을 지운다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.ok(h.coordinator.__debugCacheHistory(EPOCH_KEY))
+
+  h.observer.state.rows = [makeRow({ ptyId: 'pty2' })]
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+test('cacheHistory: handle만 바뀌면 이력을 보존한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  h.observer.state.rows = [makeRow({ handle: 'h2' })]
+  await h.clock.advance(h.tickMs)
+
+  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+})
+
+test('cacheHistory: incarnationId만 바뀌면 이력을 보존한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  h.observer.state.rows = [makeRow({ incarnationId: 'inc2' })]
+  await h.clock.advance(h.tickMs)
+
+  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+})
+
+test('cacheHistory: catalog에서 target이 사라지면 이력도 함께 사라진다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  assert.ok(h.coordinator.__debugCacheHistory(EPOCH_KEY))
+
+  h.observer.state.rows = []
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
 })

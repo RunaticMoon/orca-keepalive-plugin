@@ -13,6 +13,7 @@
  */
 
 import { REASON_CODES, TIMING } from './contracts.mjs'
+import { reduceCacheHistory } from './cache-history.mjs'
 import { sameBinding } from './runtime-location.mjs'
 import { marginFor } from './scheduler.mjs'
 import { repoIdFromWorktreeId } from './terminal-observer.mjs'
@@ -83,6 +84,7 @@ const EPOCH_MEMORY_MAX_AGE_MS = 3600000
  * @property {(payload: unknown) => void} onReviewCleared
  * @property {() => void} onPolicyChanged
  * @property {() => any} getRpc
+ * @property {(key:string) => import('./contracts.mjs').CacheHistory|null} __debugCacheHistory 테스트 전용 내부 조회.
  */
 
 /**
@@ -238,8 +240,10 @@ export function createCoordinator({
   let connection = { state: 'starting', reason: null }
 
   /**
-   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason} }
-   * @type {Map<string, {state:any, decision:any, meta:any}>}
+   * key → { state: SchedulerState, decision: object|null, meta: {title,label,supported,unsupportedReason}, cacheHistory: CacheHistory|null }
+   * cacheHistory는 표시 전용 관측 이력(§2-3)이다. scheduler의 epoch와 독립이며
+   * 영속 저장·복원·제목 출력은 다른 작업(I/J)이 담당한다.
+   * @type {Map<string, {state:any, decision:any, meta:any, cacheHistory:any}>}
    */
   const targets = new Map()
   /** key → 다음 시도 허용 시각(skipped 후 최소 tickMs 대기). @type {Map<string, number>} */
@@ -308,6 +312,8 @@ export function createCoordinator({
 
   /**
    * targets Map의 최신 state에 reduce를 적용한다(클로저에 잡힌 옛 state 금지).
+   * 적용 전 state(before)와 적용 후(after)를 비교해 표시 전용 cacheHistory도
+   * 같은 지점에서 갱신한다(§2-3). epoch를 지운 뒤 시각을 찾지 않는다.
    * 적용 뒤 RuntimeView용 decision을 갱신한다. config를 넘기면 그 값으로,
    * 생략하면 refreshDecision이 그 시점의 store config를 읽는다.
    * @param {string} key
@@ -320,10 +326,168 @@ export function createCoordinator({
     if (!entry) {
       return null
     }
+    const before = entry.state
     entry.state = scheduler.reduceTarget(entry.state, input)
+    updateCacheHistory(key, before, entry.state, input)
     syncEpochMemory(key, entry.state)
     refreshDecision(key, config)
     return entry.state
+  }
+
+  /**
+   * 현재 설정에서 알 수 있는 TTL(ms). known이고 ttlMs가 유한수일 때만 값이 있다.
+   * 캐시 이력의 예상 만료 시각 계산에 쓴다(decide와 같은 설정을 본다).
+   * @returns {number|null}
+   */
+  function currentTtlMs() {
+    if (!isObject(lastSettings) || lastSettings.known !== true) {
+      return null
+    }
+    const ttlMs = lastSettings.ttlMs
+    return typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : null
+  }
+
+  /**
+   * 이력을 바꾸지 않는 reason(만료 자체·관측 부재·단순 대기)은 호출하지 않는다.
+   * 허용 목록 밖 reason은 reduceCacheHistory의 BLOCK이 정규화로 걸러낸다.
+   * @param {unknown} reason
+   * @returns {boolean}
+   */
+  function isRecordableBlockReason(reason) {
+    return (
+      typeof reason === 'string' &&
+      reason.length > 0 &&
+      reason !== 'EXPIRED' &&
+      reason !== 'NO_FRESH_TURN'
+    )
+  }
+
+  /**
+   * 현재 이력의 같은 epoch에 차단 reason을 기록한다. epochId가 이력과 다르면
+   * (새 턴 뒤 도착한 옛 결과 등) 무시한다. reduceBlock이 만료 전 여부·중복
+   * reason·허용 목록을 한 번 더 검증한다.
+   * @param {string} key
+   * @param {string} reason
+   * @param {number|null} epochId
+   * @param {number} at
+   * @returns {void}
+   */
+  function recordBlockReason(key, reason, epochId, at) {
+    const entry = targets.get(key)
+    if (!entry || !isRecordableBlockReason(reason)) {
+      return
+    }
+    const cur = entry.cacheHistory
+    if (cur === null || cur.epochId !== epochId) {
+      return
+    }
+    const next = reduceCacheHistory(cur, { type: 'BLOCK', epochId, reason, at })
+    if (next !== cur) {
+      entry.cacheHistory = next
+    }
+  }
+
+  /**
+   * 실행 중 tick에서 모든 target의 이력에 현재 시각을 반영한다(§2-3). 실제
+   * expiresAt을 지나면 expiredAt을 확정하고, 만료 후 24시간이 지나면 지운다.
+   * scheduler의 10초 조기 EXPIRE 동작과는 무관하다(만료 시각은 expiresAt 기준).
+   * @param {number} now
+   * @returns {void}
+   */
+  function advanceCacheHistories(now) {
+    for (const [key, entry] of targets) {
+      const cur = entry.cacheHistory
+      if (cur === null) {
+        continue
+      }
+      const next = reduceCacheHistory(cur, { type: 'ADVANCE', now })
+      if (next !== cur) {
+        entry.cacheHistory = next
+      }
+    }
+  }
+
+  /**
+   * applyReduce의 before/after를 비교해 cacheHistory를 갱신한다(§2-3).
+   *
+   * - 새 턴이 인정되면(실제 working의 budgetResetSeq 증가, TURN_CONFIRMED/자체 턴
+   *   working의 selfTurnSeq 증가) CLEAR한다.
+   * - TARGET_CHANGED는 ptyId가 바뀐 경우에만 CLEAR한다. handle/incarnation만 바뀌면
+   *   이력을 보존한다(예약 무효화는 scheduler가 그대로 처리한다).
+   * - POLICY_INVALIDATED는 폐기 전 epochId로 폐기 시점 reason을 BLOCK으로 남긴다.
+   * - 그 밖에는 after.epoch를 기준으로 OPEN/RETIME한다. epoch가 지워져도 이력은
+   *   지우지 않는다. TTL을 모르면 OPEN을 보류하고, 알게 된 뒤 다음 적용에서
+   *   OPEN(이력 없음/다른 epoch) 또는 RETIME(같은 epoch의 TTL 변경)한다.
+   *
+   * @param {string} key
+   * @param {any} before 적용 전 scheduler state.
+   * @param {any} after 적용 후 scheduler state.
+   * @param {any} input scheduler reduce 입력.
+   * @returns {void}
+   */
+  function updateCacheHistory(key, before, after, input) {
+    const entry = targets.get(key)
+    if (!entry) {
+      return
+    }
+    const cur = entry.cacheHistory
+    let next = cur
+    const type = isObject(input) ? input.type : null
+
+    if (
+      after.budgetResetSeq > before.budgetResetSeq ||
+      after.selfTurnSeq > before.selfTurnSeq
+    ) {
+      // 실제 새 턴 또는 자체 keepalive 턴 시작: 옛 이력을 삭제한다.
+      next = null
+    } else if (type === 'TARGET_CHANGED') {
+      const prevPty = isObject(before.target) ? before.target.ptyId : null
+      const nextPty = isObject(after.target) ? after.target.ptyId : null
+      if (prevPty !== nextPty) {
+        next = null
+      }
+    } else if (type === 'POLICY_INVALIDATED') {
+      if (cur !== null && isObject(before.epoch) && cur.epochId === before.epoch.id) {
+        const reason = isObject(input) ? input.reason : null
+        if (isRecordableBlockReason(reason)) {
+          next = reduceCacheHistory(cur, {
+            type: 'BLOCK',
+            epochId: before.epoch.id,
+            reason,
+            at: clock.now(),
+          })
+        }
+      }
+    } else {
+      const epoch = after.epoch
+      const ttlMs = currentTtlMs()
+      if (isObject(epoch) && ttlMs !== null) {
+        const basisAt =
+          typeof epoch.basisAt === 'number' && Number.isFinite(epoch.basisAt)
+            ? epoch.basisAt
+            : epoch.doneAt
+        const expiresAt = basisAt + ttlMs
+        if (next === null || next.epochId !== epoch.id) {
+          next = reduceCacheHistory(next, {
+            type: 'OPEN',
+            epochId: epoch.id,
+            doneAt: epoch.doneAt,
+            basisAt,
+            expiresAt,
+          })
+        } else if (next.expiredAt === null && next.expiresAt !== expiresAt) {
+          next = reduceCacheHistory(next, {
+            type: 'RETIME',
+            epochId: epoch.id,
+            expiresAt,
+          })
+        }
+      }
+    }
+
+    if (next !== cur) {
+      entry.cacheHistory = next
+    }
   }
 
   /**
@@ -1035,7 +1199,26 @@ export function createCoordinator({
           candidates.push({ key, dueAt: decision.dueAt ?? 0 })
         }
       }
+
+      // due를 지난 뒤 실제 전송을 막은 결정(정책 차단·catalog 불완전)은 그 reason을
+      // 이력에 남긴다(§2-3). 만료 전 단순 대기(reason null)나 EXPIRED/NO_FRESH_TURN는
+      // 기록하지 않는다. attempt 중(attempted=true)에는 덮지 않는다.
+      const finalDecision = entry.decision
+      const blockAt = clock.now()
+      if (
+        finalDecision &&
+        finalDecision.kind === 'wait' &&
+        entry.state.epoch !== null &&
+        entry.state.epoch.attempted === false &&
+        typeof finalDecision.dueAt === 'number' &&
+        blockAt >= finalDecision.dueAt
+      ) {
+        recordBlockReason(key, finalDecision.reason, entry.state.epoch.id, blockAt)
+      }
     }
+
+    // e2. 관측 이력 전진: 모든 target에서 실제 expiresAt 경과와 24시간 정리를 반영한다.
+    advanceCacheHistories(clock.now())
 
     // f. 동시 1개 전송.
     maybeSend(candidates)
@@ -1190,7 +1373,12 @@ export function createCoordinator({
       }
       const entry = targets.get(key)
       if (!entry) {
-        targets.set(key, { state: scheduler.initialTargetState(target), decision: null, meta })
+        targets.set(key, {
+          state: scheduler.initialTargetState(target),
+          decision: null,
+          meta,
+          cacheHistory: null,
+        })
         // 새 target을 만들었을 때만 저장된 예약을 복원한다(전환/삭제 후 재생성 포함).
         restoreEpochMemory(key, target)
       } else {
@@ -1507,11 +1695,28 @@ export function createCoordinator({
       })
     } else {
       skipUntil.set(key, clock.now() + tickMs)
+      const skipReason =
+        isObject(result) && typeof result.reason === 'string' ? result.reason : 'SETTINGS_UNKNOWN'
       diagnostics.record({
         event: 'safety_skipped',
-        code: isObject(result) && typeof result.reason === 'string' ? result.reason : 'SETTINGS_UNKNOWN',
+        code: skipReason,
         targetId: key,
       })
+      // 실행 시작 때의 key·target identity·generation·epochId가 모두 그대로일 때만
+      // 차단 원인을 기록한다(§2-3). 새 턴 뒤 도착한 옛 결과는 이력과 epoch가 달라
+      // 무시된다.
+      const current = targets.get(key)
+      if (
+        current &&
+        current.state.generation === gen &&
+        current.state.epoch !== null &&
+        current.state.epoch.id === epochId &&
+        current.state.target.handle === target.handle &&
+        current.state.target.ptyId === target.ptyId &&
+        current.state.target.incarnationId === target.incarnationId
+      ) {
+        recordBlockReason(key, skipReason, epochId, clock.now())
+      }
     }
   }
 
@@ -1897,6 +2102,20 @@ export function createCoordinator({
     return rpc
   }
 
+  /**
+   * 테스트 전용 내부 조회: target key의 표시 이력을 복사해 돌려준다(§2-3). 제품
+   * 경로(RuntimeView/대시보드)에는 노출하지 않는다. target이 없으면 null.
+   * @param {string} key
+   * @returns {import('./contracts.mjs').CacheHistory|null}
+   */
+  function __debugCacheHistory(key) {
+    const entry = targets.get(key)
+    if (!entry || entry.cacheHistory === null || entry.cacheHistory === undefined) {
+      return null
+    }
+    return { ...entry.cacheHistory }
+  }
+
   // -------------------------------------------------------------------------
   // stop
   // -------------------------------------------------------------------------
@@ -2004,6 +2223,7 @@ export function createCoordinator({
     onReviewCleared,
     onPolicyChanged,
     getRpc,
+    __debugCacheHistory,
   }
 }
 
