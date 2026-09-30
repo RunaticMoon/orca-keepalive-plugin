@@ -14,6 +14,8 @@
 
 import { REASON_CODES, TIMING, CACHE_HISTORY_RETENTION_MS } from './contracts.mjs'
 import { reduceCacheHistory, normalizeBlockReason } from './cache-history.mjs'
+import { projectCacheStatus } from './cache-status.mjs'
+import { capFor } from './config.mjs'
 import { sameBinding } from './runtime-location.mjs'
 import { marginFor } from './scheduler.mjs'
 import { repoIdFromWorktreeId } from './terminal-observer.mjs'
@@ -56,10 +58,16 @@ const EPOCH_MEMORY_PRUNE_INTERVAL_MS = 3600000
  * @property {string|null} title
  * @property {string} phase
  * @property {string|null} reason
- * @property {number|null} dueAt
- * @property {number|null} expiresAt
+ * @property {number|null} dueAt 실행 가능한 예약이 있을 때만 값이 있다(§2-1). 이력 복원만으로는 만들지 않는다.
+ * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약이 취소돼도 이력이 있으면 유지한다.
  * @property {boolean} supported
  * @property {string|null} unsupportedReason
+ * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태(§2-1).
+ * @property {string} cacheStatus 표시용 상태(§2-1 표).
+ * @property {boolean} indicatorOn 탭 표시용 활성 조건(§2-2). 전송 허용 필드로 사용하지 않는다.
+ * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). 그 전에는 null.
+ * @property {string|null} expireCause 만료된 epoch의 마지막 차단 reason 또는 null.
+ * @property {string|null} blockedReason 현재 이력의 마지막 차단 reason 또는 null.
  *
  * @typedef {Object} RuntimeWorktreeView
  * @property {string} worktreeId
@@ -235,6 +243,12 @@ export function createCoordinator({
   let titleIndicatorSeq = 0
   /** 마지막 catalog 조회 실패 여부. policy 변경 시에도 보수적 reconciliation을 유지한다. */
   let titleIndicatorCatalogFailed = true
+  /**
+   * 마지막 reconcile이 확인한 cwarm.disabled 결과. getRuntimeView의 indicatorOn이
+   * 동기적으로 같은 gate를 쓰도록 캐시한다(§2-2).
+   * @type {boolean}
+   */
+  let cwarmBlockedCache = false
   /** @type {object|null} */
   let latestCatalog = null
   /** 마지막 catalog가 complete가 아니면 true. true인 동안 새 전송을 시작하지 않는다. */
@@ -258,8 +272,6 @@ export function createCoordinator({
   const targets = new Map()
   /** key → 다음 시도 허용 시각(skipped 후 최소 tickMs 대기). @type {Map<string, number>} */
   const skipUntil = new Map()
-  /** 실제(사람/기타) 턴의 working을 관측한 target key. 그 done에서 탭 제목을 새로 고친다. @type {Set<string>} */
-  const pendingRealTurn = new Set()
   /** `${targetId ?? ''}\u0000${code}` → 마지막 event_unresolved 기록 시각(clock.now). @type {Map<string, number>} */
   const unresolvedRecordedAt = new Map()
 
@@ -1044,6 +1056,104 @@ export function createCoordinator({
     }
   }
 
+  /**
+   * 영속 budget이 검토 필요(needsReview)인지 확인한다. getBudget이 없거나 실패하면
+   * false(검토 필요 아님)로 본다. projection의 review 우선 판정에 쓴다(§2-1).
+   * @param {Record<string, any>} target
+   * @returns {boolean}
+   */
+  function needsReviewFor(target) {
+    try {
+      if (typeof store.getBudget !== 'function') {
+        return false
+      }
+      const budget = store.getBudget(scopeOf(target))
+      return isObject(budget) && budget.needsReview === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 표시 gate에서 `PARTIAL_OR_UNKNOWN_SEND`(검토 필요) 뒤에 가려진 off 조건을
+   * 확인한다(§2-2). isAllowedByPolicy는 needsReview를 연속 상한·memoryPaused보다
+   * 먼저 검사하므로, 검토 필요 자체를 표시에서 예외로 둘 때 이 두 조건을 별도로
+   * 확인해야 기존 off 조건을 잃지 않는다. 확인할 수 없으면 보수적으로 off(true)다.
+   * @param {Record<string, any>} target
+   * @param {number|null} ttlMs
+   * @returns {boolean} true면 표시를 꺼야 하는 숨은 조건이 있다.
+   */
+  function displayHiddenOff(target, ttlMs) {
+    let snap
+    try {
+      snap = store.snapshot()
+    } catch {
+      return true
+    }
+    if (isObject(snap) && snap.memoryPaused === true) {
+      return true
+    }
+    try {
+      if (typeof store.getBudget !== 'function') {
+        return false
+      }
+      const budget = store.getBudget(scopeOf(target))
+      const charged = isObject(budget) && isFiniteNumber(budget.charged) ? budget.charged : 0
+      const max = capFor(ttlMs ?? null, isObject(snap) ? snap.config : null)
+      return max !== 0 && charged >= max
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * 탭 표시용 활성 조건(indicatorOn)을 계산한다(§2-2). 실제 전송 gate(safePolicy·
+   * assertAllowed)와 분리되며 정책 판정 자체를 바꾸지 않는다. 기존 paused/settings/
+   * connection/cwarm/scope/상한/storage 실패 조건을 유지하되, `PARTIAL_OR_UNKNOWN_SEND`
+   * (검토 필요)는 표시를 끄는 이유에서 제외한다(그 뒤에 가려진 off 조건은 보존).
+   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, settingsEnabled:boolean, connectionOk:boolean}} gates
+   * @param {Record<string, any>} target
+   * @param {number|null} ttlMs
+   * @returns {boolean}
+   */
+  function computeIndicatorOn(gates, target, ttlMs) {
+    if (
+      gates.cwarmBlocked ||
+      gates.paused ||
+      !gates.settingsKnown ||
+      !gates.settingsEnabled ||
+      !gates.connectionOk
+    ) {
+      return false
+    }
+    const policy = safePolicy(target, ttlMs)
+    if (policy.allowed === true) {
+      return true
+    }
+    if (policy.reason === UNKNOWN_SEND_REASON) {
+      return !displayHiddenOff(target, ttlMs)
+    }
+    return false
+  }
+
+  /**
+   * 한 target의 캐시 상태를 projection한다(§2-1). RuntimeView terminal과 제목 표시기
+   * desired가 같은 값을 쓰도록 하는 단일 진입점이다.
+   * @param {any} entry targets Map 항목.
+   * @returns {ReturnType<typeof projectCacheStatus>}
+   */
+  function projectEntry(entry) {
+    const target = entry.state.target
+    const decision = entry.decision
+    return projectCacheStatus({
+      state: entry.state,
+      history: entry.cacheHistory ?? null,
+      now: clock.now(),
+      needsReview: needsReviewFor(target),
+      dueAt: decision ? decision.dueAt ?? null : null,
+    })
+  }
+
   // -------------------------------------------------------------------------
   // 탭 제목 표시기
   // -------------------------------------------------------------------------
@@ -1138,8 +1248,9 @@ export function createCoordinator({
   /**
    * 실제 전송 게이트와 같은 cwarm 조건을 반영해 desired를 만든다. cwarmDisabled()
    * 예외는 false로 취급한다(assertAllowed와 동일). respectCwarmDisabled=true이고
-   * cwarm.disabled가 있으면 모든 target을 on=false로 보낸다. ⚡는 phase(ARMED)와
-   * 무관하게 "이 탭이 keepalive 대상으로 켜져 있음"을 뜻한다.
+   * cwarm.disabled가 있으면 모든 target을 on=false로 보낸다. on(=indicatorOn)은
+   * phase와 무관하게 "이 탭이 캐시 유지 대상으로 켜져 있음"을 뜻한다. cacheState는
+   * RuntimeView와 같은 projection 결과다(§2-1, §2-2).
    * @param {object} config
    * @param {number} seq updateTitleIndicator가 부여한 순번. 더 새 호출이 있으면 버린다.
    * @param {boolean} removeOnly 불완전 catalog면 off 제거만 수행한다.
@@ -1160,11 +1271,20 @@ export function createCoordinator({
     if (titleIndicator === null || typeof titleIndicator.reconcile !== 'function') {
       return
     }
+    // getRuntimeView의 indicatorOn이 같은 gate를 동기적으로 쓰도록 캐시한다.
+    cwarmBlockedCache = cwarmBlocked
     const settingsKnown = isObject(lastSettings) && lastSettings.known === true
     const settingsEnabled = settingsKnown && lastSettings.enabled === true
     const connectionOk = connection.state === 'connected'
-    const paused = config.paused === true
-    /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean}>} */
+    const gates = {
+      cwarmBlocked,
+      paused: config.paused === true,
+      settingsKnown,
+      settingsEnabled,
+      connectionOk,
+    }
+    const ttlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean, cacheState:string}>} */
     const desired = []
     for (const entry of targets.values()) {
       if (entry.meta.supported !== true) {
@@ -1176,19 +1296,14 @@ export function createCoordinator({
         continue
       }
       const leafId = typeof entry.meta.leafId === 'string' ? entry.meta.leafId : null
-      const on =
-        !cwarmBlocked &&
-        !paused &&
-        settingsKnown &&
-        settingsEnabled &&
-        connectionOk &&
-        safePolicy(target, settingsKnown ? lastSettings.ttlMs : null).allowed === true
+      const display = projectEntry(entry)
       desired.push({
         worktreeId: target.worktreeId,
         tabId,
         leafId,
         handle: target.handle,
-        on,
+        on: computeIndicatorOn(gates, target, ttlMs),
+        cacheState: display.cacheState,
       })
     }
     fireAndForget(titleIndicator.reconcile(desired, removeOnly ? { removeOnly: true } : undefined))
@@ -1372,7 +1487,6 @@ export function createCoordinator({
     // 다음 reconcile의 식별자 불일치 forget과 bootstrap의 prune이 정리한다.
     targets.clear()
     skipUntil.clear()
-    pendingRealTurn.clear()
     currentProfileId = null
     settingsInitialized = false
     connection = { state: 'starting', reason: null }
@@ -1633,7 +1747,6 @@ export function createCoordinator({
       // profileId 불일치로 forget되고, 시작 시 prune도 정리한다.
       targets.clear()
       skipUntil.clear()
-      pendingRealTurn.clear()
       currentProfileId = profileId
       changed = true
     }
@@ -1742,7 +1855,6 @@ export function createCoordinator({
         if (!seen.has(key)) {
           const entry = targets.get(key)
           targets.delete(key)
-          pendingRealTurn.delete(key)
           // 잠시 사라진 target: 예약은 되살리지 않게 정리하되 표시 이력은 history로
           // 낮춰 24시간 prune에 맡긴다(§2-5).
           downgradeEpochMemoryOnRemoval(key, entry)
@@ -2201,28 +2313,10 @@ export function createCoordinator({
       diagnostics.record({ event: 'epoch_armed', targetId: key })
     }
 
-    // 탭 제목 ⚡ 표시: 자체 keepalive 턴이 아닌 실제 턴이 done이 되면 1회 새로 고친다.
-    if (hookState === 'working') {
-      if (after.selfTurnSeq > before.selfTurnSeq) {
-        // 자체 keepalive 턴은 실제 턴 완료로 보지 않는다.
-        pendingRealTurn.delete(key)
-      } else if (after.budgetResetSeq > before.budgetResetSeq) {
-        // 실제(사람/기타) 턴 시작: 이 target의 다음 done에서 제목을 새로 고친다.
-        pendingRealTurn.add(key)
-      }
-    } else if (hookState === 'done' && pendingRealTurn.has(key)) {
-      pendingRealTurn.delete(key)
-      const tabId = typeof entry.meta.tabId === 'string' ? entry.meta.tabId : null
-      const worktreeId = typeof after.target.worktreeId === 'string' ? after.target.worktreeId : null
-      if (
-        tabId !== null &&
-        worktreeId !== null &&
-        titleIndicator !== null &&
-        typeof titleIndicator.onTurnCompleted === 'function'
-      ) {
-        fireAndForget(titleIndicator.onTurnCompleted(`${worktreeId}:${tabId}`))
-      }
-    }
+    // 실제 턴 완료만을 이유로 하는 제목 refresh rename은 제거했다(§2-6). 같은 기호에서는
+    // pane 순서·handle·phase 변화로 rename하지 않는다. 제목은 tick의 reconcile이
+    // projection 결과(cacheState)에 따라 갱신한다. titleIndicator.onTurnCompleted는
+    // 호환용 no-op으로 남아 있지만 여기서 호출하지 않는다.
   }
 
   /**
@@ -2295,7 +2389,6 @@ export function createCoordinator({
       const entry = targets.get(key)
       if (entry && entry.state.target.worktreeId === worktreeId) {
         targets.delete(key)
-        pendingRealTurn.delete(key)
         forgetEpochMemory(key)
       }
     }
@@ -2347,6 +2440,24 @@ export function createCoordinator({
    * @returns {RuntimeView}
    */
   function getRuntimeView() {
+    // 표시 gate(indicatorOn)에 필요한 값을 한 번만 읽는다. store.snapshot()은 전체
+    // 상태를 복제하므로 target마다 반복 호출하지 않는다(§2-2).
+    let gateConfig = null
+    try {
+      gateConfig = store.snapshot().config
+    } catch {
+      gateConfig = null
+    }
+    const settingsKnown = isObject(lastSettings) && lastSettings.known === true
+    const settingsEnabled = settingsKnown && lastSettings.enabled === true
+    const gateTtlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    const gateBase = {
+      cwarmBlocked: cwarmBlockedCache,
+      paused: isObject(gateConfig) && gateConfig.paused === true,
+      settingsKnown,
+      settingsEnabled,
+      connectionOk: connection.state === 'connected',
+    }
     /** @type {Map<string, any>} */
     const groups = new Map()
     for (const [key, entry] of targets) {
@@ -2372,16 +2483,33 @@ export function createCoordinator({
       if (group.branch === null && entry.meta.branch) {
         group.branch = entry.meta.branch
       }
+      const display = projectEntry(entry)
+      // dueAt은 실행 가능한 예약(kept/scheduled)이 있을 때만 노출한다. 이력 복원만으로는
+      // 만들지 않으며, 전송 중/만료/중단 상태에서는 null이다(§2-1).
+      const dueAt =
+        display.cacheStatus === 'scheduled' && entry.decision && isFiniteNumber(entry.decision.dueAt)
+          ? entry.decision.dueAt
+          : null
+      // expiresAt은 관측 이력을 우선한다(예약이 취소돼도 유지, §2-1). TTL 정보 없이
+      // 복원된 옛 예약(v1)처럼 이력이 없을 때만 decision의 계산값으로 보완한다.
+      const decisionExpiresAt =
+        entry.decision && isFiniteNumber(entry.decision.expiresAt) ? entry.decision.expiresAt : null
       group.terminals.push({
         worktreeId: target.worktreeId,
         paneKey: target.paneKey,
         title: entry.meta.title ?? null,
         phase: entry.state.phase,
         reason: entry.decision ? entry.decision.reason ?? null : entry.state.reason ?? null,
-        dueAt: entry.decision ? entry.decision.dueAt ?? null : null,
-        expiresAt: entry.decision ? entry.decision.expiresAt ?? null : null,
+        dueAt,
+        expiresAt: display.expiresAt ?? decisionExpiresAt,
         supported: entry.meta.supported === true,
         unsupportedReason: entry.meta.unsupportedReason ?? null,
+        cacheState: display.cacheState,
+        cacheStatus: display.cacheStatus,
+        indicatorOn: computeIndicatorOn(gateBase, target, gateTtlMs),
+        expiredAt: display.expiredAt,
+        expireCause: display.expireCause,
+        blockedReason: display.blockedReason,
       })
     }
 

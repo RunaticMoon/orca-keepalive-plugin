@@ -1857,7 +1857,7 @@ test('title indicator: 옵션 on이면 supported target만 on=true로 원한다'
 
   const desired = h.titleIndicators[0].calls.reconcile.at(-1)
   assert.deepEqual(desired, [
-    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: true },
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: true, cacheState: 'none' },
   ])
 })
 
@@ -1870,7 +1870,7 @@ test('title indicator: paused이거나 앱 타이머가 off면 on=false', async 
   await h.clock.advance(h.tickMs)
   let desired = h.titleIndicators[0].calls.reconcile.at(-1)
   assert.deepEqual(desired, [
-    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false },
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false, cacheState: 'none' },
   ])
 
   await h.store.setPaused(false)
@@ -1925,7 +1925,7 @@ test('title indicator: worktree off는 onPolicyChanged만으로 즉시 표시기
   await h.store.updateConfig({ tabTitleIndicator: true })
   await h.clock.advance(h.tickMs)
   await h.clock.settle(5)
-  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
+  assert.equal(titleRpc.titles.get('h1'), '💤 Terminal 1')
 
   const catalogCalls = h.observer.listCalls.length
   await h.store.setWorktree({ userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1' }, false)
@@ -1960,8 +1960,8 @@ test('title indicator: 전역 pause는 onPolicyChanged 즉시 모든 target을 o
   await h.store.updateConfig({ tabTitleIndicator: true })
   await h.clock.advance(h.tickMs)
   await h.clock.settle(5)
-  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
-  assert.equal(titleRpc.titles.get('h2'), '⚡ Terminal 1')
+  assert.equal(titleRpc.titles.get('h1'), '💤 Terminal 1')
+  assert.equal(titleRpc.titles.get('h2'), '💤 Terminal 1')
 
   await h.store.setPaused(true)
   h.coordinator.onPolicyChanged()
@@ -1975,26 +1975,53 @@ test('title indicator: 전역 pause는 onPolicyChanged 즉시 모든 target을 o
   assert.equal(titleRpc.titles.get('h2'), 'Terminal 1')
 })
 
-test('title indicator: 실제 턴 완료에 1회 호출, 자체 keepalive 턴에는 호출하지 않는다', async () => {
+test('title indicator: 실제 턴 완료에도 onTurnCompleted를 호출하지 않는다(§2-6)', async () => {
   const h = createHarness()
   await startHarness(h)
   await h.store.updateConfig({ tabTitleIndicator: true })
   const indicator = h.titleIndicators[0]
 
-  // 실제(사람) 턴 완료 → tabKey 1회.
+  // 실제(사람) 턴 완료 → refresh rename을 위한 onTurnCompleted는 더 이상 호출하지 않는다.
   await arm(h, h.clock.now())
-  assert.deepEqual(indicator.calls.onTurnCompleted, ['w1:tab'])
+  assert.deepEqual(indicator.calls.onTurnCompleted, [])
 
-  // 자체 keepalive 턴 완료 → 호출하지 않는다.
+  // 자체 keepalive 턴 완료도 마찬가지다.
   await advanceToDue(h)
   assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
-  const before = indicator.calls.onTurnCompleted.length
   const turnAt = h.clock.now() + 100
   worktreeEvent(h, 'w1', 'working', turnAt)
   await h.clock.settle()
   worktreeEvent(h, 'w1', 'done', turnAt + 100)
   await h.clock.settle()
-  assert.equal(indicator.calls.onTurnCompleted.length, before, '자체 턴 완료는 무시한다')
+  assert.deepEqual(indicator.calls.onTurnCompleted, [])
+})
+
+test('cacheState: BUSY→ARMED 동안 같은 기호(⚡)로는 rename하지 않는다', async () => {
+  const rows = [makeRow()]
+  const titleRpc = createTitleIndicatorRpc(rows)
+  const h = createHarness({
+    terminals: rows,
+    rpc: titleRpc.rpc,
+    createTitleIndicator: (deps) => createTitleIndicator({ ...deps, settleMs: 0 }),
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+
+  // 실제 작업 시작(BUSY) → projection cacheState는 kept(⚡).
+  const t0 = h.clock.now()
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.advance(h.tickMs)
+  await h.clock.settle(5)
+  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
+  const renamesAfterBusy = titleRpc.renames.length
+
+  // done → ARMED도 kept이므로 같은 기호 rename은 일어나지 않는다.
+  worktreeEvent(h, 'w1', 'done', t0 + 1000)
+  await h.clock.advance(h.tickMs)
+  await h.clock.settle(5)
+  assert.equal(viewTerminal(h).phase, 'ARMED')
+  assert.equal(titleRpc.titles.get('h1'), '⚡ Terminal 1')
+  assert.equal(titleRpc.renames.length, renamesAfterBusy, 'ARMED 전환은 같은 기호라 rename 0')
 })
 
 test('title indicator: stop은 rpc close 전에 restoreAll을 기다린다', async () => {
@@ -2068,7 +2095,7 @@ test('title indicator: cwarm 게이트를 반영하고 확인 예외는 차단�
   // cwarm.disabled가 있으면 이번 tick desired는 전부 on=false.
   await h.clock.advance(h.tickMs)
   assert.deepEqual(h.titleIndicators[0].calls.reconcile.at(-1), [
-    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false },
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: false, cacheState: 'none' },
   ])
   assert.ok(h.cwarmCalls.length >= 1, 'respectCwarmDisabled=true면 cwarm을 확인한다')
 
@@ -2123,17 +2150,17 @@ test('title indicator: 늦게 끝난 이전 tick의 cwarm 확인은 새 tick 결
 })
 
 // ---------------------------------------------------------------------------
-// 21. pendingRealTurn 누수: target 삭제 경로에서 정리
+// 21. 제목 refresh rename 제거: target 삭제·재생성과 무관하게 onTurnCompleted 없음
 // ---------------------------------------------------------------------------
 
-test('pendingRealTurn: onWorktreeRemoved로 target이 삭제되면 정리된다', async () => {
+test('title refresh 제거: target 삭제·재생성 뒤 done에도 onTurnCompleted를 호출하지 않는다', async () => {
   const h = createHarness()
   await startHarness(h)
   await h.store.updateConfig({ tabTitleIndicator: true })
   const indicator = h.titleIndicators[0]
 
   const t0 = h.clock.now()
-  // 실제(사람) 턴 시작만 관측하고 done은 아직 없다 → pendingRealTurn 등록 상태.
+  // 실제(사람) 턴 시작만 관측하고 done은 아직 없다.
   worktreeEvent(h, 'w1', 'working', t0)
   await h.clock.settle()
 
@@ -2145,25 +2172,19 @@ test('pendingRealTurn: onWorktreeRemoved로 target이 삭제되면 정리된다'
   await h.clock.advance(h.tickMs)
   assert.equal(viewTerminal(h).worktreeId, 'w1')
 
-  // 누수된 pending이 없으면 done만으로는 onTurnCompleted가 호출되지 않는다.
-  const before = indicator.calls.onTurnCompleted.length
+  // done 이후에도 onTurnCompleted는 호출되지 않는다(제목은 tick reconcile이 담당).
   worktreeEvent(h, 'w1', 'done', t0 + 1000)
   await h.clock.settle()
-  assert.equal(
-    indicator.calls.onTurnCompleted.length,
-    before,
-    '삭제된 target의 pending이 남아 done만으로 새로 고치면 안 된다',
-  )
+  assert.equal(indicator.calls.onTurnCompleted.length, 0)
 
-  // 대조: 재생성된 target의 실제 working→done은 여전히 1회 호출한다.
   worktreeEvent(h, 'w1', 'working', t0 + 2000)
   await h.clock.settle()
   worktreeEvent(h, 'w1', 'done', t0 + 3000)
   await h.clock.settle()
-  assert.equal(indicator.calls.onTurnCompleted.length, before + 1)
+  assert.equal(indicator.calls.onTurnCompleted.length, 0)
 })
 
-test('pendingRealTurn: catalog 재구성으로 target이 삭제되면 정리된다', async () => {
+test('title refresh 제거: catalog 재구성으로 target이 삭제·재생성돼도 onTurnCompleted가 없다', async () => {
   const h = createHarness()
   await startHarness(h)
   await h.store.updateConfig({ tabTitleIndicator: true })
@@ -2183,10 +2204,9 @@ test('pendingRealTurn: catalog 재구성으로 target이 삭제되면 정리된�
   await h.clock.advance(h.tickMs)
   assert.equal(viewTerminal(h).worktreeId, 'w1')
 
-  const before = indicator.calls.onTurnCompleted.length
   worktreeEvent(h, 'w1', 'done', t0 + 1000)
   await h.clock.settle()
-  assert.equal(indicator.calls.onTurnCompleted.length, before)
+  assert.equal(indicator.calls.onTurnCompleted.length, 0)
 })
 
 // ---------------------------------------------------------------------------
@@ -3179,4 +3199,176 @@ test('epochMemoryI: 만료 후 24시간이 지나면 이력과 저장 레코드�
 
   assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
   assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+// ---------------------------------------------------------------------------
+// 26. 캐시 상태 projection·표시 gate (작업 J)
+// ---------------------------------------------------------------------------
+
+test('getRuntimeView: 캐시 표시 필드와 dueAt(실행 가능한 예약일 때만)', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  // 관측 전(초기 UNKNOWN): 유지 예약 없음.
+  let term = viewTerminal(h)
+  assert.equal(term.cacheState, 'none')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.indicatorOn, true)
+  assert.equal(term.dueAt, null)
+  assert.equal(term.expiresAt, null)
+  assert.equal(term.expiredAt, null)
+  assert.equal(term.expireCause, null)
+  assert.equal(term.blockedReason, null)
+
+  // fresh working→done: 유지 중(예약 실행 가능).
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  term = viewTerminal(h)
+  assert.equal(term.cacheState, 'kept')
+  assert.equal(term.cacheStatus, 'scheduled')
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.expiredAt, null)
+
+  // due 전송 뒤(AWAITING_TURN): 유지 중이지만 dueAt은 더 이상 실행 예약이 아니다.
+  await advanceToDue(h)
+  term = viewTerminal(h)
+  assert.equal(term.cacheState, 'kept')
+  assert.equal(term.cacheStatus, 'awaiting-turn')
+  assert.equal(term.dueAt, null)
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+})
+
+test('getRuntimeView: 10초 cutoff는 no-reservation+expiresAt, 실제 만료 뒤에는 expired+expireCause', async () => {
+  const h = createHarness()
+  h.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: 'DRAFT_PRESENT',
+    attemptId: null,
+    at: h.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const expiresAt = t0 + TTL_5M
+  await advanceToDue(h)
+
+  // 10초 조기 EXPIRE 구간: 아직 실제 만료 전이므로 예약 없음 · 만료 예정(expiresAt 유지).
+  await h.clock.advance(expiresAt - TIMING.minimumRemainingMs - h.clock.now() + h.tickMs)
+  let term = viewTerminal(h)
+  assert.equal(term.phase, 'EXPIRED')
+  assert.equal(term.cacheState, 'none')
+  assert.equal(term.cacheStatus, 'no-reservation')
+  assert.equal(term.expiresAt, expiresAt)
+  assert.equal(term.expiredAt, null)
+  assert.equal(term.blockedReason, 'DRAFT_PRESENT')
+  assert.equal(term.expireCause, null)
+
+  // 실제 expiresAt 경과: 만료 확정, 원인 노출.
+  await h.clock.advance(TIMING.minimumRemainingMs + h.tickMs * 2)
+  term = viewTerminal(h)
+  assert.equal(term.cacheState, 'none')
+  assert.equal(term.cacheStatus, 'expired')
+  assert.equal(term.expiresAt, expiresAt)
+  assert.equal(term.expiredAt, expiresAt)
+  assert.equal(term.expireCause, 'DRAFT_PRESENT')
+
+  // 제목 표시기에도 같은 none이 공급된다.
+  const desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.equal(desired[0].cacheState, 'none')
+})
+
+test('getRuntimeView: INTERACTIVE_WAIT으로 예약이 폐기되면 none/interactive-wait', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'SUSPENDED')
+  assert.equal(term.cacheState, 'none')
+  assert.equal(term.cacheStatus, 'interactive-wait')
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+})
+
+test('projection: review는 indicatorOn true(⚠️)이며 PARTIAL_OR_UNKNOWN_SEND를 표시 예외로 둔다', async () => {
+  const h = createHarness()
+  h.setSendBehavior(async (args) => {
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    return {
+      kind: 'uncertain',
+      reason: 'PARTIAL_OR_UNKNOWN_SEND',
+      attemptId,
+      at: h.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'NEEDS_REVIEW')
+  assert.equal(term.cacheState, 'review')
+  assert.equal(term.cacheStatus, 'review')
+  assert.equal(term.indicatorOn, true)
+
+  const desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.equal(desired.length, 1)
+  assert.equal(desired[0].cacheState, 'review')
+  assert.equal(desired[0].on, true)
+})
+
+test('indicatorOn: paused·설정 off·cwarm disabled면 getRuntimeView도 false', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  await h.store.setPaused(true)
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).indicatorOn, false)
+
+  await h.store.setPaused(false)
+  h.settingsBox.value = {
+    known: true,
+    profileId: 'p1',
+    enabled: false,
+    ttlMs: TTL_5M,
+    readAt: 0,
+  }
+  await h.clock.advance(h.tickMs)
+  assert.equal(viewTerminal(h).indicatorOn, false)
+
+  const h2 = createHarness({ cwarmDisabled: true })
+  await startHarness(h2)
+  await h2.store.updateConfig({ tabTitleIndicator: true })
+  await h2.clock.advance(h2.tickMs)
+  assert.equal(viewTerminal(h2).indicatorOn, false)
+})
+
+test('indicatorOn: review 예외로도 검토 필요 뒤에 가려진 연속 상한은 표시를 끈다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  await h.store.updateConfig({ maxConsecutiveKeepalives5m: 1 })
+
+  // charged=1(상한 도달) + needsReview(검토 필요). isAllowedByPolicy는 검토 필요를 먼저
+  // 반환하므로, 표시 gate는 가려진 LIMIT_REACHED를 별도로 확인해야 한다(§2-2).
+  await h.rawStore.reserveAttempt(
+    { userDataKey: 'key-p', profileId: 'p1', worktreeId: 'w1', paneKey: 'tab:leaf' },
+    1,
+    h.clock.now(),
+  )
+  await h.rawStore.markReview(SCOPE)
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.cacheState, 'review')
+  assert.equal(term.cacheStatus, 'review')
+  assert.equal(term.indicatorOn, false, '검토 필요에 가려진 연속 상한은 표시를 끈다')
 })

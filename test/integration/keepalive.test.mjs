@@ -743,11 +743,13 @@ test('scenario 11: 5분 이상 가상 시간 동안 host.call(storage.get) heart
 })
 
 // ---------------------------------------------------------------------------
-// 시나리오 12. 탭 제목 ⚡ 표시(실험 옵션) on → rename, off → rename(null)
+// 시나리오 12. 탭 제목 캐시 상태 표시(실험 옵션) on → rename, off → rename(null)
+//   관측 전(초기 UNKNOWN)은 💤, fresh working→done으로 예약이 열리면 ⚡.
 // ---------------------------------------------------------------------------
 
-test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래대로 되돌린다', async () => {
-  const PREFIX = '⚡ '
+test('scenario 12: 관측 전 탭은 💤, fresh working→done 뒤 ⚡로 바뀌고 off면 원래대로 되돌린다', async () => {
+  const INITIAL_PREFIX = '💤 '
+  const KEPT_PREFIX = '⚡ '
   const h = await createHarness({ enabled: true })
   try {
     await h.start()
@@ -769,18 +771,13 @@ test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래�
     })
     assert.equal(on.status, 200, '옵션 on POST 성공')
 
+    // 관측 전(초기 UNKNOWN): 유지 예약이 없으므로 💤.
     await h.advanceTo(h.clock.now() + TICK_MS * 3)
     await waitFor(
-      () =>
-        h.runtime.frames.some(
-          (frame) =>
-            frame.method === 'terminal.rename' &&
-            frame.params &&
-            frame.params.title === PREFIX + 'W1 terminal',
-        ),
+      () => h.runtime.getTerminal('h1').customTitle === INITIAL_PREFIX + 'W1 terminal',
       { clock: h.clock },
     )
-    assert.equal(h.runtime.getTerminal('h1').customTitle, PREFIX + 'W1 terminal')
+    assert.equal(h.runtime.getTerminal('h1').customTitle, INITIAL_PREFIX + 'W1 terminal')
 
     // rename은 session.tabs.list 항목 id(tab1::leaf1)가 아니라 terminal handle(h1)로 호출된다.
     const renames = h.runtime.frames.filter((frame) => frame.method === 'terminal.rename')
@@ -789,6 +786,21 @@ test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래�
       renames.every((frame) => frame.params && frame.params.terminal === 'h1'),
       'rename은 terminal handle로만 호출된다',
     )
+
+    // fresh working→done으로 유지 예약이 열리면 같은 탭이 ⚡로 바뀐다(기호 전환 rename 1회).
+    await h.arm()
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await waitFor(
+      () => h.runtime.getTerminal('h1').customTitle === KEPT_PREFIX + 'W1 terminal',
+      { clock: h.clock },
+    )
+    const keptRenames = h.runtime.frames.filter(
+      (frame) =>
+        frame.method === 'terminal.rename' &&
+        frame.params &&
+        frame.params.title === KEPT_PREFIX + 'W1 terminal',
+    )
+    assert.equal(keptRenames.length, 1, '💤→⚡ 전환 rename은 1회')
 
     const off = await requestJson({
       method: 'POST',
@@ -825,8 +837,8 @@ test('scenario 12: tabTitleIndicator on이면 탭 제목에 ⚡, off면 원래�
 // 시나리오 13. 런타임 제목이 바뀐 뒤 off — tabs.list title ≠ applied여도 해제
 // ---------------------------------------------------------------------------
 
-test('scenario 13: 런타임 제목이 ⚡ 적용 값과 달라져도 off면 customTitle을 해제한다', async () => {
-  const PREFIX = '⚡ '
+test('scenario 13: 관측 전 💤가 적용된 뒤 런타임 제목이 달라져도 off면 customTitle을 해제한다', async () => {
+  const PREFIX = '💤 '
   const h = await createHarness({ enabled: true })
   try {
     await h.start()
