@@ -249,7 +249,7 @@ Keybindings declared in the manifest:
 - **Mod+Alt+P** → `keepalive-toggle-pause` (pause/resume all).
 - **Mod+Alt+K** → `keepalive-toggle-worktree` (toggle the current worktree).
 
-Orca runs plugin keybindings only when focus is outside a terminal; click the sidebar or another panel first if the cursor is in a terminal.
+Orca runs plugin keybindings only when focus is on Orca's own UI, such as the sidebar. They do nothing while the cursor is in a terminal, a text field, the dashboard, or this plugin's panel, so click the sidebar first.
 
 The three `context: worktree` commands are inactive while no worktree is active.
 They only change the current worktree when the plugin workspace context resolves

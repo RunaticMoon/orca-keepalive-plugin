@@ -55,7 +55,16 @@ test('keepalive toggle shortcuts are documented in the panel', async () => {
   for (const removed of ['⌘⌥⇧J', 'Alt+Shift+J']) {
     assert.ok(!html.includes(removed), removed)
   }
-  assert.ok(html.includes('터미널 밖'), '터미널 포커스 안내 문구가 있다')
+  assert.ok(html.includes('사이드바 등 Orca 기본 화면'), '단축키 동작 범위 안내 문구가 있다')
+  assert.ok(!html.includes('사이드바·대시보드 등'), '틀린 안내 문구가 없다')
+
+  const kbdIds = [...html.matchAll(/<kbd id="([^"]+)"/g)].map((match) => match[1]).sort()
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1])
+  const script = scripts.join('\n')
+  const referencedIds = [...script.matchAll(/getElementById\('([^']+-(?:primary|other))'\)/g)]
+    .map((match) => match[1])
+    .sort()
+  assert.deepEqual(kbdIds, referencedIds)
 })
 
 test('inline action script parses and fits Orca shell prelude', async () => {
