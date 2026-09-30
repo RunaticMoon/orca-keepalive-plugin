@@ -766,7 +766,7 @@ function boot() {
         );
         toggle.type = 'button';
         toggle.setAttribute('aria-pressed', String(worktree.scopeOn));
-        toggle.setAttribute('aria-label', `워크트리 keepalive 토글: ${worktree.label || worktree.id}`);
+        toggle.setAttribute('aria-label', `워크트리 keepalive ${toggle.textContent}: ${worktree.label || worktree.id}`);
         toggle.disabled = !connected;
         toggle.addEventListener('click', () => {
           postAction(
@@ -831,7 +831,8 @@ function boot() {
     title.title = terminal.title || '(제목 없음)';
     head.appendChild(title);
     head.appendChild(el('span', 'badge badge-phase', terminal.phase));
-    head.appendChild(
+    const status = el('div', 'terminal-status');
+    status.appendChild(
       el(
         'span',
         terminal.effectiveEnabled ? 'terminal-applied is-on' : 'terminal-applied',
@@ -841,14 +842,15 @@ function boot() {
     if (!terminal.supported) {
       const readonly = el('span', 'readonly-note', '읽기 전용 · 미지원');
       readonly.title = `지원하지 않는 대상이라 읽기 전용입니다.${terminal.reasonText ? ` ${terminal.reasonText}` : ''}`;
-      head.appendChild(readonly);
+      status.appendChild(readonly);
     }
     if (terminal.reasonText) {
       const reason = el('span', 'terminal-reason', terminal.reasonText);
       reason.title = terminal.reasonText;
-      head.appendChild(reason);
+      status.appendChild(reason);
     }
     row.appendChild(head);
+    row.appendChild(status);
 
     const actions = el('div', 'terminal-actions');
 
@@ -910,9 +912,10 @@ function boot() {
     if (terminal.needsReview) {
       const warning = el('span', 'review-warning', '⚠ 확인 필요');
       warning.title = '전송 결과 확인 필요: 터미널 입력창을 확인하세요.';
-      actions.appendChild(warning);
+      status.appendChild(warning);
       const clear = el('button', 'btn compact-button review-action', '다음 작업부터 재개');
       clear.type = 'button';
+      clear.setAttribute('aria-label', `다음 작업부터 재개: ${terminal.title || terminal.id}`);
       clear.disabled = !connected || !terminal.supported;
       clear.addEventListener('click', () => {
         postAction(buildAction('clear-review', { targetId: terminal.id }, snapshot.revision));

@@ -7,7 +7,10 @@
  * 도달한다. `keepalive-open`으로 대시보드 URL을 출력하고, 가짜 에이전트가 주기적으로
  * working→done을 만들며 Enter를 받으면 자체 turn을 흉내낸다.
  *
- *   node scripts/demo.mjs [--speed 60] [--exit-after 20]
+ *   node scripts/demo.mjs [--speed 60] [--exit-after 20] [--layout-fixture]
+ *
+ * `--layout-fixture`는 긴 브랜치/제목, 제목 없는 터미널, 미지원 터미널을
+ * 화면 검증용으로 만든다. 기본 데모 데이터와 제품 동작은 그대로 둔다.
  *
  * SIGINT/SIGTERM 또는 --exit-after 도달 시 플러그인을 deactivate하고 소켓·tmp를 정리한다.
  * 실제 shell/claude/Orca 프로세스는 실행하지 않는다.
@@ -43,7 +46,7 @@ const PERIODIC_TURN_SAFETY_MS = 30000
  * @param {string[]} argv
  */
 function parseArgs(argv) {
-  const options = { speed: DEFAULT_SPEED, exitAfter: null }
+  const options = { speed: DEFAULT_SPEED, exitAfter: null, layoutFixture: false }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (arg === '--speed') {
@@ -54,6 +57,8 @@ function parseArgs(argv) {
       options.exitAfter = Number(argv[++i])
     } else if (arg.startsWith('--exit-after=')) {
       options.exitAfter = Number(arg.slice('--exit-after='.length))
+    } else if (arg === '--layout-fixture') {
+      options.layoutFixture = true
     }
   }
   if (!Number.isFinite(options.speed) || options.speed <= 0) {
@@ -135,24 +140,25 @@ async function main() {
     worktreeId: 'wt-alpha',
     tabId: 'tab-a',
     leafId: 'leaf-1',
-    title: 'alpha main',
-    branch: 'feature/alpha',
+    title: options.layoutFixture ? '' : 'alpha main',
+    branch: options.layoutFixture ? 'feature/MRTN-2716-cache-keepalive-dashboard-worktree-layout' : 'feature/alpha',
   })
   runtime.addTerminal({
     handle: 'h2',
     worktreeId: 'wt-alpha',
     tabId: 'tab-a',
     leafId: 'leaf-2',
-    title: 'alpha split',
-    branch: 'feature/alpha',
+    title: options.layoutFixture ? 'Claude terminal for a long running cache keepalive investigation' : 'alpha split',
+    branch: options.layoutFixture ? 'feature/MRTN-2716-cache-keepalive-dashboard-worktree-layout' : 'feature/alpha',
   })
   runtime.addTerminal({
     handle: 'h3',
     worktreeId: 'wt-beta',
     tabId: 'tab-b',
     leafId: 'leaf-1',
-    title: 'beta main',
-    branch: 'feature/beta',
+    title: options.layoutFixture ? 'Remote terminal · unsupported' : 'beta main',
+    branch: options.layoutFixture ? 'feature/MRTN-2717-remote-session-support-check' : 'feature/beta',
+    ...(options.layoutFixture ? { executionHostId: 'remote' } : {}),
   })
 
   // 실제 Orca 브라우저가 없으므로 tabCreate를 실패시켜 알림으로 URL을 받는다.

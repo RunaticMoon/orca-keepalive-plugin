@@ -211,7 +211,7 @@ input[type="checkbox"] {
 
 .project {
   display: grid;
-  grid-template-columns: minmax(13rem, 14rem) minmax(0, 1fr);
+  grid-template-columns: minmax(11rem, 13rem) minmax(0, 1fr);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -255,7 +255,7 @@ input[type="checkbox"] {
 
 .worktree {
   display: grid;
-  grid-template-columns: minmax(17rem, 19rem) minmax(0, 1fr);
+  grid-template-columns: minmax(22rem, 26rem) minmax(0, 1fr);
   min-width: 0;
 }
 
@@ -265,16 +265,17 @@ input[type="checkbox"] {
 
 .worktree-cell {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.2rem 0.35rem;
+  align-content: center;
+  gap: 0.3rem 0.4rem;
   min-width: 0;
-  padding: 0.2rem 0.5rem;
+  padding: 0.45rem 0.6rem;
   border-right: 1px solid var(--border);
 }
 
 .worktree-identity {
-  flex: 1 1 4rem;
+  flex: 1 1 100%;
   min-width: 0;
   line-height: 1.1;
 }
@@ -294,15 +295,13 @@ input[type="checkbox"] {
 .worktree-reason {
   color: var(--muted);
   font-size: 0.8rem;
-  flex: 0 1 4rem;
-  min-width: 2.5rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1 1 100%;
+  overflow-wrap: anywhere;
 }
 
 .worktree-cell .compact-button {
   font-size: 0.8rem;
+  flex: 0 0 auto;
 }
 
 .terminals {
@@ -312,12 +311,16 @@ input[type="checkbox"] {
 
 .terminal {
   display: grid;
-  grid-template-columns: minmax(8rem, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "head actions"
+    "status status"
+    "meta meta";
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.2rem 0.75rem;
   min-height: 38px;
   min-width: 0;
-  padding: 0.15rem 0.5rem;
+  padding: 0.45rem 0.6rem;
   background: var(--surface);
 }
 
@@ -335,18 +338,29 @@ input[type="checkbox"] {
 }
 
 .terminal-head {
+  grid-area: head;
   display: flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.4rem;
   min-width: 0;
 }
 
 .terminal-title {
   font-weight: 600;
-  min-width: 4rem;
+  flex: 0 1 auto;
+  min-width: 6.5rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.terminal-status {
+  grid-area: status;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.65rem;
+  min-width: 0;
 }
 
 .badge {
@@ -373,12 +387,18 @@ input[type="checkbox"] {
 }
 
 .terminal-meta {
+  grid-area: meta;
   display: flex;
-  gap: 0.4rem;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.8rem;
   color: var(--muted);
   font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+}
+
+.terminal-meta > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .terminal-expiry.is-expired {
@@ -389,18 +409,17 @@ input[type="checkbox"] {
 .terminal-reason {
   color: var(--muted);
   font-size: 0.8rem;
-  flex: 1 1 3rem;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .terminal-actions {
+  grid-area: actions;
   display: flex;
-  gap: 0.3rem;
+  flex-wrap: wrap;
+  gap: 0.35rem;
   align-items: center;
-  white-space: nowrap;
+  justify-content: flex-end;
 }
 
 .review-warning {
@@ -426,6 +445,7 @@ input[type="checkbox"] {
   align-items: center;
   gap: 0.2rem;
   font-size: 0.8rem;
+  white-space: nowrap;
 }
 
 .field-inline select {
@@ -439,6 +459,7 @@ input[type="checkbox"] {
   padding: 0.15rem 0.35rem;
   font-size: 0.8rem;
   line-height: 1.35;
+  white-space: nowrap;
 }
 
 .terminal-empty {
@@ -446,14 +467,12 @@ input[type="checkbox"] {
   font-size: 0.82rem;
 }
 
-@media (max-width: 1150px) {
-  .project,
-  .worktree {
+@media (max-width: 1200px) {
+  .project {
     display: block;
   }
 
-  .project-cell,
-  .worktree-cell {
+  .project-cell {
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
@@ -465,40 +484,30 @@ input[type="checkbox"] {
     border-radius: 7px 7px 0 0;
   }
 
-  .worktree-cell {
-    flex-wrap: wrap;
-    padding: 0.35rem 0.5rem;
-  }
-
-  .worktree-identity {
-    flex: 1 1 12rem;
+  .worktree {
+    grid-template-columns: minmax(20rem, 25rem) minmax(0, 1fr);
   }
 }
 
-@media (max-width: 1050px) {
+@media (max-width: 900px) {
+  .worktree {
+    display: block;
+  }
+
+  .worktree-cell {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 600px) {
   .terminal {
     grid-template-columns: minmax(0, 1fr);
-    gap: 0.15rem;
-    padding: 0.45rem 0.5rem;
+    grid-template-areas: "head" "status" "meta" "actions";
   }
 
-  .terminal-meta,
   .terminal-actions {
-    flex-wrap: wrap;
-  }
-}
-
-@media (max-width: 760px) {
-  .terminal-title {
-    flex: 1 1 6rem;
-  }
-
-  .terminal-head {
-    flex-wrap: wrap;
-  }
-
-  .terminal-reason {
-    flex-basis: 100%;
+    justify-content: flex-start;
   }
 }
 
@@ -565,8 +574,11 @@ input[type="checkbox"] {
   margin: 0;
   padding: 0;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.25rem;
+  width: 100%;
   max-width: 60rem;
+  min-width: 0;
 }
 
 .diagnostics li {
@@ -579,6 +591,7 @@ input[type="checkbox"] {
   border-radius: 6px;
   padding: 0.3rem 0.6rem;
   font-size: 0.88rem;
+  min-width: 0;
 }
 
 .diag-time {
