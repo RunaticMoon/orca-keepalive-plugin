@@ -778,21 +778,171 @@ test('reconcile: 이미 ⚡가 붙은 미확정 기록은 중복 접두어 없�
   assert.deepEqual(renames[0].params, { terminal: HANDLE, title: PREFIX + 'Claude' })
 })
 
-test('load: confirmed 없는 기록은 확정으로 간주해 재적용하지 않는다', async () => {
+test('load: 이전 실행 기록은 미확정으로 보고 첫 reconcile에서 재적용한다', async () => {
   const storage = new Map([
     [
       KEY,
       { [TAB_KEY]: { worktreeId: WORKTREE, tabId: TAB, handle: HANDLE, applied: PREFIX + 'Claude' } },
     ],
   ])
-  const { rpc, ti } = setup({
+  const { rpc, ti, storage: store } = setup({
     tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
     storage,
   })
   await ti.load()
   await ti.reconcile([pane()])
 
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  // 이미 ⚡가 붙은 제목에서 재적용해도 중복 접두어가 생기지 않는다.
+  assert.deepEqual(renames[0].params, { terminal: HANDLE, title: PREFIX + 'Claude' })
+  assert.equal(store.get(KEY)[TAB_KEY].confirmed, true)
+})
+
+test('load: confirmed:true 저장 기록도 새 handle로 첫 reconcile에서 재적용한다', async () => {
+  const handle2 = 'terminal:local:2'
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane({ handle: handle2 })])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.deepEqual(renames[0].params, { terminal: handle2, title: PREFIX + 'Claude' })
+  assert.deepEqual(store.get(KEY)[TAB_KEY], {
+    worktreeId: WORKTREE,
+    tabId: TAB,
+    handle: handle2,
+    applied: PREFIX + 'Claude',
+    confirmed: true,
+  })
+})
+
+test('load: 이전 종료가 ⚡를 지운 탭에 저장 기록으로 재적용한다', async () => {
+  // 이전 인스턴스 종료가 중간에 끊겨 제목의 ⚡는 지워졌지만 기록은 confirmed:true.
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane()])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.deepEqual(renames[0].params, { terminal: HANDLE, title: PREFIX + 'Claude' })
+  assert.equal(store.get(KEY)[TAB_KEY].confirmed, true)
+})
+
+test('load: removeOnly reconcile은 미확정으로 읽은 기록을 재적용하지 않는다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane()], { removeOnly: true })
+
   assert.equal(rpc.callsFor('terminal.rename').length, 0)
+  assert.equal(store.get(KEY)[TAB_KEY].confirmed, true, '저장 형식의 confirmed는 유지된다')
+})
+
+test('load: 재적용 후 다음 reconcile은 rename을 반복하지 않는다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti } = setup({
+    tabsList: () => listOf(entry({ title: 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane()])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1)
+
+  await ti.reconcile([pane()])
+  assert.equal(rpc.callsFor('terminal.rename').length, 1, '확정된 뒤에는 재적용하지 않는다')
+})
+
+test('load: confirmed:true 기록이라도 on:false reconcile은 재적용 없이 해제만 한다', async () => {
+  const storage = new Map([
+    [
+      KEY,
+      {
+        [TAB_KEY]: {
+          worktreeId: WORKTREE,
+          tabId: TAB,
+          handle: HANDLE,
+          applied: PREFIX + 'Claude',
+          confirmed: true,
+        },
+      },
+    ],
+  ])
+  const { rpc, ti, storage: store } = setup({
+    tabsList: () => listOf(entry({ title: PREFIX + 'Claude' })),
+    storage,
+  })
+  await ti.load()
+  await ti.reconcile([pane({ on: false })])
+
+  const renames = rpc.callsFor('terminal.rename')
+  assert.equal(renames.length, 1)
+  assert.deepEqual(renames[0].params, { terminal: HANDLE, title: null })
+  assert.deepEqual(store.get(KEY), {})
+  assert.deepEqual(ti.snapshot(), { tabs: 0, disabledTabs: 0 })
 })
 
 test('remove: 미확정 기록도 탭이 있으면 되돌린다', async () => {
