@@ -2369,6 +2369,7 @@ test('epochMemory: 첫 done 뒤 ARMED이면 remember한다', async () => {
   const remembered = epochMemory.calls.remember.filter((call) => call.key === EPOCH_KEY)
   assert.equal(remembered.length, 1)
   assert.deepEqual(remembered[0].record, {
+    kind: 'armed',
     userDataKey: 'key-p',
     profileId: 'p1',
     worktreeId: 'w1',
@@ -2377,6 +2378,9 @@ test('epochMemory: 첫 done 뒤 ARMED이면 remember한다', async () => {
     incarnationId: 'inc1',
     doneAt: t0 + 1000,
     basisAt: t0,
+    expiresAt: t0 + TTL_5M,
+    lastBlockReason: null,
+    expiredAt: null,
   })
   assert.equal(epochMemory.store.has(EPOCH_KEY), true)
 })
@@ -2568,7 +2572,7 @@ test('epochMemory: 저장된 incarnationId null과 target inc1이 달라도 같�
   assert.equal(restored[0].code, 'incarnation_changed')
 })
 
-test('epochMemory: needsReview scope는 복원하지 않고 forget하며 clearReview 뒤에도 전송하지 않는다', async () => {
+test('epochMemory: needsReview scope는 예약을 복원하지 않고 이력으로 낮추며 clearReview 뒤에도 전송하지 않는다', async () => {
   const epochMemory = createFakeEpochMemory()
   const hostCall = createHostCall()
   const h1 = createHarness({ epochMemory, hostCall })
@@ -2584,10 +2588,9 @@ test('epochMemory: needsReview scope는 복원하지 않고 forget하며 clearRe
   const h2 = createHarness({ epochMemory, hostCall, store: h1.rawStore })
   await startHarness(h2)
 
-  // needsReview이므로 복원하지 않고 저장 항목을 정리한다.
-  assert.equal(viewTerminal(h2).phase, 'UNKNOWN')
-  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
-  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  // 예약은 되살리지 않지만 표시 이력은 복원한다(저장 레코드는 history로 낮춘다).
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
   assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
 
   // 검토를 해제해도 새 working→done 없이는 전송하지 않는다.
@@ -2943,4 +2946,237 @@ test('cacheHistory: catalog에서 target이 사라지면 이력도 함께 사라
   await h.clock.advance(h.tickMs)
 
   assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+// ---------------------------------------------------------------------------
+// 25. epochMemory: 만료 이력 영속·복원(작업 I)
+// ---------------------------------------------------------------------------
+
+test('epochMemoryI: 플러그인 재시작 후 만료 이력(EXPIRED·원인·시각)을 그대로 복원한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  h1.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: 'DRAFT_PRESENT',
+    attemptId: null,
+    at: h1.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const expiresAt = t0 + TTL_5M
+  await advanceToDue(h1)
+  assert.ok(h1.sendCalls.length >= 1)
+  assert.equal(h1.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'DRAFT_PRESENT')
+
+  // 실제 expiresAt을 지나 ADVANCE가 expiredAt을 확정한다.
+  await h1.clock.advance(expiresAt - h1.clock.now() + h1.tickMs)
+  const before = h1.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.equal(before.expiredAt, expiresAt)
+  assert.equal(before.lastBlockReason, 'DRAFT_PRESENT')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'EXPIRED')
+  const after = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.expiresAt, expiresAt)
+  assert.equal(after.expiredAt, expiresAt)
+  assert.equal(after.lastBlockReason, 'DRAFT_PRESENT')
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+})
+
+test('epochMemoryI: 같은 ptyId·새 incarnationId(Orca 재시작)에서도 만료 이력을 복원한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  h1.setSendBehavior(async () => ({
+    kind: 'skipped',
+    reason: 'OUTPUT_ACTIVE',
+    attemptId: null,
+    at: h1.clock.now(),
+    framesSent: 0,
+  }))
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const expiresAt = t0 + TTL_5M
+  await advanceToDue(h1)
+  await h1.clock.advance(expiresAt - h1.clock.now() + h1.tickMs)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory, terminals: [makeRow({ incarnationId: 'inc2' })] })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'EXPIRED')
+  const after = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.expiredAt, expiresAt)
+  assert.equal(after.lastBlockReason, 'OUTPUT_ACTIVE')
+})
+
+test('epochMemoryI: 오프라인 중 만료(재시작 전 expiresAt 경과)는 EXPIRED로 낮추고 전송하지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  const expiresAt = t0 + TTL_5M
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'armed')
+  await h1.coordinator.stop()
+
+  // 재시작 전에 expiresAt이 지나도록 시각을 진행한다.
+  const h2 = createHarness({
+    epochMemory,
+    clock: createFakeClock({ start: expiresAt + 1000 }),
+  })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'EXPIRED')
+  const after = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.expiredAt, expiresAt)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  await h2.clock.advance(TTL_5M * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryI: 저장된 history와 ptyId가 다르면 복원을 거절하고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'history',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt: 1000000,
+    basisAt: 1000000,
+    expiresAt: 1000000 + TTL_5M,
+    lastBlockReason: 'DRAFT_PRESENT',
+    expiredAt: null,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory, terminals: [makeRow({ ptyId: 'pty2' })] })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+test('epochMemoryI: 열린 attempt는 예약 복원만 차단하고 이력으로 낮춘다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const hostCall = createHostCall()
+  const h1 = createHarness({ epochMemory, hostCall })
+  await startHarness(h1)
+  await arm(h1, h1.clock.now())
+  await h1.coordinator.stop()
+
+  const attemptId = await h1.rawStore.reserveAttempt(
+    {
+      userDataKey: 'key-p',
+      profileId: 'p1',
+      worktreeId: 'w1',
+      paneKey: 'tab:leaf',
+      ptyId: 'pty1',
+      runtimeId: 'rt1',
+    },
+    1,
+    h1.clock.now(),
+  )
+  await h1.rawStore.recordAttempt(attemptId, 'pasted')
+  assert.equal(h1.rawStore.getBudget(SCOPE).lastAttempt.phase, 'pasted')
+
+  const h2 = createHarness({ epochMemory, hostCall, store: h1.rawStore })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  await h2.clock.advance(TTL_5M)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryI: history 레코드는 재시작 후 due가 지나도 전송 예약을 만들지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  // 만료 전 예약 취소(blocked/waiting): phase SUSPENDED, 이력은 남는다.
+  worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
+  await h1.clock.settle()
+  assert.equal(viewTerminal(h1).phase, 'SUSPENDED')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).expiredAt, null)
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h2).dueAt, null)
+  const hist = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.lastBlockReason, null)
+
+  await h2.clock.advance(t0 + TTL_5M - h2.clock.now() + h2.tickMs * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryI: 복원된 history 뒤 fresh working→done은 새 ARMED와 새 이력을 만든다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
+  await h1.clock.settle()
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+
+  const t1 = h2.clock.now()
+  await arm(h2, t1)
+
+  assert.equal(viewTerminal(h2).phase, 'ARMED')
+  const hist = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.doneAt, t1 + 1000)
+  assert.equal(hist.expiresAt, t1 + TTL_5M)
+  assert.equal(hist.lastBlockReason, null)
+  assert.equal(hist.expiredAt, null)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'armed')
+})
+
+test('epochMemoryI: 만료 후 24시간이 지나면 이력과 저장 레코드를 함께 지운다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  const expiresAt = t0 + TTL_5M
+  assert.equal(epochMemory.store.has(EPOCH_KEY), true)
+
+  // wall/mono를 함께 점프해 clock gap으로 오인되지 않게 한 뒤 tick을 1회 진행한다.
+  const jump = expiresAt + CACHE_HISTORY_RETENTION_MS - h.clock.now() + h.tickMs
+  h.clock.jumpWall(jump)
+  h.clock.jumpMono(jump)
+  await h.clock.advance(h.tickMs)
+
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
 })
