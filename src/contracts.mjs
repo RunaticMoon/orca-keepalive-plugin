@@ -128,6 +128,50 @@
  */
 
 /**
+ * 표시 전용 캐시 관측 이력. scheduler의 예약 epoch를 대체하지 않는다(§2-3).
+ * coordinator의 target entry에만 존재하며, 이력만으로 전송 예약을 만들지 않는다.
+ * @typedef {Object} CacheHistory
+ * @property {number} epochId 실행 중 경합 검증용 epoch id. **영속 저장하지 않는다**(복원 시 새 id).
+ * @property {number} doneAt 이력을 연 관측 done의 시각(ms).
+ * @property {number} basisAt 캐시 TTL 기준 시각(ms). (basisAt ?? doneAt) + ttlMs가 예상 만료 시각이다.
+ * @property {number} expiresAt 예상 만료 시각(ms). 예약이 취소돼도 이력이 있으면 유지한다.
+ * @property {string|null} lastBlockReason 이 이력의 마지막 차단 reason(EXPIRE_CAUSE_REASONS 중 하나) 또는 null. 알 수 없는 문자열은 기록하지 않는다.
+ * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). 여기서는 **expiresAt과 같은 값**이며, 그 전에는 null. 이후 CACHE_HISTORY_RETENTION_MS가 지나면 null로 정리된다.
+ */
+
+/**
+ * epoch-memory v2 저장 레코드(§2-4). storage key는 기존 'epochs-v1'을 유지하고
+ * envelope version만 EPOCH_MEMORY_VERSION으로 올린다. 시각은 유한수를 검증하고,
+ * expiredAt !== null이면 expiresAt과 같아야 하며 반드시 kind='history'다.
+ * @typedef {Object} EpochMemoryRecordV2
+ * @property {'armed'|'history'} kind armed=복원 가능한 예약(ARMED && attempted=false), history=표시 전용(전송 예약으로 복원 금지).
+ * @property {string} userDataKey
+ * @property {string} profileId
+ * @property {string} worktreeId
+ * @property {string} paneKey
+ * @property {string} ptyId
+ * @property {string|null} incarnationId 재시작에 따른 변경은 허용한다.
+ * @property {number} doneAt
+ * @property {number|null} basisAt 없으면 doneAt을 쓴다.
+ * @property {number|null} expiresAt 예상 만료 시각(ms). TTL 정보가 없는 옛 레코드에서는 null.
+ * @property {string|null} lastBlockReason EXPIRE_CAUSE_REASONS 중 하나 또는 null. 알 수 없는 값은 null로 정규화한다.
+ * @property {number|null} expiredAt null이 아니면 expiresAt과 같은 값이다. 이 값이 있으면 kind는 반드시 'history'다.
+ * @property {number} savedAt 저장 시각(ms). 이 값 갱신으로 보존 기간을 연장하지 않는다.
+ */
+
+/**
+ * 내부 전용 scheduler 입력: 저장된 표시 이력 복원(§2-5). MACHINE_INPUT_TYPES에는 넣지
+ * 않는다(RESTORE_EPOCH와 같은 내부 전용 취급). 초기 UNKNOWN이고 epoch/attempt가 없으며
+ * fresh working을 관측하지 않은 상태에서만 적용된다. seenWorking=false, epoch/attempt=null을
+ * 유지하고 예산·자체 턴 카운터를 바꾸지 않는다.
+ * @typedef {Object} RestoreCacheHistoryInput
+ * @property {'RESTORE_CACHE_HISTORY'} type
+ * @property {boolean} expired true면 만료 이력(EXPIRED/EXPIRED)으로, false면 만료 전 취소 이력(SUSPENDED)으로 복원한다.
+ * @property {string} [reason] 만료 이력의 마지막 차단 reason(선택, EXPIRE_CAUSE_REASONS 중 하나). 알 수 없는 값은 기록하지 않는다.
+ * @property {number} [at] 이벤트 시각(ms).
+ */
+
+/**
  * scheduler 결정. §6.
  * @typedef {Object} Decision
  * @property {'wait'|'inspect'|'send'|'expire'} kind
@@ -146,16 +190,40 @@
  */
 
 /**
+ * 캐시 상태 표시 필드(공통, §2-1). coordinator의 RuntimeTerminalView와 아래
+ * DashboardTerminal이 같은 이름·같은 의미로 전달한다. dashboard-model은 enum과
+ * 유한 timestamp만 복사하고, 누락·불량 값은 각각 `none`/`no-reservation`/null로 정규화한다.
+ * `phase`/`reason`/`effectiveEnabled`와 달리 이 필드들은 실제 캐시 적중 여부나 전송
+ * 허용을 뜻하지 않는다.
+ * @typedef {Object} CacheDisplayFields
+ * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태. 실제 캐시 적중 여부가 아니다. 누락 시 'none'.
+ * @property {'working'|'scheduled'|'sending'|'awaiting-turn'|'expired'|'no-reservation'|'interactive-wait'|'suspended'|'review'} cacheStatus 표시용 상태(§2-1 표). 누락 시 'no-reservation'.
+ * @property {boolean} indicatorOn 탭 표시용 활성 조건(§2-2). 전송 허용 필드로 사용하지 않는다.
+ * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약이 취소돼도 이력이 있으면 유지하며, 이력이 없으면 null.
+ * @property {number|null} expiredAt 예상 만료가 실제로 지난 뒤의 만료 시각(ms). tick 실행 시각이 아니라 expiresAt이며, 그 전에는 null.
+ * @property {string|null} expireCause 만료된 epoch의 마지막 차단 reason(EXPIRE_CAUSE_REASONS 중 하나) 또는 null.
+ * @property {string|null} blockedReason 현재 이력의 마지막 차단 reason 또는 null. 만료 전 표시에도 쓸 수 있다.
+ * @property {number|null} dueAt 실행 가능한 예약이 있을 때만 값이 있다(ms). 이력 복원만으로는 생성하지 않는다.
+ */
+
+/**
  * 대시보드 terminal row. §7.4.
+ * 캐시 표시 필드는 CacheDisplayFields와 같은 의미·normalize 규칙을 따른다(§2-1).
  * @typedef {Object} DashboardTerminal
  * @property {string} id opaque targetId.
  * @property {string} title plain text(innerHTML 금지).
- * @property {string} phase target phase.
+ * @property {string} phase target phase(호환용, 일반 사용자 화면에 출력하지 않는다).
  * @property {boolean|null} enabledOverride null=inherit.
- * @property {boolean} effectiveEnabled 실제 적용 상태.
+ * @property {boolean} effectiveEnabled 실제 적용 상태(캐시 유지 여부로 해석하지 않는다).
  * @property {string} reason 적용/차단 이유 코드.
- * @property {number|null} dueAt
- * @property {number|null} expiresAt
+ * @property {'kept'|'none'|'review'} cacheState 관측한 턴과 유효 예약에 근거한 유지 상태. 실제 캐시 적중 여부가 아니다.
+ * @property {'working'|'scheduled'|'sending'|'awaiting-turn'|'expired'|'no-reservation'|'interactive-wait'|'suspended'|'review'} cacheStatus 표시용 상태.
+ * @property {boolean} indicatorOn 탭 표시용 활성 조건. 전송 허용 필드로 사용하지 않는다.
+ * @property {number|null} dueAt 실행 가능한 예약이 있을 때만 값이 있다(ms). 이력 복원만으로는 생성하지 않는다.
+ * @property {number|null} expiresAt 현재 관측 이력의 예상 만료 시각(ms). 예약 취소 후에도 이력이 있으면 유지, 이력이 없으면 null.
+ * @property {number|null} expiredAt 예상 만료가 지난 뒤의 만료 시각(ms). tick 시각이 아니라 expiresAt이며 그 전에는 null.
+ * @property {string|null} expireCause 만료된 epoch의 마지막 차단 reason(EXPIRE_CAUSE_REASONS 중 하나) 또는 null.
+ * @property {string|null} blockedReason 현재 이력의 마지막 차단 reason 또는 null. 만료 전 표시에도 쓸 수 있다.
  * @property {number} charged
  * @property {number} confirmed
  * @property {boolean} needsReview
@@ -452,4 +520,88 @@ export const PUBLIC_SNAPSHOT_FORBIDDEN_KEYS = deepFreeze([
   'worktreePath',
   'userDataPath',
   'endpoint',
+]);
+
+/**
+ * 캐시 유지 상태(§2-1). 실제 Anthropic 캐시 적중 여부가 아니라 관측한 턴과 유효
+ * 예약에 근거한 유지 상태다. review는 사용자 확인이 필요하다는 표시다.
+ * @type {ReadonlyArray<string>}
+ */
+export const CACHE_STATES = deepFreeze(['kept', 'none', 'review']);
+
+/**
+ * 캐시 표시 상태(§2-1). dueAt/expiresAt이 있어도 실제 전송 가능 여부와 다를 수 있다.
+ * @type {ReadonlyArray<string>}
+ */
+export const CACHE_STATUSES = deepFreeze([
+  'working',
+  'scheduled',
+  'sending',
+  'awaiting-turn',
+  'expired',
+  'no-reservation',
+  'interactive-wait',
+  'suspended',
+  'review',
+]);
+
+/**
+ * 표시 이력 보존 시간(ms). 만료 후 이 시간이 지나면 이력을 제거한다(§2-3, §2-4).
+ * @type {number}
+ */
+export const CACHE_HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 탭 이름 prefix(§2-2, §2-6). cacheState별 기호이며 항상 뒤에 공백을 포함한다.
+ * @type {Readonly<Record<string, string>>}
+ */
+export const TITLE_PREFIXES = deepFreeze({
+  kept: '⚡ ',
+  none: '💤 ',
+  review: '⚠️ ',
+});
+
+/**
+ * 같은 탭의 on pane을 합산할 때의 상태 우선순위(§2-2). 앞이 우선이며
+ * `review > kept > none`을 뜻한다.
+ * @type {ReadonlyArray<string>}
+ */
+export const TITLE_PREFIX_PRIORITY = deepFreeze(['review', 'kept', 'none']);
+
+/**
+ * epoch-memory envelope version. storage key 'epochs-v1'은 유지하고 version만 올린다(§2-4).
+ * version 1 레코드는 기존 방식으로 읽는다.
+ * @type {number}
+ */
+export const EPOCH_MEMORY_VERSION = 2;
+
+/**
+ * 만료 이력에 저장할 수 있는 차단 reason allowlist(§2-7 "만료 원인 문구" 표).
+ * REASON_CODES에 실제로 존재하는 값만 담는다. EXPIRED(만료 자체), NO_FRESH_TURN(관측
+ * 부재), PARTIAL_OR_UNKNOWN_SEND(확인 필요 표시)는 만료 원인이 아니므로 제외한다.
+ * @type {ReadonlyArray<string>}
+ */
+export const EXPIRE_CAUSE_REASONS = deepFreeze([
+  REASON_CODES.DRAFT_PRESENT,
+  REASON_CODES.INPUT_QUIET_WINDOW,
+  REASON_CODES.OUTPUT_ACTIVE,
+  REASON_CODES.INTERACTIVE_WAIT,
+  REASON_CODES.BUSY,
+  REASON_CODES.UNKNOWN_WAIT,
+  REASON_CODES.SCREEN_UNKNOWN,
+  REASON_CODES.GLOBAL_PAUSED,
+  REASON_CODES.SCOPE_DISABLED,
+  REASON_CODES.APP_TIMER_OFF,
+  REASON_CODES.SETTINGS_UNKNOWN,
+  REASON_CODES.CWARM_DISABLED,
+  REASON_CODES.LIMIT_REACHED,
+  REASON_CODES.STORAGE_FAILED,
+  REASON_CODES.CATALOG_INCOMPLETE,
+  REASON_CODES.RUNTIME_UNAVAILABLE,
+  REASON_CODES.WRONG_RUNTIME,
+  REASON_CODES.NO_AGENT,
+  REASON_CODES.UNSUPPORTED_AGENT,
+  REASON_CODES.UNSUPPORTED_HOST,
+  REASON_CODES.NOT_CONNECTED,
+  REASON_CODES.STALE_TARGET,
 ]);
