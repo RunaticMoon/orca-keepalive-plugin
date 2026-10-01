@@ -26,13 +26,14 @@ import { createPlugin } from '../main.mjs'
 import { createCoordinator } from '../src/coordinator.mjs'
 import { createDashboardModel } from '../src/dashboard-model.mjs'
 import { DEFAULT_CONFIG } from '../src/config.mjs'
+import { STATE_KEY } from '../src/state-store.mjs'
 import { startFakeRuntime } from '../test/fixtures/fake-runtime.mjs'
 import { createOrcaUserData } from '../test/fixtures/orca-userdata.mjs'
 import { createFakeHost } from '../test/fixtures/fake-host.mjs'
 
 const DEFAULT_SPEED = 60
 
-/** 데모 userdata fixture에 설정하는 앱 타이머 TTL(ms). 5분. */
+/** 플러그인 config에 저장하는 캐시 TTL(ms). 5분. */
 const DEMO_TTL_MS = 300000
 
 /**
@@ -126,6 +127,7 @@ async function main() {
     socketPath,
     profileId: 'demo-profile',
     enabled: true,
+    // Orca 타이머 값은 더 이상 사용되지 않음. fixture 호환용으로만 채운다.
     ttlMs: DEMO_TTL_MS,
   })
   const runtime = await startFakeRuntime({
@@ -165,6 +167,15 @@ async function main() {
   runtime.setBrowserTabCreateResult({})
 
   const host = createFakeHost()
+  // 플러그인 config에 5분 TTL을 명시한다. Orca userdata fixture의 타이머 TTL은 더 이상
+  // 사용되지 않으므로, state-store가 load할 수 있는 state-v1 envelope를 활성화 전에
+  // host storage에 직접 채운다(형식은 validatePersistedState 계약과 동일).
+  host.storage.set(STATE_KEY, {
+    schemaVersion: 1,
+    revision: 0,
+    config: { ...DEFAULT_CONFIG, claudeCacheTtlMs: DEMO_TTL_MS },
+    profiles: [],
+  })
   const clock = createScaledClock(options.speed)
   const plugin = createPlugin(host.orca, {
     os: { homedir: () => userData.homeDir },
