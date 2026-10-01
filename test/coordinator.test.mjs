@@ -2912,7 +2912,7 @@ test('cacheHistory: 새 실제 working은 이력을 CLEAR한다', async () => {
   assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
 })
 
-test('cacheHistory: blocked/waiting으로 예약이 취소돼도 이력은 남는다', async () => {
+test('cacheHistory: blocked/waiting으로 예약이 취소돼도 이력은 남기고 차단 원인을 기록한다', async () => {
   const h = createHarness()
   await startHarness(h)
   const t0 = h.clock.now()
@@ -2924,7 +2924,12 @@ test('cacheHistory: blocked/waiting으로 예약이 취소돼도 이력은 남�
   await h.clock.settle()
 
   assert.equal(viewTerminal(h).phase, 'SUSPENDED')
-  assert.deepEqual(h.coordinator.__debugCacheHistory(EPOCH_KEY), before)
+  // 대기 직전 ARMED 예약의 epoch id·만료 시각은 그대로 두고 차단 원인만 남긴다.
+  const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.epochId, before.epochId)
+  assert.equal(after.expiresAt, before.expiresAt)
+  assert.equal(after.lastBlockReason, 'INTERACTIVE_WAIT')
 })
 
 test('cacheHistory: 정책 폐기(POLICY_INVALIDATED)는 이력을 남기고 폐기 사유를 기록한다', async () => {
@@ -3280,7 +3285,8 @@ test('epochMemoryI: history 레코드는 재시작 후 due가 지나도 전송 �
   assert.equal(viewTerminal(h2).dueAt, null)
   const hist = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.ok(hist)
-  assert.equal(hist.lastBlockReason, null)
+  // 대기(hold) 중 기록한 INTERACTIVE_WAIT 차단 원인도 함께 복원된다.
+  assert.equal(hist.lastBlockReason, 'INTERACTIVE_WAIT')
 
   await h2.clock.advance(t0 + TTL_5M - h2.clock.now() + h2.tickMs * 2)
   assert.equal(h2.sendCalls.length, 0)
@@ -3411,20 +3417,127 @@ test('getRuntimeView: 10초 cutoff는 no-reservation+expiresAt, 실제 만료 �
   assert.equal(desired[0].cacheState, 'none')
 })
 
-test('getRuntimeView: INTERACTIVE_WAIT으로 예약이 폐기되면 none/interactive-wait', async () => {
+test('getRuntimeView: ARMED→waiting은 원래 예약을 승계해 kept/interactive-wait', async () => {
   const h = createHarness()
   await startHarness(h)
   const t0 = h.clock.now()
   await arm(h, t0)
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
 
   worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  // 대기 전송은 금지되지만, 대기 직전 관측한 예약은 아직 만료 전이므로 유지 중이다.
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'SUSPENDED')
+  assert.equal(term.cacheState, 'kept')
+  assert.equal(term.cacheStatus, 'interactive-wait')
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+
+  // hold는 기존 epoch의 id·기준 시각을 승계하므로 이력은 다시 OPEN되지 않는다.
+  const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.epochId, before.epochId)
+  assert.equal(after.expiresAt, before.expiresAt)
+  assert.equal(after.lastBlockReason, 'INTERACTIVE_WAIT')
+})
+
+test('getRuntimeView: hold 근거 없는 waiting은 none/interactive-wait', async () => {
+  const h = createHarness()
+  await startHarness(h)
+
+  // seenWorking 없이 곧바로 대기: 승계할 캐시 기준이 없다.
+  worktreeEvent(h, 'w1', 'waiting', h.clock.now() + 1000)
   await h.clock.settle()
 
   const term = viewTerminal(h)
   assert.equal(term.phase, 'SUSPENDED')
   assert.equal(term.cacheState, 'none')
   assert.equal(term.cacheStatus, 'interactive-wait')
-  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.expiresAt, null)
+})
+
+test('getRuntimeView: BUSY→waiting은 대기 수신 시각 기준 만료를 유지한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h, 'w1', 'waiting', waitingAt)
+  await h.clock.settle()
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'SUSPENDED')
+  assert.equal(term.cacheState, 'kept')
+  assert.equal(term.cacheStatus, 'interactive-wait')
+  assert.equal(term.expiresAt, waitingAt + TTL_5M)
+
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.epochId, 1)
+  assert.equal(hist.basisAt, waitingAt)
+  assert.equal(hist.expiresAt, waitingAt + TTL_5M)
+  assert.equal(hist.lastBlockReason, 'INTERACTIVE_WAIT')
+})
+
+test('getRuntimeView: 대기(hold) 뒤 TTL이 지나면 expired/expireCause INTERACTIVE_WAIT', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  const expiresAt = t0 + TTL_5M
+  await h.clock.advance(expiresAt - h.clock.now() + h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.cacheState, 'none')
+  assert.equal(term.cacheStatus, 'expired')
+  assert.equal(term.expiresAt, expiresAt)
+  assert.equal(term.expiredAt, expiresAt)
+  assert.equal(term.expireCause, 'INTERACTIVE_WAIT')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).expiredAt, expiresAt)
+})
+
+test('getRuntimeView: waiting→working은 hold를 버리고 기존 새 턴 규칙으로 이력을 CLEAR한다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+  assert.ok(h.coordinator.__debugCacheHistory(EPOCH_KEY))
+
+  worktreeEvent(h, 'w1', 'working', t0 + 4000)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'BUSY')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+})
+
+test('getRuntimeView: 대기 hold 중 정책 폐기는 hold id로 사유를 남긴다', async () => {
+  const h = createHarness()
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+  const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(before)
+
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
+  await h.clock.advance(h.tickMs)
+
+  const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(after)
+  assert.equal(after.epochId, before.epochId)
+  assert.equal(after.lastBlockReason, 'SETTINGS_UNKNOWN')
 })
 
 test('projection: review는 indicatorOn true(⚠️)이며 PARTIAL_OR_UNKNOWN_SEND를 표시 예외로 둔다', async () => {

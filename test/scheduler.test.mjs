@@ -114,6 +114,7 @@ test('initialTargetState는 계약 shape을 만든다', () => {
     seenWorking: false,
     epochSeq: 0,
     epoch: null,
+    hold: null,
     attempt: null,
     reason: 'NO_FRESH_TURN',
     generation: 0,
@@ -553,15 +554,156 @@ test('blocked/waiting은 SUSPENDED와 INTERACTIVE_WAIT, 전송 중이면 generat
   assert.equal(blocked.phase, 'SUSPENDED');
   assert.equal(blocked.epoch, null);
   assert.equal(blocked.reason, 'INTERACTIVE_WAIT');
+  // ARMED의 캐시 기준을 hold로 승계한다.
+  assert.deepEqual(blocked.hold, { id: 1, basisAt: 0, attempted: false });
 
   const waiting = reduce(armedState, hook('waiting', 3000));
   assert.equal(waiting.phase, 'SUSPENDED');
+  assert.deepEqual(waiting.hold, blocked.hold);
 
   const pasting = withAttempt('a1', 3000);
   const generation = pasting.generation;
   const blockedDuringSend = reduce(pasting, hook('blocked', 4000));
   assert.equal(blockedDuringSend.generation, generation + 1);
   assert.equal(blockedDuringSend.phase, 'SUSPENDED');
+  // PASTING은 캐시 기준을 승계할 예약이 없으므로 hold가 없다.
+  assert.equal(blockedDuringSend.hold, null);
+});
+
+// ---------------------------------------------------------------------------
+// hold: 대기(waiting/blocked) 중 캐시 관측 보존
+// ---------------------------------------------------------------------------
+
+test('hold (a): working→waiting은 SUSPENDED, epoch null, hold에 대기 직전 관측을 잡고 decide는 wait', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  assert.equal(state.phase, 'BUSY');
+  const seqBefore = state.epochSeq;
+
+  state = reduce(state, hook('waiting', 3000));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.epoch, null);
+  assert.deepEqual(state.hold, { id: seqBefore + 1, basisAt: 3000, attempted: false });
+  assert.equal(state.epochSeq, seqBefore + 1);
+
+  const decision = decideWith(state, 3000);
+  assert.equal(decision.kind, 'wait');
+  assert.equal(decision.reason, 'INTERACTIVE_WAIT');
+});
+
+test('hold (b): 반복 waiting/blocked와 전환에도 hold id·basisAt·epochSeq는 불변', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('waiting', 3000));
+  const hold = { ...state.hold };
+  const seq = state.epochSeq;
+
+  state = reduce(state, hook('blocked', 4000));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.deepEqual(state.hold, hold);
+  assert.equal(state.epochSeq, seq);
+
+  state = reduce(state, hook('waiting', 5000));
+  assert.deepEqual(state.hold, hold);
+  assert.equal(state.epochSeq, seq);
+});
+
+test('hold (c): working→waiting→done은 hold의 id·basisAt을 승계하고 epochSeq를 더 올리지 않는다', () => {
+  for (const mainAgentState of [undefined, 'done']) {
+    let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+    state = reduce(state, hook('waiting', 3000));
+    const seq = state.epochSeq;
+
+    const opts = mainAgentState === undefined ? {} : { mainAgentState };
+    state = reduce(state, hook('done', 4000, opts));
+    assert.equal(state.phase, 'ARMED');
+    assert.equal(state.epoch.id, 1);
+    assert.equal(state.epoch.doneAt, 4000);
+    assert.equal(state.epoch.basisAt, 3000);
+    assert.equal(state.epoch.attempted, false);
+    assert.equal(state.hold, null);
+    assert.equal(state.epochSeq, seq);
+    assert.equal(state.lastWorkingAt, null);
+    assert.equal(state.reason, null);
+  }
+});
+
+test('hold (d): working→waiting→working→done은 기존 흐름(hold 해제, 새 epoch)', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('waiting', 3000));
+  const budget = state.budgetResetSeq;
+
+  state = reduce(state, hook('working', 5000));
+  assert.equal(state.phase, 'BUSY');
+  assert.equal(state.hold, null);
+  assert.equal(state.budgetResetSeq, budget + 1);
+
+  state = reduce(state, hook('done', 6000));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.id, 2);
+  assert.equal(state.epoch.basisAt, 5000);
+  assert.equal(state.epoch.doneAt, 6000);
+  assert.equal(state.hold, null);
+});
+
+test('hold (e): ARMED(attempted true)→waiting→done은 id·basisAt·attempted를 승계한다', () => {
+  const base = armed(2000);
+  let state = { ...base, epoch: { ...base.epoch, attempted: true } };
+  state = reduce(state, hook('waiting', 3000));
+  assert.deepEqual(state.hold, { id: 1, basisAt: base.epoch.basisAt, attempted: true });
+
+  state = reduce(state, hook('done', 4000));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.id, 1);
+  assert.equal(state.epoch.basisAt, base.epoch.basisAt);
+  assert.equal(state.epoch.attempted, true);
+  assert.equal(state.epoch.doneAt, 4000);
+  assert.equal(state.hold, null);
+  assert.equal(state.epochSeq, 1);
+});
+
+test('hold (f): UNKNOWN(seenWorking false)→waiting은 hold 없음', () => {
+  const state = reduce(initialTargetState(TARGET), hook('waiting', 3000));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.epoch, null);
+  assert.equal(state.hold, null);
+  assert.equal(state.epochSeq, 0);
+});
+
+test('hold (g): waiting→done이 이미 TTL을 지났으면 decide가 expire', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 900000));
+  state = reduce(state, hook('waiting', 1000000));
+  state = reduce(state, hook('done', 1500000));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.basisAt, 1000000);
+  assert.equal(state.epoch.doneAt, 1500000);
+
+  const decision = decideWith(state, 1500000);
+  assert.equal(decision.kind, 'expire');
+  assert.equal(decision.reason, 'EXPIRED');
+});
+
+test('hold (h): POLICY_INVALIDATED / TARGET_CHANGED는 hold를 지운다', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('waiting', 3000));
+  assert.notEqual(state.hold, null);
+
+  const invalidated = reduce(state, { type: 'POLICY_INVALIDATED', reason: 'SCOPE_DISABLED' });
+  assert.equal(invalidated.hold, null);
+
+  const changed = reduce(state, { type: 'TARGET_CHANGED', target: { ...TARGET, ptyId: 'pty2' } });
+  assert.equal(changed.hold, null);
+});
+
+test('hold: EXPIRE/CLOCK_GAP 같은 예약 폐기도 hold를 지운다', () => {
+  const waitingState = reduce(
+    reduce(initialTargetState(TARGET), hook('working', 1000)),
+    hook('waiting', 3000),
+  );
+  assert.notEqual(waitingState.hold, null);
+  assert.equal(reduce(waitingState, { type: 'CLOCK_GAP' }).hold, null);
+
+  // ARMED + hold는 정상 흐름에는 없지만, EXPIRE가 hold를 지우는지 직접 확인한다.
+  const armedHold = { ...armed(2000), hold: { id: 5, basisAt: 1000, attempted: false } };
+  assert.equal(reduce(armedHold, { type: 'EXPIRE', epochId: 1 }).hold, null);
 });
 
 // ---------------------------------------------------------------------------

@@ -156,7 +156,18 @@ export function cacheStatusDisplay(terminal, now) {
   if (status === 'sending') return { category: 'kept', label: '유지 중', text: '캐시 유지 중 · 유지 메시지 전송 중' };
   if (status === 'awaiting-turn') return { category: 'kept', label: '유지 중', text: '캐시 유지 중 · 작업 시작 확인 중' };
   if (status === 'expired') return { category: 'expired', label: '만료', text: `캐시 만료됨 · ${time(expired)} · ${cause}`, at: expired, cause: true };
-  if (status === 'interactive-wait') return { category: 'stopped', label: '유지 중단', text: '유지 중단 · 권한·입력 응답 대기' };
+  if (status === 'interactive-wait') {
+    if (terminal.cacheState === 'kept') {
+      const expiryText = expiry === null ? '' : ` · 만료 예정 ${time(expiry)}`;
+      return {
+        category: 'kept',
+        label: '유지 중',
+        text: `캐시 유지 중 · 선택·권한 응답 대기(응답 전 자동 전송 안 함)${expiryText}`,
+        at: expiry,
+      };
+    }
+    return { category: 'stopped', label: '응답 대기', text: '선택·권한 응답 대기 · 캐시 상태 확인 안 됨(응답 전 자동 전송 안 함)' };
+  }
   if (status === 'suspended') return { category: 'stopped', label: '유지 중단', text: `유지 중단 · ${Object.hasOwn(REASON_TEXT, terminal.reason) ? reasonText(terminal.reason) : '현재 예약이 중단되었습니다.'}` };
   if (status === 'review') return { category: 'review', label: '확인 필요', text: '확인 필요 · 전송 결과를 확인하세요' };
   if (terminal.reservationNote === 'safety-cutoff' && expiry !== null) {
