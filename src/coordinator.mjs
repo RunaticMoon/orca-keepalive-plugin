@@ -920,6 +920,13 @@ export function createCoordinator({
         return
       }
       // 4. 저장된 basisAt으로 대기 상태를 되살린다. 예약(epoch/attempt)은 만들지 않는다.
+      // 복원할 표시 이력을 먼저 검증한다(방어): 불량 레코드(비유한 doneAt/expiresAt,
+      // expiredAt 불일치 등)면 RESTORE_HOLD를 적용하지 않고 버린다.
+      const restoredHistory = historyFromRecord({ ...record, expiresAt })
+      if (restoredHistory === null) {
+        forget()
+        return
+      }
       const holdState = applyReduce(key, {
         type: 'RESTORE_HOLD',
         basisAt: isFiniteNumber(record.basisAt) ? record.basisAt : doneAt,
@@ -931,7 +938,7 @@ export function createCoordinator({
           // 저장된 expiresAt·lastBlockReason을 유지하고, 대기 이력이 같은 hold id를
           // 이어받게 한다. 이후 BLOCK이 같은 id로 기록된다.
           holdEntry.cacheHistory = {
-            ...historyFromRecord(record),
+            ...restoredHistory,
             epochId: holdState.hold.id,
             expiredAt: null,
           }
