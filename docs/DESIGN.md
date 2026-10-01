@@ -6,17 +6,17 @@
 
 ## 1. 목표와 결론
 
-Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 짧은 메시지를 보내고, 터미널·워크트리별 버튼 및 전체 일시정지로 제어하는 커뮤니티 플러그인을 만든다. 빌드 없는 ESM, 외부 npm 의존성 0, `node:test`, JSDoc을 사용한다.
+Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 짧은 메시지를 보내고, 터미널·워크트리별 버튼 및 전체 일시정지로 제어하는 커뮤니티 플러그인을 만든다. 빌드 없는 ESM, 외부 npm 의존성 0, `node:test`, JSDoc을 사용한다. (**0.2.0에서 변경**: Orca 앱 타이머 의존을 제거하고 플러그인 자체 Claude Code 캐시 TTL 설정(`claudeCacheTtlMs`)으로 타이밍·상한을 정한다. §4.4, §5.2 참조.)
 
 **권장안은 플러그인 이벤트/커맨드 + 로컬 런타임 RPC + 활성 프로필 SQLite 읽기 + 루프백 대시보드다.** 공개 플러그인 API만으로는 요구사항을 구현할 수 없다. RPC 연결 실패 시 `terminal.sendText`로 우회하지 않고 전송을 중단한다.
 
 다만 현재 Orca만으로 다음의 강한 보장은 불가능하다.
 
 - 렌더러의 캐시 타이머 시작 시각과 정확히 일치하는 예약.
-- UI에서 타이머를 끈 순간부터 전송이 즉시 금지되는 원자적 조건 검사.
+- UI 설정(플러그인 pause·워크트리/터미널 off)을 바꾼 순간부터 전송이 즉시 금지되는 원자적 조건 검사. (0.2.0부터 Orca 앱 타이머 on/off는 전송 조건이 아니다.)
 - 모든 실제 사람 키 입력의 감지와 keepalive/다른 자동화/사람의 완전한 구분.
 - 초안 검사 이후 Enter까지 입력이 바뀌지 않았다는 원자적 보장.
-- 실제 Anthropic 캐시 적중·TTL·과금 절약 보장. 여기서 TTL은 Orca 사용자가 선택한 추정값이다.
+- 실제 Anthropic 캐시 적중·TTL·과금 절약 보장. 여기서 TTL은 플러그인 설정(`claudeCacheTtlMs`)으로 사용자가 고른 추정값이다.
 
 출시 설명은 “관측한 작업 완료를 기준으로 캐시 유지 메시지를 예약”으로 한다. 초안 보호는 최선 노력이라는 한계를 명시한다. 이 한계가 허용되지 않는 제품 기준이라면 §12의 Orca 상위 API 변경이 선행되어야 한다. 이 문서는 현재 버전에 가능한 플러그인 구현안을 구체화하며 상위 제품 수정을 작업 범위에 넣지 않는다.
 
@@ -59,7 +59,7 @@ Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 �
 | 안 | 결정 | 이유·구현 영향 |
 |---|---|---|
 | 1 하이브리드 | 확정, RPC 불가 시 전송 중단 | S01–S16. plugin raw sendText fallback은 안전 guard를 잃으므로 제외. 직접 RPC는 plugin capability로 격리되지 않는 내부 계약 의존임을 README에 공개. |
-| 2 앱 설정 파일 | 수정하여 확정: 활성 프로필 SQLite 우선, DB 없는 legacy 프로필만 JSON | S17–S21. runtime settings.get으로 대체할 수 없다. fs.watch만으로는 WAL 변화를 놓칠 수 있어 읽기 polling. 읽기 오류·미지원 schema는 disabled/unknown 취급. 앱 설정은 절대 쓰지 않는다. |
+| 2 앱 설정 파일 | 수정하여 확정: 활성 프로필 SQLite 우선, DB 없는 legacy 프로필만 JSON (**0.2.0에서 변경**: Orca 타이머 설정은 읽지 않고 `orca-profile-index.json`의 활성 프로필 ID만 읽는다 — §4.4) | S17–S21. runtime settings.get으로 대체할 수 없다. fs.watch만으로는 WAL 변화를 놓칠 수 있어 읽기 polling. 읽기 오류·미지원 schema는 unknown 취급. 앱 설정은 절대 쓰지 않는다. |
 | 3 시각·안전·상한 | 수정: 관측 working→done epoch, 4분/58분 목표, 관측당 최대 1회 | renderer timer 복제는 불가능. mainAgent와 combined 상태를 함께 확인. 자체 attempt로 설명되지 않는 fresh working(=실제 작업 turn)이 관측되면 해당 대상 budget을 자동 reset한다(지휘자 결정, §5.3). 기본 3회, 0=무제한, UI의 “횟수 초기화”로도 reset. |
 | 4 메시지 | 확정 | 기본 `Cache keepalive. Reply only OK; do not use tools or continue previous work.`. 단일 행, UTF-8 1–512 bytes, 제어문자 금지, trim 후 비어있으면 오류. LLM이 문구를 반드시 따를 보장은 없다. |
 | 5 UI | 수정: 대시보드 + 커맨드, panel 제외, “포커스 터미널 토글” 제외 | 패널은 worker 통신 채널이 없다(지휘자 확인 사항). 현재 워크트리는 plugin context terminal handles를 RPC 목록과 join해 고유 ID를 얻는다. 터미널 선택은 대시보드에서 명시적으로 한다. resolveActive로 포커스를 추측하지 않는다(S04,S24). **추가(OKPN-EB52)**: Orca 1.4.214 패널은 postMessage 브리지로 `workspace.readContext`·`terminal.sendText`·`notifications.show`만 호출할 수 있고 storage·명령 실행·worker 통신·네트워크(connect-src none)·navigation이 막혀 있어, 정적 안내 패널(`panel/index.html`)만 추가했다. 상태 확인·on/off는 팔레트 명령과 터미널 CLI(`bin/keepalive.mjs`, 제어 파일 `~/.orca-cache-keepalive/control.json`)로 제공하며, 이를 위해 대시보드 서버는 activate 시 즉시 시작한다. |
@@ -83,9 +83,9 @@ Orca의 프롬프트 캐시 타이머가 켜져 있을 때 Claude 터미널에 �
 
 | ID | 기능 | 설계 |
 |---|---|---|
-| A | 상태 요약 개선 | `src/dashboard-model.mjs`의 `statusSummary({currentWorktreeId})`가 첫 줄 전역 상태(`켜짐`/`꺼짐(일시정지)` · 타이머 · 연결 · `워크트리 N개`)과 워크트리별 한 줄을 만든다. 현재 워크트리 `▶`, 설정 `켜짐`/`꺼짐` + `(기본값)`/`(직접 설정)`, 캐시 상태 기호와 `유지 중 N · 만료 M · 확인 필요 K`, 일시정지 중 `켜짐(일시정지 중)`, `다음 전송 … 후`. 기호·개수는 설정값(`effectiveEnabled`)이 아니라 `indicatorOn=true` 터미널의 실제 `cacheState`/`cacheStatus`로만 정한다(on 터미널이 없으면 캐시 문구 생략). 480자(`STATUS_MAX_CHARS`)를 넘으면 `… 외 N개`로 자른다. `keepalive-status` 커맨드가 `controller.currentWorktreeId()`(2초 상한, 실패 시 null)를 넘겨 호출해 요약을 알린 뒤 대시보드도 연다(플러그인 알림이 macOS에서 표시되지 않을 수 있음). 원시 worktreeId·경로·토큰은 넣지 않는다. |
+| A | 상태 요약 개선 | `src/dashboard-model.mjs`의 `statusSummary({currentWorktreeId})`가 첫 줄 전역 상태(`켜짐`/`꺼짐(일시정지)` · 캐시 TTL · 연결 · `워크트리 N개`, 프로필 미확인 시 `Orca 프로필 확인 불가`)과 워크트리별 한 줄을 만든다. 현재 워크트리 `▶`, 설정 `켜짐`/`꺼짐` + `(기본값)`/`(직접 설정)`, 캐시 상태 기호와 `유지 중 N · 만료 M · 확인 필요 K`, 일시정지 중 `켜짐(일시정지 중)`, `다음 전송 … 후`. 기호·개수는 설정값(`effectiveEnabled`)이 아니라 `indicatorOn=true` 터미널의 실제 `cacheState`/`cacheStatus`로만 정한다(on 터미널이 없으면 캐시 문구 생략). 480자(`STATUS_MAX_CHARS`)를 넘으면 `… 외 N개`로 자른다. `keepalive-status` 커맨드가 `controller.currentWorktreeId()`(2초 상한, 실패 시 null)를 넘겨 호출해 요약을 알린 뒤 대시보드도 연다(플러그인 알림이 macOS에서 표시되지 않을 수 있음). 원시 worktreeId·경로·토큰은 넣지 않는다. |
 | B | 변경 알림 | `src/change-notice.mjs`의 순수 함수 `describeActionChange(action, snapshot)`가 성공한 dispatch의 Action과 새 snapshot으로 200자 이하 한 줄을 만든다. main.mjs가 대시보드 `POST /api/action` dispatch wrapper(터미널 CLI도 같은 경로)에서 응답 뒤 fire-and-forget으로 Orca 알림을 보낸다. 팔레트 명령은 자체 알림을 쓰므로 이 경로를 타지 않는다. worktree는 label(없으면 `워크트리`), terminal은 label/title만 쓰고, 전역 일시정지 중 켜기에는 ` (전체 일시정지 중)` 꼬리말을 붙이며, `config`/`reset-budget`/`clear-review`는 알리지 않는다. |
-| D | 캐시 상태 prefix 탭 표시 | 설정 `tabTitleIndicator`(기본 true, `src/config.mjs`; 대시보드 설정 폼 `name="tabTitleIndicator"`, 표시명 **탭 이름에 캐시 상태 표시**). `src/title-indicator.mjs`가 Orca RPC `terminal.rename`으로 Claude 탭의 `customTitle` 앞에 상태 prefix(`⚡ ` 캐시 유지 중 / `💤 ` 유지 중인 캐시 없음 / `⚠️ ` 확인 필요)를 붙인다. desired pane의 `cacheState`(`kept`/`none`/`review`)를 매핑하고, 같은 탭의 on pane만 모아 `review > kept > none`(⚠️ > ⚡ > 💤) 우선순위로 탭 prefix 하나를 고른다. on 조건은 전체 일시정지 아님·앱 타이머 켜짐·런타임 연결·워크트리/터미널 정책 허용(연속 전송 상한 도달 시 일시 false 가능)·(respectCwarmDisabled일 때) `cwarm.disabled` 없음이다. 기록을 storage(`title-indicator-v1`)에 먼저 저장한 뒤 rename하고(선저장 실패 시 기존 복구 기록을 되돌림), prefix 교체는 기존 prefix 제거 + 새 prefix를 한 번의 rename으로 수행한다(2단계 금지). 조건이 깨지거나 종료 시 `title:null`로 해제하며 다음 시작의 reconcile이 잔여 prefix를 정리한다(옵션이 꺼져 있으면 제거, 켜져 있으면 조건에 맞는 탭에 새 handle로 재적용 — storage에서 읽은 기록은 이번 실행에서 미확정으로 취급해 첫 전체 reconcile이 다시 적용한다). **같은 prefix가 confirmed면 pane 순서·handle·phase 변화로 rename하지 않고 handle만 갱신한다.** 실제 턴 완료만을 이유로 하는 refresh rename은 제거했고(`onTurnCompleted`는 호환용 no-op), 그 결과 에이전트가 만든 자동 제목이 늦게 반영될 수 있다. rename 실패는 다음 tick에 재시도하고 탭별 연속 실패 3회에서 그 탭을 이번 실행 동안 건너뛴다. 실패는 삼키고 안전 code만 진단에 남긴다. Orca `session.tabs.list` title은 customTitle이 아니라 런타임 제목 투영값(OSC/PTY)이라 사용자 지정 제목과 비교할 수 없다. 따라서 prefix가 켜진 탭은 off·prefix 변경·플러그인 종료 시 사용자 지정 제목이 해제될 수 있고, 저장 기록도 없고 조회된 제목에도 알려진 prefix가 없는 잔여물은 식별할 수 없어 자동 정리하지 않는다(한계). 한계: prefix 동안 Orca 자동 제목 갱신 정지, 비정상 종료 시 잔존, 같은 탭 분할 창 이름 공유. |
+| D | 캐시 상태 prefix 탭 표시 | 설정 `tabTitleIndicator`(기본 true, `src/config.mjs`; 대시보드 설정 폼 `name="tabTitleIndicator"`, 표시명 **탭 이름에 캐시 상태 표시**). `src/title-indicator.mjs`가 Orca RPC `terminal.rename`으로 Claude 탭의 `customTitle` 앞에 상태 prefix(`⚡ ` 캐시 유지 중 / `💤 ` 유지 중인 캐시 없음 / `⚠️ ` 확인 필요)를 붙인다. desired pane의 `cacheState`(`kept`/`none`/`review`)를 매핑하고, 같은 탭의 on pane만 모아 `review > kept > none`(⚠️ > ⚡ > 💤) 우선순위로 탭 prefix 하나를 고른다. on 조건은 전체 일시정지 아님·활성 프로필 확인 가능(0.2.0부터; 앱 타이머와 무관)·런타임 연결·워크트리/터미널 정책 허용(연속 전송 상한 도달 시 일시 false 가능)·(respectCwarmDisabled일 때) `cwarm.disabled` 없음이다. 기록을 storage(`title-indicator-v1`)에 먼저 저장한 뒤 rename하고(선저장 실패 시 기존 복구 기록을 되돌림), prefix 교체는 기존 prefix 제거 + 새 prefix를 한 번의 rename으로 수행한다(2단계 금지). 조건이 깨지거나 종료 시 `title:null`로 해제하며 다음 시작의 reconcile이 잔여 prefix를 정리한다(옵션이 꺼져 있으면 제거, 켜져 있으면 조건에 맞는 탭에 새 handle로 재적용 — storage에서 읽은 기록은 이번 실행에서 미확정으로 취급해 첫 전체 reconcile이 다시 적용한다). **같은 prefix가 confirmed면 pane 순서·handle·phase 변화로 rename하지 않고 handle만 갱신한다.** 실제 턴 완료만을 이유로 하는 refresh rename은 제거했고(`onTurnCompleted`는 호환용 no-op), 그 결과 에이전트가 만든 자동 제목이 늦게 반영될 수 있다. rename 실패는 다음 tick에 재시도하고 탭별 연속 실패 3회에서 그 탭을 이번 실행 동안 건너뛴다. 실패는 삼키고 안전 code만 진단에 남긴다. Orca `session.tabs.list` title은 customTitle이 아니라 런타임 제목 투영값(OSC/PTY)이라 사용자 지정 제목과 비교할 수 없다. 따라서 prefix가 켜진 탭은 off·prefix 변경·플러그인 종료 시 사용자 지정 제목이 해제될 수 있고, 저장 기록도 없고 조회된 제목에도 알려진 prefix가 없는 잔여물은 식별할 수 없어 자동 정리하지 않는다(한계). 한계: prefix 동안 Orca 자동 제목 갱신 정지, 비정상 종료 시 잔존, 같은 탭 분할 창 이름 공유. |
 
 ## 4. 런타임 및 저장소 계약
 
@@ -130,22 +130,41 @@ read RPC timeout 5초, 전체 deadline 10초; send RPC 5초 전체 deadline. Abo
 
 placement의 정확한 허용값은 `server` 또는 `client`다(`src/shared/browser-client-host-placement.ts:17`). `server`는 현재 desktop 런타임의 브라우저를 사용한다. navigation의 `host`는 별개 필드다(`src/shared/runtime-navigation.ts:1`). 포커스된 터미널 선택에는 terminal.resolveActive를 사용하지 않는다.
 
-### 4.4 앱 타이머 설정 읽기
+### 4.4 활성 프로필 읽기 (0.2.0에서 변경)
 
-`orca-profile-index.json`을 읽고 activeProfileId가 profiles 배열에 존재하는지, `/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/`인지 검증한다. index가 없거나 손상되면 unknown으로 중지한다. 자동화에서는 오래된 `.bak`의 다른 프로필을 fallback하지 않는다.
+> **0.2.0에서 변경.** 이 절은 원래 Orca 활성 프로필의 prompt cache 타이머
+> (`promptCacheTimerEnabled`/`promptCacheTtlMs`)를 SQLite/JSON에서 읽는 설계(§2
+> S17–S22)를 담았다. 0.2.0부터 플러그인은 Orca 타이머를 사용하지 않고 자체 설정
+> `claudeCacheTtlMs`(5분/1시간)로 타이밍·연속 상한을 정한다. Orca에서는 전송 금지
+> 판정과 scope 키·복원 키를 위해 활성 프로필 ID만 읽는다. 아래 SQLite/settings
+> 읽기 문단은 **역사적 맥락**으로만 남긴다.
 
-DB가 있으면 `node:sqlite`를 dynamic import하여 `new DatabaseSync(path,{readOnly:true})`로 연다. 기존 파일 존재를 먼저 확인하고 DB를 생성·migration·checkpoint·VACUUM·journal_mode 변경하지 않는다. `PRAGMA user_version`이 3, meta `profile_id`가 현재 profile과 같아야 한다. 짧은 read transaction 안에서 아래 row를 읽는다.
+`orca-profile-index.json`(≤1 MiB)을 읽어 JSON object 여부, `profiles` 배열 존재,
+`activeProfileId`가 `/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/`이고 `profiles` 목록에
+존재하는지 검증한다. 통과하면 `{known:true, profileId, source:'index', readAt}`을,
+실패하면 `{known:false, reason, readAt}`을 돌려준다. reader(`readActiveProfile`)는
+어떤 예외도 던지지 않는다. 읽기 전후 index를 다시 읽어 `activeProfileId`가 바뀌면
+(재읽기 실패 포함) `profile_changed`로 폐기한다. 프로필을 읽을 수 없으면
+SETTINGS_UNKNOWN으로 전송을 중단하고, 전송 직전 프로필이 바뀌었으면 STALE_TARGET으로
+거절한다. 서로 다른 프로필의 결과를 fallback하지 않는다.
+
+**0.2.0 이전(역사).** DB가 있으면 `node:sqlite`를 dynamic import하여
+`new DatabaseSync(path,{readOnly:true})`로 열었다. 기존 파일 존재를 먼저 확인하고 DB를
+생성·migration·checkpoint·VACUUM·journal_mode 변경하지 않았다. `PRAGMA user_version`이
+3, meta `profile_id`가 현재 profile과 같아야 했다. 짧은 read transaction 안에서 다음
+row를 읽었다.
 
 ```sql
 SELECT domain, payload, domain_version, revision, updated_at, content_hash
 FROM profile_state_documents WHERE domain = 'settings';
 ```
 
-domain_version=1, revision 양의 안전한 정수, SHA-256(payload UTF-8)=content_hash 확인 후 JSON parse. settings row payload 자체에서 `promptCacheTimerEnabled`/`promptCacheTtlMs`를 선택한다. 최대 payload 4 MiB; 다른 settings 비밀값은 보관·로그·HTTP 반환하지 않는다. DB 오류/busy/hash 오류/미지원 버전/필드 오류는 unknown. DB가 있을 때 JSON으로 fallback하지 않는다. read transaction은 즉시 닫아 WAL writer를 방해하지 않는다.
-
-DB가 **없는** 유효한 프로필만 `profiles/<id>/orca-data.json`의 `.settings`를 읽는다(최대 32 MiB). 읽기 전후 index/profile과 DB 출현 여부를 재검사해 전환 중 결과를 폐기한다. DB-less support에서도 루트 legacy 파일이나 export/backup은 자동 채택하지 않는다.
-
-boolean은 실제 boolean만 수락. timer key 미존재는 disabled. TTL 미존재는 Orca 기본 300000, 그 외 값은 300000/3600000만 허용하며 비정상 값은 unknown. 2초 polling, 전송의 두 단계 직전 강제 재읽기. fs.watch는 선택적 wakeup일 뿐 freshness 근거로 사용하지 않는다. UI off→저장 1–5초+queue→poll 사이 지연은 남는다. 즉시 중지는 플러그인 자체 전역 일시정지로 제공한다. 이미 전송한 bytes까지 회수할 수는 없다.
+domain_version=1, revision 양의 안전한 정수, SHA-256(payload UTF-8)=content_hash 확인 후
+JSON parse. settings row payload 자체에서 `promptCacheTimerEnabled`/`promptCacheTtlMs`를
+선택했다. DB가 없으면 `profiles/<id>/orca-data.json`의 `.settings`를 읽었다. boolean은
+실제 boolean만 수락, timer key 미존재는 disabled, TTL 미존재는 Orca 기본 300000이었고
+그 외 값은 300000/3600000만 허용했다. 이 방식은 `readTimerSettings`가 담당했고
+0.2.0에서 제거되었다(호환용으로 남기지 않음).
 
 ## 5. 설정·영속 데이터·판정 모델
 
@@ -164,6 +183,7 @@ hooks를 통한 fresh working→done 관측을 예약 기준으로 삼는다. �
   "paused": false,
   "defaultWorktreeEnabled": true,
   "message": "Cache keepalive. Reply only OK; do not use tools or continue previous work.",
+  "claudeCacheTtlMs": 3600000,
   "margin5mMs": 60000,
   "margin1hMs": 120000,
   "quietOutputMs": 2500,
@@ -177,11 +197,12 @@ hooks를 통한 fresh working→done 관측을 예약 기준으로 삼는다. �
 ```
 
 - unknown 설정 key 거절. 저장·출력 schemaVersion은 2이고 입력은 1(레거시)과 2를 수락한다. 저장된 v1은 로드 시 v2로 마이그레이션하고 그 결과를 즉시 1회 저장한다(이미 v2인 저장값은 쓰지 않음): `maxConsecutiveKeepalives`가 옛 기본값 3이면 새 기본값(5m=8, 1h=3)을 쓰고, 아니면 그 값을 두 키에 복사한다. config patch에 레거시 키 `maxConsecutiveKeepalives`가 오면 두 키에 같은 값을 적용한다(호환). 로드 마이그레이션 시 `tabTitleIndicator`를 한 번 true로 켠다(옛 기본 false와 사용자가 끈 값을 구분할 수 없음). 단 설정 patch 경로(current가 v1)에서는 강제로 켜지 않고 current 값을 유지한다. v2 설정을 이전 버전 플러그인이 읽으면 `unsupported_schema`로 거부될 수 있다(다운그레이드 주의). 상위 schema 파일은 덮어쓰지 않고 pause.
+- `claudeCacheTtlMs`=300000(5분)|3600000(1시간)만 허용. 기본 3600000. 정수 아님은 invalid_type, 허용 목록 밖은 out_of_range로 거절한다. 전송 시각·만료·연속 상한 선택이 모두 이 값 기준이며, 미전송 ARMED 예약은 TTL 변경 시 같은 `basisAt` 기준으로 due/만료를 재계산한다(짧아져 마감이 지났으면 만료, catch-up 없음). 전송 진행 중 TTL이 바뀌면 STALE_TARGET으로 거절한다. 대시보드 폼에서는 **Claude Code 캐시 TTL** select로 편집한다.
 - margin5mMs=30000..120000, margin1hMs=60000..600000 정수. TTL보다 작아야 한다.
-- quietOutputMs=2500..60000; observedInputQuietMs=10000..300000; maxConsecutiveKeepalives5m·maxConsecutiveKeepalives1h=0..1000 정수(0 무제한). 현재 Orca 타이머 TTL(`promptCacheTtlMs`)에 해당하는 키를 적용하고, TTL을 알 수 없으면 두 값 중 작은 제한을 적용한다. 대시보드 설정 폼은 두 값을 따로 편집하고, 터미널 행 `연속 x/상한 y`는 현재 TTL 기준 상한을 보여준다. message 계약은 §3. 사용자 UI에는 상한을 “직접 초기화 전 최대 유지 메시지 횟수”로 정확히 표현한다.
+- quietOutputMs=2500..60000; observedInputQuietMs=10000..300000; maxConsecutiveKeepalives5m·maxConsecutiveKeepalives1h=0..1000 정수(0 무제한). 현재 플러그인 캐시 TTL(`claudeCacheTtlMs`)에 해당하는 키를 적용하고, TTL을 알 수 없으면 두 값 중 작은 제한을 적용한다. 대시보드 설정 폼은 두 값을 따로 편집하고, 터미널 행 `연속 x/상한 y`는 현재 TTL 기준 상한을 보여준다. message 계약은 §3. 사용자 UI에는 상한을 “직접 초기화 전 최대 유지 메시지 횟수”로 정확히 표현한다.
 - poll=2000ms, hostHeartbeat=60000ms, preflight 최대 5000ms, minimumRemaining=10000ms, paste 확인 deadline=5000ms, turn-start 확인=15000ms, 송신 concurrency=1은 내부 상수다. 초 단위 빠른 TTL은 테스트 의존성 주입으로만 지원하고 사용자 설정에는 넣지 않는다.
 - runtimeUserDataPath 변경은 모든 epoch를 취소하고 새 binding을 확인한 뒤 다음 fresh turn을 기다린다.
-- 플러그인 설정은 host `storage.get/set`의 key `state-v1`에 저장. `settings:own`은 필요 없다. 앱 timer 설정은 읽기 전용이며 dashboard에서 변경하는 값은 플러그인 자체 설정뿐이다. epoch 예약·표시 이력 저장은 `state-v1`과 분리된 key `epochs-v1`에 하며(§5.6), revision/409 충돌 검사는 `state-v1`에만 적용된다.
+- 플러그인 설정은 host `storage.get/set`의 key `state-v1`에 저장. `settings:own`은 필요 없다. 0.2.0부터 Orca 앱 timer 설정은 읽지 않으며 dashboard에서 변경하는 값은 플러그인 자체 설정뿐이다. epoch 예약·표시 이력 저장은 `state-v1`과 분리된 key `epochs-v1`에 하며(§5.6), revision/409 충돌 검사는 `state-v1`에만 적용된다.
 
 ### 5.3 영속 상태 계약
 
@@ -209,7 +230,7 @@ userDataKey는 realpath(userData)의 SHA-256. 사용자 경로 문자열을 HTTP
 
 행 개수 제한과 별도로 **직렬화한 state-v1 전체 UTF-8 240 KiB** 상한을 적용한다. host는 value당 256 KiB, 전체 storage 5 MiB 제한이다(`src/shared/plugins/plugin-host-api.ts:68`). prospective mutation을 직렬화하여 상한을 검사하고 넘으면 write/send를 거절한다. 행 제한이 저장 용량을 보장한다고 가정하지 않는다. off 요청이 저장 용량 문제로 실패해도 메모리 pause는 유지하고 “저장 실패, 재시작 전에 설정 정리 필요”를 표시한다.
 
-우선순위: 앱 timer enabled AND config.paused=false AND disable 파일 없음 AND worktree enabled AND terminal override가 false 아님 AND 지원 가능한 대상/상태. 터미널 on은 worktree off나 전역 pause를 덮어쓰지 않는다. worktree override가 없으면 defaultWorktreeEnabled, terminal override가 없으면 inherit. on/off 버튼은 현재 scope 설정과 실제 적용 상태를 따로 표시한다.
+우선순위: 활성 프로필 확인 가능(0.2.0부터; 이전의 앱 timer enabled를 대체) AND config.paused=false AND disable 파일 없음 AND worktree enabled AND terminal override가 false 아님 AND 지원 가능한 대상/상태. 터미널 on은 worktree off나 전역 pause를 덮어쓰지 않는다. worktree override가 없으면 defaultWorktreeEnabled, terminal override가 없으면 inherit. on/off 버튼은 현재 scope 설정과 실제 적용 상태를 따로 표시한다.
 
 storage 쓰기는 단일 직렬 queue, revision 증가, 저장 성공 뒤 UI 성공 응답. 단, 로드 시 config v1→v2 정규화 저장은 revision을 올리지 않는다. OFF/pause는 먼저 메모리에서 전송을 막은 다음 저장하고, 저장 실패 시 메모리 pause 유지 + 오류 표시. ON/reset/config 변경은 저장 성공 전 적용하지 않는다. reset은 budget만 초기화하고 예약은 새 완료 관측을 기다린다. 재개도 과거 만료 epoch를 부활시키지 않는다.
 
@@ -255,7 +276,7 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 
 모든 체크는 같은 target generation/epoch로 수행하고 중간 변경 시 폐기한다. per-target mutex 및 전체 send semaphore=1. 대기 target은 순서대로 재검사하며 만료된 것을 나중에 보내지 않는다.
 
-1. metadata binding, active profile와 timer settings 강제 읽기, 플러그인 pause/overrides/budget, `~/.claude/cwarm.disabled` 존재 확인. 파일 접근이 실패해 상태를 판정할 수 없으면 전송 금지. 이 파일은 읽기만 한다.
+1. metadata binding, 활성 프로필 강제 읽기, 플러그인 pause/overrides/budget, `~/.claude/cwarm.disabled` 존재 확인. 파일 접근이 실패해 상태를 판정할 수 없으면 전송 금지. 이 파일은 읽기만 한다.
 2. list/resolvePane/show로 같은 worktreeId,paneKey,handle,ptyId 및 optional incarnation을 확인. connected/writable true, agentIdentity='claude', executionHostId='local'. 목록 truncation/누락/빈 ptyId는 금지.
 3. 최신 hook combined done, main done/absent, terminal.agentStatus idle+running, terminal.show.agentWait===null을 요구. 어느 신호든 working/permission/waiting이면 금지. unknown은 idle로 바꾸지 않는다.
 4. lastOutputAt가 유효한 number이고 현재 시각보다 미래가 아니며 quietOutputMs 이상 무출력. null은 unknown. screen read에서 running/source='screen'/truncated=false, nonempty draft 없음을 확인. unknown screen은 금지. draft 부재의 검출 한계는 남는다(S16).
@@ -340,7 +361,7 @@ README.md docs/TESTING.md docs/PUBLISHING.md LICENSE(소유자 선택 후)
 | config | `DEFAULT_CONFIG`; `parseConfig(value):Config`; `parseConfigPatch(value,current):Config` (throw ValidationError{code,field}). |
 | runtime-location | `candidateUserDataPaths({platform,home,env,override}):string[]`; `readRuntimeBinding({userDataPath,parentPid,readFile}):Promise<Binding>`; `sameBinding(a,b):boolean`. Binding={userDataPath,userDataKey,runtimeId,pid,startedAt,endpoint,transportKind,authToken}. |
 | rpc-client | `createRpcClient({getBinding,connect,clock,limits}):{call(method,params,{signal,timeoutMs}?):Promise<unknown>,close():void}`. Typed RpcError={code,phase:'connect'|'write'|'response',mayHaveWritten:boolean}. low-level call은 재시도 없음. |
-| orca-settings | `readTimerSettings({userDataPath,readFile,openSqlite,now}):Promise<SettingsSnapshot>`. `{known:true,profileId,enabled,ttlMs,revision,source:'sqlite'|'json',readAt}` 또는 `{known:false,reason,readAt}`. reader만 작성; 자체 timer 없음. |
+| orca-settings | `readActiveProfile({userDataPath,readFile,now}):Promise<SettingsSnapshot>`. `{known:true,profileId,source:'index',readAt}` 또는 `{known:false,reason,readAt}`. 활성 프로필 index만 읽고 Orca 타이머/SQLite는 읽지 않는다(0.2.0에서 `readTimerSettings` 제거). reader만 작성; 자체 timer 없음. |
 | state-store | `createStateStore({hostCall}):{load(),snapshot(),subscribe(fn),updateConfig(patch),setWorktree(scope,enabled),setTerminal(scope,enabled),reserveAttempt(target,epochId,at),recordAttempt(id,phase),confirmAttempt(id),markReview(id,reason),clearReview(scope),resetBudget(scope),flush()}`. async mutation은 저장 후 snapshot 반환. reserveAttempt는 attemptId 반환. |
 | epoch-memory | `EPOCH_MEMORY_KEY='epochs-v1'`; `EPOCH_MEMORY_VERSION=2`; `createEpochMemory({hostCall,now}):{load():Promise<void>,get(key):EpochRecord\|null,remember(key,record):void,forget(key):void,prune(maxAgeMs):void,flush():Promise<void>}`. `state-v1`과 분리된 key에 `kind='armed'`(복원 가능한 예약)와 `kind='history'`(표시 전용) 레코드를 envelope v2로 직렬 coalesce 저장하고 v1 레코드도 읽는다. 최대 200건·직렬화 256 KiB 상한이며 작업 전 1시간·만료 이력 24시간 prune을 적용한다. import 시 I/O·타이머 없음. |
 | cache-history | `reduceCacheHistory(history,event):CacheHistory\|null`; `normalizeBlockReason(reason):string\|null`; `isCacheHistoryExpired(history):boolean`. OPEN/RETIME/BLOCK/ADVANCE/RESTORE/CLEAR만 처리하는 부작용 없는 순수 reducer. 시계·타이머·난수·fs·net 없음. |
@@ -368,7 +389,7 @@ Cmd-J(Windows/Linux Ctrl-J)는 Orca 커맨드 UI에 진입하는 기존 사용 �
 - `keepalive-open`: 대시보드 열기. 서버가 아직 준비 중이면 최대 5초 기다린 뒤 알림. 정상 local runtime에 browser.tabCreate 1회, 실패하면 URL 표시. URL은 token fragment 포함이며 로그에는 기록하지 않는다.
 - `keepalive-toggle-worktree`: 현재 워크트리 on/off. plugin context handles를 완전한 RPC catalog에 join해 worktreeId가 정확히 하나인 경우만 변경. context가 null/빈 터미널/ambiguous면 변경하지 않고 대시보드에서 선택하도록 알림. 동일 branch/displayName으로 매칭 금지.
 - `keepalive-pause`: 전역 pause=true (idempotent).
-- `keepalive-resume`: 전역 pause=false (budget, 앱 timer off를 무시하지 않음).
+- `keepalive-resume`: 전역 pause=false (budget/연속 상한을 무시하지 않음).
 - `keepalive-status`: enabled/paused 이유, 관측된 대상/예약/차단 수를 알림. 토큰·원시 화면 없음.
 
 대시보드 단축키 초안 `Mod+Alt+Shift+J`; 충돌이 있으면 설정에서 재지정하거나 단축키를 제거해도 커맨드는 유지한다. 플러그인 자체 터미널 타이핑 hotkey는 구현하지 않는다.
@@ -420,9 +441,9 @@ terminal:send를 명시하여 사용 의도를 드러내고 grantedCapabilities�
 
 순수 HTML/CSS/JS, system font, 밝은/어두운 OS 테마, 상태를 색상만으로 구별하지 않음, keyboard focus·label·aria-live error 포함. 패널/외부 폰트/CDN/프레임워크 없음. 서버가 없어지면 “연결 종료, Orca에서 다시 열기”로 표시하고 버튼을 잠근다.
 
-상단: 앱 timer enabled/TTL, plugin pause, runtime 연결/설정 freshness, 전역 pause/resume. 본문은 워크트리별 그룹 및 terminal row: title(plain text), scope 토글, **유지 설정 켜짐/꺼짐**(worktree·terminal 정책과 분리), **캐시 상태 문구**(내부 phase 대신 `캐시 유지 중 · …`, `캐시 만료됨 · HH:MM · <마지막 차단 사유>`, `예약 없음 · …`, `유지 중단 · …`, `확인 필요 · …`), 다음 예정 전송(dueAt이 있을 때만), charged/confirmed, 횟수 초기화. 만료 시각은 관측한 작업·설정 TTL 기준의 예상이며 만료 사유는 실제 원인이 아니라 마지막으로 기록된 전송 차단 사유임을 화면에 명시한다(§2-1, §2-7). 삭제된 대상은 active처럼 보이지 않게 한다. unsupported target도 읽기 전용으로 이유 표시. 단, 에이전트가 없는 일반 터미널(NO_AGENT)은 이유 문구와 미지원 표시를 생략한다. 수정한 설정은 explicit 저장 버튼을 눌러 반영한다.
+상단: 플러그인 캐시 TTL(`claudeCacheTtlMs`), 활성 프로필 확인 상태(미확인이면 경고 배너), plugin pause, runtime 연결/설정 freshness, 전역 pause/resume. 본문은 워크트리별 그룹 및 terminal row: title(plain text), scope 토글, **유지 설정 켜짐/꺼짐**(worktree·terminal 정책과 분리), **캐시 상태 문구**(내부 phase 대신 `캐시 유지 중 · …`, `캐시 만료됨 · HH:MM · <마지막 차단 사유>`, `예약 없음 · …`, `유지 중단 · …`, `확인 필요 · …`), 다음 예정 전송(dueAt이 있을 때만), charged/confirmed, 횟수 초기화. 만료 시각은 관측한 작업·설정 TTL 기준의 예상이며 만료 사유는 실제 원인이 아니라 마지막으로 기록된 전송 차단 사유임을 화면에 명시한다(§2-1, §2-7). 삭제된 대상은 active처럼 보이지 않게 한다. unsupported target도 읽기 전용으로 이유 표시. 단, 에이전트가 없는 일반 터미널(NO_AGENT)은 이유 문구와 미지원 표시를 생략한다. 수정한 설정은 explicit 저장 버튼을 눌러 반영한다.
 
-“전송 결과 확인 필요”에는 터미널에서 초안을 확인하도록 설명하고 “다음 작업부터 재개” 버튼 제공. 버튼은 pending paste/Enter를 실행하지 않는다. 실시간 테스트 메시지 보내기 버튼은 제공하지 않는다. 사용자에게 앱 timer 설정과 플러그인 자체 설정을 구분해서 보여준다. 최초 화면에 “메시지는 사용량을 소비하고 대화에 남습니다. 입력 감지는 제한적입니다.”를 짧게 표시한다.
+“전송 결과 확인 필요”에는 터미널에서 초안을 확인하도록 설명하고 “다음 작업부터 재개” 버튼 제공. 버튼은 pending paste/Enter를 실행하지 않는다. 실시간 테스트 메시지 보내기 버튼은 제공하지 않는다. 0.2.0부터 Orca 앱 timer 설정은 표시·사용하지 않고 플러그인 자체 설정(캐시 TTL 포함)만 보여준다. 최초 화면에 “메시지는 사용량을 소비하고 대화에 남습니다. 입력 감지는 제한적입니다.”를 짧게 표시한다.
 
 ### 7.4 루프백 HTTP와 인증
 
@@ -448,7 +469,7 @@ POST /api/action -> Action -> DashboardSnapshot
 
 targetId는 worker가 발급한 opaque random ID로 snapshot에 노출, 현재 catalog에 속한 것만 허용한다. 브라우저가 보낸 worktreeId/terminalHandle을 RPC로 직접 넘기지 않는다. 오래된 revision은 409, unknown target 404, invalid payload 400, unauthorized 401, storage/unavailable 503. config edit에는 runtimeUserDataPath만 입력 가능하며 arbitrary file read endpoint는 없다.
 
-DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readAt,reason?},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시),worktrees:[{id,worktreeHash,projectId,projectLabel,label,branch,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,cacheState,cacheStatus,indicatorOn,dueAt,expiresAt,expiredAt,expireCause,blockedReason,charged,confirmed,needsReview}]}],diagnostics:[{at,level,event,code?,target?,targetLabel?}]}. terminal의 캐시 표시 필드는 `CacheDisplayFields`와 같은 의미이며 dashboard-model이 enum·유한 timestamp만 allowlist로 복사하고 누락·불량 값은 `none`/`no-reservation`/null로 정규화한다. 영속 budget이 `needsReview`면 `cacheState`/`cacheStatus`를 `review`로 덮는다. 원시 authToken·binding·draft·screen·전체 settings·repoId·worktree 경로는 금지. 진단의 저장 로그는 target을 hashed ID(12 hex)로만 가진다. 스냅숏 생성 시 현재 catalog의 터미널로 해시를 되돌려 `targetLabel`(`워크트리 / 터미널 제목`)을 붙이고, 되돌릴 수 없으면 `targetLabel:null`이며 UI는 `#해시6자리`로 표시한다. 원문 targetId는 노출하지 않고, UI는 event를 한국어 설명으로 매핑한다. worktree는 worktreeId의 repoId(`${repoId}::${path}`)를 기준으로 프로젝트로 묶는다. 프로젝트 이름은 런타임 `repo.list`의 `displayName`을 사용하고, 조회 실패 시 같은 저장소 worktree의 label 중 사전순 최솟값을 쓴다. 화면은 `프로젝트 | 워크트리 | 세션` 3열 compact 행으로 표시하며 원시 repoId와 경로는 노출하지 않는다.
+DashboardSnapshot={revision,serverNow,profileSettings:{known,source:'index'|null,readAt,reason},connection:{state,reason?},config:(Config에서 경로는 필요시 입력값만 별도 표시; `claudeCacheTtlMs` 포함),worktrees:[{id,worktreeHash,projectId,projectLabel,label,branch,enabled,effectiveEnabled,reason,terminals:[{id,title,phase,enabledOverride,effectiveEnabled,reason,cacheState,cacheStatus,indicatorOn,dueAt,expiresAt,expiredAt,expireCause,blockedReason,charged,confirmed,needsReview}]}],diagnostics:[{at,level,event,code?,target?,targetLabel?}]}. terminal의 캐시 표시 필드는 `CacheDisplayFields`와 같은 의미이며 dashboard-model이 enum·유한 timestamp만 allowlist로 복사하고 누락·불량 값은 `none`/`no-reservation`/null로 정규화한다. 영속 budget이 `needsReview`면 `cacheState`/`cacheStatus`를 `review`로 덮는다. 원시 authToken·binding·draft·screen·전체 settings·repoId·worktree 경로는 금지. 진단의 저장 로그는 target을 hashed ID(12 hex)로만 가진다. 스냅숏 생성 시 현재 catalog의 터미널로 해시를 되돌려 `targetLabel`(`워크트리 / 터미널 제목`)을 붙이고, 되돌릴 수 없으면 `targetLabel:null`이며 UI는 `#해시6자리`로 표시한다. 원문 targetId는 노출하지 않고, UI는 event를 한국어 설명으로 매핑한다. worktree는 worktreeId의 repoId(`${repoId}::${path}`)를 기준으로 프로젝트로 묶는다. 프로젝트 이름은 런타임 `repo.list`의 `displayName`을 사용하고, 조회 실패 시 같은 저장소 worktree의 label 중 사전순 최솟값을 쓴다. 화면은 `프로젝트 | 워크트리 | 세션` 3열 compact 행으로 표시하며 원시 repoId와 경로는 노출하지 않는다.
 
 ## 8. 로그·진단과 장애 처리
 
@@ -456,7 +477,7 @@ DashboardSnapshot={revision,serverNow,appTimer:{known,enabled,ttlMs,source,readA
 
 host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cache-keepalive/logs/events.jsonl`에 plugin 전용 파일 기록(1 MiB×3, chmod 0600·디렉터리 0700 best effort). 앱 프로필/설정 파일에는 쓰지 않는다. Windows ACL은 chmod로 보장되지 않으므로 기존 사용자 data 디렉터리 경계를 따른다. 파일 logger 실패는 ring/host log로 대체하고 전송 상태 저장 실패와 구별한다. 알림은 동일 reason당 5분에 1회, 큰 상태 전환에만 발생; 매 tick 알림 금지.
 
-중요 reason 코드: APP_TIMER_OFF, SETTINGS_UNKNOWN, RUNTIME_UNAVAILABLE, WRONG_RUNTIME, NO_FRESH_TURN, NO_AGENT, UNSUPPORTED_AGENT, UNSUPPORTED_HOST, NOT_CONNECTED, BUSY, INTERACTIVE_WAIT, UNKNOWN_WAIT, OUTPUT_ACTIVE, DRAFT_PRESENT, SCREEN_UNKNOWN, INPUT_QUIET_WINDOW, SCOPE_DISABLED, GLOBAL_PAUSED, CWARM_DISABLED, LIMIT_REACHED, EXPIRED, STALE_TARGET, STORAGE_FAILED, CATALOG_INCOMPLETE, PARTIAL_OR_UNKNOWN_SEND. reason별 UI 문구는 사용자가 취할 행동을 한 문장으로 설명한다. 만료 이력의 `lastBlockReason`/`expireCause`는 `contracts.EXPIRE_CAUSE_REASONS`(= 위 목록에서 EXPIRED·NO_FRESH_TURN·PARTIAL_OR_UNKNOWN_SEND을 제외한 값)만 허용하고, 임의 문자열·초안·제목은 저장하지 않는다.
+중요 reason 코드: APP_TIMER_OFF(과거 저장 이력 호환용, 0.2.0부터 새로 생성하지 않음), SETTINGS_UNKNOWN, RUNTIME_UNAVAILABLE, WRONG_RUNTIME, NO_FRESH_TURN, NO_AGENT, UNSUPPORTED_AGENT, UNSUPPORTED_HOST, NOT_CONNECTED, BUSY, INTERACTIVE_WAIT, UNKNOWN_WAIT, OUTPUT_ACTIVE, DRAFT_PRESENT, SCREEN_UNKNOWN, INPUT_QUIET_WINDOW, SCOPE_DISABLED, GLOBAL_PAUSED, CWARM_DISABLED, LIMIT_REACHED, EXPIRED, STALE_TARGET, STORAGE_FAILED, CATALOG_INCOMPLETE, PARTIAL_OR_UNKNOWN_SEND. reason별 UI 문구는 사용자가 취할 행동을 한 문장으로 설명한다. 만료 이력의 `lastBlockReason`/`expireCause`는 `contracts.EXPIRE_CAUSE_REASONS`(= 위 목록에서 EXPIRED·NO_FRESH_TURN·PARTIAL_OR_UNKNOWN_SEND을 제외한 값)만 허용하고, 임의 문자열·초안·제목은 저장하지 않는다.
 
 최소 사용 권한 미허용/SQLite 미지원이어도 명령 등록과 diagnostics는 살아 있어야 한다. unhandled promise rejection을 남기지 않으며 한 대상 오류로 다른 상태 조회까지 멈추지 않는다. 단 runtime/profile 설정 신뢰 실패는 전체 전송을 중단한다.
 
@@ -509,14 +530,15 @@ host `orca.log` + 최근 200건 memory ring. binding 확인 후 `<userData>/cach
 - 선행: B. 완료: 성공/서버 오류/EOF/mismatched ID/runtime restart/fragmentation/oversize/abort/keepalive 무한 연장 방지 테스트 통과.
 - 검증: `node --test test/rpc-client.test.mjs`. 보고: R, error mapping 표.
 
-### E — 앱 타이머 설정 읽기
+### E — 활성 프로필 읽기 (0.2.0에서 변경)
 
-- 단일 목표: 활성 profile의 timer 설정을 읽기 전용으로 반환.
-- 입력: §4.4, S18–S22; `profileStateDatabaseFile`, DB schema/document validation.
+- 단일 목표: 활성 프로필 ID를 읽기 전용으로 반환(타이머 설정은 더 이상 읽지 않음).
+- 입력: §4.4, S18–S22; `orca-profile-index.json`.
 - 소유: `src/orca-settings.mjs`, `test/orca-settings.test.mjs`. 제외: UI·쓰기·migration·runtime settings.get.
-- 방향: 주입 가능한 DatabaseSync, profile/index 이중 확인, SQLite schema3/domain1/hash, DB-less JSON의 .settings. fail closed. 짧은 read transaction/close 보장.
-- 선행: B,C. 완료: 실제 임시 SQLite+WAL에서 설정 변경을 읽고 DB 미존재/권한/손상/미래 schema/잘못된 hash/profile switch를 검증. 기존 JSON true/DB false이면 false.
-- 검증: `node --test test/orca-settings.test.mjs`. 보고: R, read-only 검증과 SQLite feature probe 결과.
+- 방향: `readActiveProfile`로 index JSON object/`profiles` 배열/`activeProfileId` 형식·목록 존재를 확인하고 fail closed. 읽기 전후 index 재확인으로 profile switch를 폐기. SQLite/`orca-data.json`은 읽지 않는다.
+- 선행: B,C. 완료: index 미존재/손상/필드 오류/profile switch/profile_changed, 프로필 디렉터리·SQLite 미접근을 검증.
+- 검증: `node --test test/orca-settings.test.mjs`. 보고: R, read-only 검증과 index-only 여부.
+- **0.2.0 이전(역사):** 활성 profile의 timer 설정을 SQLite schema3/domain1/hash 또는 DB-less JSON `.settings`에서 읽었다(`readTimerSettings`). 이 작업과 그 검증은 위 §4.4 역사 문단을 따른다.
 
 ### F — 정책과 전송 journal 영속화
 
@@ -683,13 +705,13 @@ fake runtime의 지원 methods: terminal.list, resolvePane, show, agentStatus, r
 
 | 시나리오 | 필수 기대 결과 |
 |---|---|
-| timer=false, true 전환 | false에서 send 0건. true만으로 기존 idle에 즉시 send 안 함. 이후 working→done에서 예약. |
+| Orca 타이머 무관·설정 TTL | Orca 타이머가 꺼져 있어도 플러그인 TTL 기준 fresh epoch due에서 paste 1+Enter 1. 저장 config에 새 키가 없으면 기본 1시간 TTL. |
 | TTL=5m / 1h | done+240000 / done+3480000 직전 0건, due에서 paste 1 + Enter 1. grace 마감 후 0건. |
 | 반복 done 및 이벤트 순서 | duplicate done이 due를 늦추지 않음; 늦게 온 working/done 무시; 1 epoch에 paste≤1. |
 | 자체 keepalive 순환 | working→done으로 새 epoch 생성; 자체 turn은 charged 유지; 기본 3회 후 4번째 0건; 0 상한이면 계속. 비자체 fresh working이 오면 charged=0으로 자동 reset되어 다시 3회 가능. |
 | 사람 초안/질문 | preflight draft/permission/agentWait/waiting에서 0건. paste 후 다른 draft면 Enter 0건+review. |
 | busy/agent 종료 | status=working은 host guard가 허용해도 plugin에서 차단. shell로 전환 시 no-agent guard 때문에 Enter 0건. |
-| 설정 중간 off | paste 전 발견하면 0건, paste 후 발견하면 Enter 0건+review. 앱 저장 전 지연은 fixture에서 별도 재현하여 한계 확인. |
+| 설정 중간 off | paste 전 발견하면 0건, paste 후 발견하면 Enter 0건+review. 전송 진행 중 config TTL 변경은 STALE_TARGET으로 거절. |
 | 워크트리/터미널 scope | W1 off, W2 on이면 W2만. terminal on이어도 부모 off 우회 안 함. 앱 활성 worktree가 W1이어도 W2 local terminal send 가능. |
 | quiet 출력 | lastOutputAt+2499ms 금지, +2500ms 허용. null/future lastOutputAt 금지. observed draft 제거 후 quiet window 적용. |
 | lifecycle 변경 | pane 동일/PTY 변경, handle 교체, runtimeId/parent pid 변경, profile switch, removed 이벤트 시 기존 reservation 무효. |
@@ -697,7 +719,7 @@ fake runtime의 지원 methods: terminal.list, resolvePane, show, agentStatus, r
 | crash recovery | reserve 저장→write 직전 crash도 review. write 후 crash도 review. 재시작 자체로 budget reset/과거 epoch 전송 없음. |
 | 전송 중 pause/close | 늦은 async callback이 Enter를 예약하지 않음. 이미 host에 도착한 bytes는 취소할 수 없다고 상태 표시. |
 | 절전/clock jump | 다수 due 대상이 있어도 wake 시 burst 0건; 새 turn 대기. |
-| SQLite 권위 | JSON enabled=true, DB enabled=false이면 전송 0건. WAL 변경 인식. 미지원 schema·hash 오류·읽기 권한 없음 전송 0건. |
+| 프로필 index 권위 | index 손상·미존재·activeProfileId 불일치면 예약돼도 전송 0건(SETTINGS_UNKNOWN). Orca fixture 타이머 TTL 변경은 플러그인 전송에 영향 없음. |
 | host heartbeat | fake host idle reap model에서 5분보다 먼저 host.call이 발생; dashboard 닫혀도 loop 유지. |
 | unknown runtime shape | missing identity/agentWait/screen/host scope 또는 목록 truncation을 safe로 승격하지 않음. |
 | 루프백 HTTP | 잘못된 token/Host/Origin/oversize/unknown target/revision은 mutation 0건. 오류 응답에 token/draft 없음. |
@@ -711,7 +733,7 @@ node --test
 node scripts/demo.mjs
 ```
 
-`demo.mjs`는 별도 test dependency로 짧은 TTL을 주입하며 실제 userData를 검색하지 않는다. 출력된 localhost URL을 열고 scope 버튼, 전역 pause, 설정 편집, 불확실 전송 확인 상태를 검증한다. 종료 후 서버 socket이 닫히고 다음 실행에서 다른 token을 사용하는지 확인한다. 프로덕션에 fast TTL 옵션을 남기지 않는다.
+`demo.mjs`는 플러그인 config로 5분 TTL을 주입하며 실제 userData를 검색하지 않는다. 출력된 localhost URL을 열고 scope 버튼, 전역 pause, 설정 편집, 불확실 전송 확인 상태를 검증한다. 종료 후 서버 socket이 닫히고 다음 실행에서 다른 token을 사용하는지 확인한다. 프로덕션에 fast TTL 옵션을 남기지 않는다.
 
 ### 10.2 실제 Orca가 있는 환경에서 필요한 E2E
 
@@ -719,16 +741,16 @@ node scripts/demo.mjs
 
 1. manifest/package 정합성을 확인하고 Orca 설정 → Plugins → Development에 이 저장소 절대 경로를 추가한다. 권한 확인 후 command에서 Dashboard 실행. 앱 시작만으로 worker가 자동 기동하지 않는 점 확인.
 2. 실제 worker의 process.versions, node:sqlite feature probe, metadata pid=parentPid 확인. 기본 경로와 custom userData override 각각 smoke. sqlite unavailable이면 명확한 disabled 진단이고 전송이 없어야 한다.
-3. 앱 “Settings → Agents → Prompt Cache Timer”를 끈 상태에서 메시지를 한 번 완료시키고 전체 TTL 이상 기다려 자동 전송 0건 확인. 켠 뒤 fresh turn 완료시키고 renderer 표시와 dashboard 예상 countdown의 차이를 기록한다(정확 일치 합격 조건으로 삼지 않음).
+3. 앱 “Settings → Agents → Prompt Cache Timer”를 끈 상태에서 메시지를 한 번 완료시키고 플러그인 설정 TTL 기준으로 전송이 일어나는지 확인한다(0.2.0부터 앱 타이머 off는 중지가 아님). 중지는 플러그인 전역 pause/워크트리·터미널 off/`cwarm.disabled`로 확인한다. 대시보드에서 캐시 TTL을 1시간↔5분으로 바꿔 due/만료·상한이 실제 TTL로 재계산되는지도 확인한다. fresh turn을 완료시키고 renderer 표시와 dashboard 예상 countdown의 차이를 기록한다(정확 일치 합격 조건으로 삼지 않음).
 4. 로컬 W1/W2와 W1의 split terminal 두 개를 만든다. W1 off/W2 on 및 terminal 단독 off를 각각 확인한다. W2가 비활성 워크트리여도 승인된 대상만 keepalive된다. dashboard/browser 열기가 의도한 Orca desktop에 나타나야 한다.
 5. 5분 TTL에서 fresh 완료 뒤 약 4분에 기본 메시지 정확히 1개, 짧은 응답, 다음 epoch 예약 확인. 3회 뒤 limit 중지. explicit reset 후에는 다음 완료부터 시작. 1시간 TTL은 가속 unit test와 별도로 실제 약 58분 대기 test가 필요하며 생략하면 NOT RUN.
 6. Claude 입력창에 초안을 남기고 due를 넘긴다. 자동 Enter가 없어야 한다. 권한 질문/AskUserQuestion/plan approval 표시 중 전송 0건. 인터랙티브 메뉴 종류별 실제 화면 fixture를 확보하며 지원되지 않는 경우 기능을 제한한다. 검사와 Enter 사이의 레이스가 원자적으로 해결됐다고 주장하지 않는다.
 7. 동일 PTY를 mobile에서 조작하여 desktop input lock 상태에서 전송이 거절되는지 확인한다. RPC client가 viewport/floor를 탈취하지 않아야 한다.
-8. due 근처에 전역 pause, terminal off, 앱 timer off를 각각 시험한다. plugin pause는 후속 write 금지, 앱 off는 디스크 저장 지연을 측정해 기록. 설정 저장 이전의 메모리 상태는 플러그인이 볼 수 없음을 문서와 대조.
+8. due 근처에 전역 pause, terminal off, 플러그인 config TTL 5분↔1시간 변경을 각각 시험한다. plugin pause는 후속 write 금지, TTL 변경은 ARMED due/만료 재계산(짧아져 마감이 지나면 만료)을 확인한다.
 9. Orca restart, worker 재기동, terminal 종료·재생성, profile switch, sleep/wake를 확인. 과거 due의 catch-up 메시지/중복 Enter가 없어야 한다. journal 미완료는 review로 복원.
 10. 대시보드를 닫고 5분 이상 지나도 worker heartbeat 유지, 앱/플러그인 disable 시 서버·timer 종료. main.mjs 수정만으로 worker가 재시작되지 않는 known behavior에 따라 manifest version 변경 또는 disable/enable 후 재검증한다.
 11. 다른 웹 origin에서 loopback API 요청, console/log/history/network에 token 유출이 없는지 확인. 대시보드에는 사용자 초안·전체 settings·RPC authToken이 없어야 한다. fragment token은 브라우저 페이지를 열기 위한 bearer secret이므로 공유하지 않는다.
-12. macOS/Linux/Windows에서 개발 로드·path/socket 또는 pipe·브라우저 열기·SQLite smoke. 각 OS별 실행하지 않은 항목은 미지원 가능성으로 기록한다. SSH/VM/native chat은 의도적으로 unsupported 표시가 나와야 한다.
+12. macOS/Linux/Windows에서 개발 로드·path/socket 또는 pipe·브라우저 열기·활성 프로필 index 읽기 smoke. 각 OS별 실행하지 않은 항목은 미지원 가능성으로 기록한다. SSH/VM/native chat은 의도적으로 unsupported 표시가 나와야 한다.
 
 완료 판정: 자동 테스트 전부 pass + R blocker 0 + 실제 E2E 중 지원 platform의 필수 항목 pass. 실제 Orca 없이 완료할 수 있는 범위는 “가짜 RPC 통합 검증까지”이며 출시 E2E 완료와 구분한다.
 
