@@ -38,14 +38,22 @@ function isFiniteNumber(value) {
  * 4. PASTING/SUBMITTING + 유효 attempt + 예상 만료 전 → kept/sending.
  *    AWAITING_TURN + 유효 attempt + 예상 만료 전 → kept/awaiting-turn.
  * 5. 알려진 만료 시각이 실제로 지났거나 이력이 만료 확정됐으면 none/expired,
- *    expireCause=마지막 차단 reason.
- * 6. SUSPENDED + INTERACTIVE_WAIT → none/interactive-wait, 그 밖의 SUSPENDED → none/suspended.
- * 7. 나머지(초기 UNKNOWN, 실제 만료 전 10초 cutoff 구간, 이력 없음) → none/no-reservation.
+ *    expireCause=마지막 차단 reason. hold가 있어도 만료되면 여기로 떨어진다.
+ * 6. SUSPENDED + INTERACTIVE_WAIT + 유효한 hold + 이력 만료 전 → kept/interactive-wait.
+ *    대기 중이지만 근거 있는 예약이 아직 살아 있음을 유지 중(⚡)으로 투영한다.
+ * 7. 그 밖의 SUSPENDED + INTERACTIVE_WAIT → none/interactive-wait,
+ *    그 밖의 SUSPENDED → none/suspended.
+ * 8. 나머지(초기 UNKNOWN, 실제 만료 전 10초 cutoff 구간, 이력 없음) → none/no-reservation.
  *    cutoff 구간에서는 known expiresAt을 그대로 내보내 UI가 "안전 전송 시간이 지남 ·
  *    만료 예정"을 표시할 수 있게 한다(expiredAt=null).
  *
  * `expiresAt`은 이력이 있으면 이력의 값을 예약 취소 후에도 유지한다.
  * `blockedReason`은 이력의 마지막 차단 reason(만료 전 포함)이다.
+ *
+ * `state.hold`(coordinator가 OPEN한 대기 중 예약 근거, §2-3)가 객체이고
+ * phase==='SUSPENDED' + reason==='INTERACTIVE_WAIT'이며 이력이 아직 실제 만료
+ * 전이면 kept/interactive-wait로 투영한다. 만료됐거나 hold가 없으면 기존대로
+ * none으로 투영한다.
  *
  * `reservationNote`는 cacheStatus='no-reservation'일 때만 채운다(검토 지적 1+2).
  * - `observed === false`(이번 실행에서 아무 관측도 없음)면 'initial'.
@@ -203,7 +211,29 @@ export function projectCacheStatus({
     }
   }
 
-  // 6. 유지 중단(예약 폐기). INTERACTIVE_WAIT는 만료로 표현하지 않는다.
+  // 6. 대기 중이지만 유지 근거(hold)가 있고 예약이 아직 만료 전이면 유지 중으로 투영한다.
+  //    hold 없는 INTERACTIVE_WAIT 또는 만료된 hold는 아래 7번에서 유지 중단으로 처리한다.
+  if (
+    phase === 'SUSPENDED' &&
+    reason === 'INTERACTIVE_WAIT' &&
+    isObject(state.hold) &&
+    isFiniteNumber(state.hold.id) &&
+    isFiniteNumber(state.hold.basisAt) &&
+    historyExpiresAt !== null &&
+    !expired
+  ) {
+    return {
+      cacheState: 'kept',
+      cacheStatus: 'interactive-wait',
+      reservationNote: null,
+      expiresAt,
+      expiredAt: null,
+      expireCause: null,
+      blockedReason,
+    }
+  }
+
+  // 7. 유지 중단(예약 폐기). INTERACTIVE_WAIT는 만료로 표현하지 않는다.
   if (phase === 'SUSPENDED') {
     return {
       cacheState: 'none',
@@ -216,7 +246,7 @@ export function projectCacheStatus({
     }
   }
 
-  // 7. 초기 UNKNOWN · 실제 만료 전 cutoff 구간 · 이력 없음.
+  // 8. 초기 UNKNOWN · 실제 만료 전 cutoff 구간 · 이력 없음.
   return {
     cacheState: 'none',
     cacheStatus: 'no-reservation',

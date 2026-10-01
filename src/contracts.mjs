@@ -107,6 +107,7 @@
  * @property {number|null} lastHookAt
  * @property {boolean} seenWorking
  * @property {TargetEpoch|null} epoch
+ * @property {SchedulerHold|null} hold 대기(waiting/blocked) 직전 관측. 대기 중 캐시 기준·예상 만료를 잇기 위한 메모리 전용 값이며 전송 예약이 아니다. 대기 중에는 자동 전송을 하지 않는다(§5.4).
  * @property {AttemptRef|null} attempt
  * @property {number|null} lastObservedInputAt
  * @property {string|null} reason reason/진단 코드.

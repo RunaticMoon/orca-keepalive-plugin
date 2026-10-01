@@ -261,6 +261,83 @@ test('그 밖의 SUSPENDED는 none/suspended', () => {
   assert.equal(out.cacheStatus, 'suspended');
 });
 
+test('SUSPENDED + INTERACTIVE_WAIT + hold + 이력 미만료면 kept/interactive-wait', () => {
+  const out = projectCacheStatus({
+    state: state({
+      phase: 'SUSPENDED',
+      reason: 'INTERACTIVE_WAIT',
+      hold: { id: 1, basisAt: T0, attempted: false },
+    }),
+    history: history(),
+    now: T0 + 1000,
+  });
+  assert.equal(out.cacheState, 'kept');
+  assert.equal(out.cacheStatus, 'interactive-wait');
+  assert.equal(out.expiresAt, EXPIRES);
+  assert.equal(out.expiredAt, null);
+  assert.equal(out.expireCause, null);
+});
+
+test('SUSPENDED + INTERACTIVE_WAIT + hold여도 이력이 만료됐으면 none/expired', () => {
+  const out = projectCacheStatus({
+    state: state({
+      phase: 'SUSPENDED',
+      reason: 'INTERACTIVE_WAIT',
+      hold: { id: 1, basisAt: T0, attempted: false },
+    }),
+    history: history({ lastBlockReason: REASON_CODES.INTERACTIVE_WAIT }),
+    now: EXPIRES,
+  });
+  assert.equal(out.cacheState, 'none');
+  assert.equal(out.cacheStatus, 'expired');
+  assert.equal(out.expiresAt, EXPIRES);
+  assert.equal(out.expiredAt, EXPIRES);
+  assert.equal(out.expireCause, REASON_CODES.INTERACTIVE_WAIT);
+});
+
+test('SUSPENDED + INTERACTIVE_WAIT + hold 있어도 이력이 없으면 kept로 보지 않는다', () => {
+  const out = projectCacheStatus({
+    state: state({
+      phase: 'SUSPENDED',
+      reason: 'INTERACTIVE_WAIT',
+      hold: { id: 1, basisAt: T0, attempted: false },
+    }),
+    history: null,
+    now: T0 + 1000,
+  });
+  assert.equal(out.cacheState, 'none');
+  assert.equal(out.cacheStatus, 'interactive-wait');
+});
+
+test('needsReview는 hold/interactive-wait보다 우선해 review/review', () => {
+  const out = projectCacheStatus({
+    state: state({
+      phase: 'SUSPENDED',
+      reason: 'INTERACTIVE_WAIT',
+      hold: { id: 1, basisAt: T0, attempted: false },
+    }),
+    history: history(),
+    now: T0 + 1000,
+    needsReview: true,
+  });
+  assert.equal(out.cacheState, 'review');
+  assert.equal(out.cacheStatus, 'review');
+});
+
+test('SUSPENDED + INTERACTIVE_WAIT + 불완전 hold(id/basisAt 누락)는 kept로 보지 않는다', () => {
+  for (const hold of [{}, { id: 1 }, { basisAt: T0 }]) {
+    const out = projectCacheStatus({
+      state: state({ phase: 'SUSPENDED', reason: 'INTERACTIVE_WAIT', hold }),
+      history: history(),
+      now: T0 + 1000,
+    });
+    assert.equal(out.cacheState, 'none');
+    assert.equal(out.cacheStatus, 'interactive-wait');
+    assert.equal(out.expiresAt, EXPIRES);
+    assert.equal(out.expiredAt, null);
+  }
+});
+
 // ── 초기 / 이력 없음 ─────────────────────────────────────────────────────────
 
 test('초기 UNKNOWN + 이력 없음은 none/no-reservation, 시각은 null', () => {

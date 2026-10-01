@@ -465,10 +465,15 @@ export function createCoordinator({
    *   working의 selfTurnSeq 증가) CLEAR한다.
    * - TARGET_CHANGED는 ptyId가 바뀐 경우에만 CLEAR한다. handle/incarnation만 바뀌면
    *   이력을 보존한다(예약 무효화는 scheduler가 그대로 처리한다).
-   * - POLICY_INVALIDATED는 폐기 전 epochId로 폐기 시점 reason을 BLOCK으로 남긴다.
-   * - 그 밖에는 after.epoch를 기준으로 OPEN/RETIME한다. epoch가 지워져도 이력은
-   *   지우지 않는다. TTL을 모르면 OPEN을 보류하고, 알게 된 뒤 다음 적용에서
-   *   OPEN(이력 없음/다른 epoch) 또는 RETIME(같은 epoch의 TTL 변경)한다.
+   * - POLICY_INVALIDATED는 폐기 전 epochId(또는 대기 hold의 id)로 폐기 시점 reason을
+   *   BLOCK으로 남긴다.
+   * - 그 밖에는 after.epoch(우선) 또는 after.hold를 관측으로 삼아 OPEN/RETIME한다.
+   *   epoch/ hold가 지워져도 이력은 지우지 않는다. TTL을 모르면 OPEN을 보류하고,
+   *   알게 된 뒤 다음 적용에서 OPEN(이력 없음/다른 epoch) 또는 RETIME(같은 epoch의
+   *   TTL 변경)한다. hold는 대기 직전 관측된 캐시 기준이라 같은 id의 epoch이 나중에
+   *   생겨도 OPEN이 다시 일어나지 않고 expiresAt도 그대로다.
+   * - 대기(hold) 중이고 phase/reason이 SUSPENDED/INTERACTIVE_WAIT이면 같은 id 이력에
+   *   INTERACTIVE_WAIT 차단 원인을 남긴다. 만료 확정 후에는 reduceBlock이 거부한다.
    *
    * @param {string} key
    * @param {any} before 적용 전 scheduler state.
@@ -499,41 +504,73 @@ export function createCoordinator({
         next = null
       }
     } else if (type === 'POLICY_INVALIDATED') {
-      if (cur !== null && isObject(before.epoch) && cur.epochId === before.epoch.id) {
+      // 폐기 전 예약 epoch가 있으면 그 id, 없으면 대기 hold의 id로 사유를 남긴다.
+      const invalidatedId = isObject(before.epoch)
+        ? before.epoch.id
+        : isObject(before.hold)
+          ? before.hold.id
+          : null
+      if (invalidatedId !== null && cur !== null && cur.epochId === invalidatedId) {
         const reason = isObject(input) ? input.reason : null
         if (isRecordableBlockReason(reason)) {
           next = reduceCacheHistory(cur, {
             type: 'BLOCK',
-            epochId: before.epoch.id,
+            epochId: invalidatedId,
             reason,
             at: clock.now(),
           })
         }
       }
     } else {
-      const epoch = after.epoch
+      // epoch(우선) 또는 대기 hold를 관측으로 삼는다. hold는 대기 직전 관측된
+      // 캐시 기준이라 epoch가 없는 동안에도 이력의 만료 시각을 유지한다.
+      const obs = isObject(after.epoch)
+        ? after.epoch
+        : isObject(after.hold)
+          ? { id: after.hold.id, doneAt: after.hold.basisAt, basisAt: after.hold.basisAt }
+          : null
       const ttlMs = currentTtlMs(config)
-      if (isObject(epoch) && ttlMs !== null) {
+      if (isObject(obs) && ttlMs !== null) {
         const basisAt =
-          typeof epoch.basisAt === 'number' && Number.isFinite(epoch.basisAt)
-            ? epoch.basisAt
-            : epoch.doneAt
+          typeof obs.basisAt === 'number' && Number.isFinite(obs.basisAt)
+            ? obs.basisAt
+            : obs.doneAt
         const expiresAt = basisAt + ttlMs
-        if (next === null || next.epochId !== epoch.id) {
+        if (next === null || next.epochId !== obs.id) {
           next = reduceCacheHistory(next, {
             type: 'OPEN',
-            epochId: epoch.id,
-            doneAt: epoch.doneAt,
+            epochId: obs.id,
+            doneAt: obs.doneAt,
             basisAt,
             expiresAt,
           })
         } else if (next.expiredAt === null && next.expiresAt !== expiresAt) {
           next = reduceCacheHistory(next, {
             type: 'RETIME',
-            epochId: epoch.id,
+            epochId: obs.id,
             expiresAt,
           })
         }
+      }
+
+      // 대기 중 예약 근거가 이력과 같은 id로 살아 있으면 차단 원인을 남긴다.
+      // (epoch가 없는 대기 구간에서 만료 원인으로 INTERACTIVE_WAIT가 쓰인다.)
+      const hold = isObject(after.hold) ? after.hold : null
+      if (
+        hold !== null &&
+        after.phase === 'SUSPENDED' &&
+        after.reason === 'INTERACTIVE_WAIT' &&
+        next !== null &&
+        next.epochId === hold.id &&
+        next.lastBlockReason !== 'INTERACTIVE_WAIT' &&
+        isRecordableBlockReason('INTERACTIVE_WAIT')
+      ) {
+        next = reduceCacheHistory(next, {
+          type: 'BLOCK',
+          epochId: hold.id,
+          reason: 'INTERACTIVE_WAIT',
+          at: clock.now(),
+        })
       }
     }
 

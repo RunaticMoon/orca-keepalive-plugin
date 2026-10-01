@@ -172,7 +172,7 @@ test('cache statuses: all user-facing states come from cacheStatus, including no
     ['scheduled', `캐시 유지 중 · 만료 예정 ${formatCacheTime(future, now)}`],
     ['sending', '캐시 유지 중 · 유지 메시지 전송 중'],
     ['awaiting-turn', '캐시 유지 중 · 작업 시작 확인 중'],
-    ['interactive-wait', '유지 중단 · 권한·입력 응답 대기'],
+    ['interactive-wait', '선택·권한 응답 대기 · 캐시 상태 확인 안 됨(응답 전 자동 전송 안 함)'],
     ['suspended', `유지 중단 · ${reasonText('NO_FRESH_TURN')}`],
     ['review', '확인 필요 · 전송 결과를 확인하세요'],
   ];
@@ -189,6 +189,26 @@ test('cache statuses: all user-facing states come from cacheStatus, including no
     '예약 없음 · 플러그인 시작 후 아직 작업의 시작과 완료를 관측하지 못함');
   assert.equal(cacheStatusDisplay({ ...base, cacheStatus: 'no-reservation', expiresAt: null }, now).text,
     '예약 없음 · 다음 작업의 시작과 완료가 관측되면 예약합니다');
+});
+
+test('cache status: hold가 있는 interactive-wait은 kept로 유지 중 문구와 만료 예정 시각을 표시한다', () => {
+  const now = new Date(2026, 8, 30, 12, 0).getTime();
+  const future = now + 60_000;
+  const base = {
+    phase: 'SUSPENDED', reason: 'INTERACTIVE_WAIT', cacheState: 'kept', cacheStatus: 'interactive-wait',
+    reservationNote: null, expiresAt: future, expiredAt: null, expireCause: null,
+  };
+  const display = cacheStatusDisplay(base, now);
+  assert.equal(display.category, 'kept');
+  assert.equal(display.label, '유지 중');
+  assert.equal(
+    display.text,
+    `캐시 유지 중 · 선택·권한 응답 대기(응답 전 자동 전송 안 함) · 만료 예정 ${formatCacheTime(future, now)}`,
+  );
+  assert.equal(display.at, future, '카운트다운 갱신에 쓸 만료 시각을 전달');
+  const withoutExpiry = cacheStatusDisplay({ ...base, expiresAt: null }, now);
+  assert.equal(withoutExpiry.text, '캐시 유지 중 · 선택·권한 응답 대기(응답 전 자동 전송 안 함)');
+  assert.equal(withoutExpiry.at, null);
 });
 
 test('reservation note: review clear does not infer initial or safety cutoff from phase, reason, or future expiry', () => {

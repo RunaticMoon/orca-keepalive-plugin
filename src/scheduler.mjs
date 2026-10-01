@@ -40,6 +40,17 @@ import { ALLOWED_TTLS, HOOK_STATES, TIMING } from './contracts.mjs';
  */
 
 /**
+ * 대기(hold) 관측. 인터랙티브 대기(waiting/blocked) 직전 턴이 캐시를 막 기록했다는
+ * 관측을 대기 중에도 보존한다. 대기 중 전송은 여전히 금지된다. 응답으로 working이 오면
+ * 일반 새 턴으로 처리하고 hold를 버린다. working 없이 done이 오면(취소 등 API 호출 없는
+ * 종료) 이 값으로 epoch의 캐시 기준을 승계한다.
+ * @typedef {Object} SchedulerHold
+ * @property {number} id
+ * @property {number} basisAt
+ * @property {boolean} attempted
+ */
+
+/**
  * 진행 중 attempt.
  * @typedef {Object} SchedulerAttempt
  * @property {string} id
@@ -60,6 +71,7 @@ import { ALLOWED_TTLS, HOOK_STATES, TIMING } from './contracts.mjs';
  * @property {boolean} seenWorking
  * @property {number} epochSeq
  * @property {SchedulerEpoch|null} epoch
+ * @property {SchedulerHold|null} hold 대기 직전 관측. 대기 중 캐시 기준을 이어받기 위한 임시 값.
  * @property {SchedulerAttempt|null} attempt
  * @property {string|null} reason
  * @property {number} generation
@@ -103,6 +115,8 @@ function copyState(state) {
   return {
     ...state,
     epoch: state.epoch === null ? null : { ...state.epoch },
+    // hold 필드가 없거나 객체가 아니면(구버전 state·손상 입력) null로 정규화한다.
+    hold: state.hold && typeof state.hold === 'object' ? { ...state.hold } : null,
     attempt: state.attempt === null ? null : { ...state.attempt },
   };
 }
@@ -157,6 +171,7 @@ export function initialTargetState(target) {
     seenWorking: false,
     epochSeq: 0,
     epoch: null,
+    hold: null,
     attempt: null,
     reason: 'NO_FRESH_TURN',
     generation: 0,
@@ -196,6 +211,7 @@ function reduceHook(state, input) {
 
   if (hookState === 'working') {
     // 첫 working과 중복 working 모두 마지막 working 시각을 갱신한다.
+    next.hold = null;
     next.lastWorkingAt = receivedAt;
     if (state.lastHook === 'working') {
       // 중복 working: lastHookAt만 갱신한다.
@@ -250,6 +266,28 @@ function reduceHook(state, input) {
     if (state.phase === 'PASTING' || state.phase === 'SUBMITTING') {
       next.generation = state.generation + 1;
     }
+
+    if (state.hold !== null) {
+      // 반복되거나 waiting↔blocked로 전환돼도 최초 관측의 id·basisAt을 유지한다.
+    } else if (state.phase === 'BUSY' && state.seenWorking === true) {
+      // 대기 직전까지 실제 작업 turn이었다: 이 턴의 기록 시각을 새 hold로 잡는다.
+      const holdId = state.epochSeq + 1;
+      next.epochSeq = holdId;
+      next.hold = { id: holdId, basisAt: receivedAt, attempted: false };
+    } else if (
+      (state.phase === 'ARMED' || state.phase === 'CHECKING') &&
+      state.epoch !== null
+    ) {
+      // 아직 전송하지 않은 예약이 있었다: 그 예약의 캐시 기준을 승계한다.
+      next.hold = {
+        id: state.epoch.id,
+        basisAt: state.epoch.basisAt,
+        attempted: state.epoch.attempted,
+      };
+    } else {
+      // 근거 없음.
+      next.hold = null;
+    }
     return next;
   }
 
@@ -274,14 +312,51 @@ function reduceHook(state, input) {
     input.mainAgentState !== 'done'
   ) {
     // combined가 done이어도 mainAgent가 아직 끝나지 않았다.
-    next.phase = 'BUSY';
-    next.reason = 'BUSY';
+    if (input.mainAgentState === 'waiting' || input.mainAgentState === 'blocked') {
+      // 대기 중이다: hold를 유지·생성하고 전송도 계속 막는다.
+      next.phase = 'SUSPENDED';
+      next.reason = 'INTERACTIVE_WAIT';
+      // waiting/blocked HOOK 없이 combined done에만 대기 상태가 실린 경우에도 대기 직전
+      // 관측을 hold로 잡는다(없으면 탭이 💤로 보인다). NEEDS_REVIEW는 기존 처리를 우선한다.
+      if (state.hold === null && state.seenWorking === true && state.phase !== 'NEEDS_REVIEW') {
+        const holdId = state.epochSeq + 1;
+        next.epochSeq = holdId;
+        next.hold = {
+          id: holdId,
+          basisAt: cacheBasisAt(state.lastWorkingAt, receivedAt),
+          attempted: false,
+        };
+      }
+    } else {
+      next.phase = 'BUSY';
+      next.reason = 'BUSY';
+      // 대기가 풀리고 아직 작업 중이다: 대기 중 잡은 오래된 hold는 버린다.
+      next.hold = null;
+    }
     next.epoch = null;
     return next;
   }
   if (state.phase === 'NEEDS_REVIEW') {
     // 검토 전에는 예약하지 않는다.
     next.phase = 'NEEDS_REVIEW';
+    next.hold = null;
+    return next;
+  }
+
+  if (state.hold !== null) {
+    // working 없이 대기에서 바로 done이 왔다(취소 등 API 호출 없는 종료): 대기 진입 때
+    // 잡은 캐시 기준을 승계한다.
+    // epochSeq는 올리지 않는다(hold id를 그대로 쓴다).
+    next.epoch = {
+      id: state.hold.id,
+      doneAt: receivedAt,
+      basisAt: state.hold.basisAt,
+      attempted: state.hold.attempted,
+    };
+    next.hold = null;
+    next.lastWorkingAt = null;
+    next.phase = 'ARMED';
+    next.reason = null;
     return next;
   }
 
@@ -310,6 +385,7 @@ function reducePolicyInvalidated(state, input) {
   const next = copyState(state);
   next.generation = state.generation + 1;
   next.epoch = null;
+  next.hold = null;
   next.attempt = null;
   next.phase = state.phase === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'SUSPENDED';
   next.reason = input.reason;
@@ -342,6 +418,7 @@ function reduceClockGap(state) {
   const next = copyState(state);
   next.generation = state.generation + 1;
   next.epoch = null;
+  next.hold = null;
   next.attempt = null;
   next.phase = state.phase === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'EXPIRED';
   next.reason = 'EXPIRED';
@@ -366,6 +443,7 @@ function reduceAttemptReserved(state, input) {
   }
   next.phase = 'PASTING';
   next.epoch = { ...state.epoch, attempted: true };
+  next.hold = null;
   next.attempt = {
     id: input.attemptId,
     epochId: input.epochId,
@@ -429,6 +507,7 @@ function reduceSendRefused(state, input) {
   }
   next.attempt = null;
   next.epoch = null;
+  next.hold = null;
   next.phase = 'SUSPENDED';
   next.reason = input.reason;
   return next;
@@ -451,6 +530,7 @@ function reduceSendUncertain(state, input) {
   next.phase = 'NEEDS_REVIEW';
   next.reason = 'PARTIAL_OR_UNKNOWN_SEND';
   next.epoch = null;
+  next.hold = null;
   return next;
 }
 
@@ -467,6 +547,7 @@ function reduceReviewCleared(state) {
   next.phase = 'UNKNOWN';
   next.seenWorking = false;
   next.attempt = null;
+  next.hold = null;
   next.reason = 'NO_FRESH_TURN';
   return next;
 }
@@ -485,6 +566,7 @@ function reduceTurnConfirmed(state) {
   next.selfTurnSeq = state.selfTurnSeq + 1;
   next.attempt = null;
   next.epoch = null;
+  next.hold = null;
   next.reason = 'BUSY';
   next.seenWorking = true;
   next.lastHook = 'working';
@@ -525,6 +607,7 @@ function reduceExpire(state, input) {
   }
   next.phase = 'EXPIRED';
   next.epoch = null;
+  next.hold = null;
   next.reason = 'EXPIRED';
   return next;
 }
@@ -553,6 +636,7 @@ function reduceRestoreEpoch(state, input) {
   const next = copyState(state);
   next.seenWorking = true;
   next.lastHook = 'done';
+  next.hold = null;
   next.lastHookAt = Math.max(state.lastHookAt ?? -Infinity, doneAt);
   const epochSeq = state.epochSeq + 1;
   next.epochSeq = epochSeq;
@@ -585,6 +669,7 @@ function reduceRestoreCacheHistory(state, input) {
     return copyState(state);
   }
   const next = copyState(state);
+  next.hold = null;
   if (input.expired === true) {
     next.phase = 'EXPIRED';
     next.reason = 'EXPIRED';
