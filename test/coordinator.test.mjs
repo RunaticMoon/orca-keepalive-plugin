@@ -355,10 +355,7 @@ function createHarness(options = {}) {
     value: options.settings ?? {
       known: true,
       profileId: 'p1',
-      enabled: true,
-      ttlMs: TTL_5M,
-      revision: 1,
-      source: 'sqlite',
+      source: 'index',
       readAt: 0,
     },
   }
@@ -371,6 +368,20 @@ function createHarness(options = {}) {
         now: () => clock.now(),
         randomId: () => `att-${(attemptCounter += 1)}`,
       })
+  if (!options.store) {
+    // TTL은 이제 플러그인 config(claudeCacheTtlMs)에서 온다. store.load()가 읽도록
+    // 저장 상태를 미리 심는다. 기본 5분, storeConfig/ttlMs 옵션으로 조정한다.
+    const seedConfig =
+      options.storeConfig ?? { schemaVersion: 2, claudeCacheTtlMs: options.ttlMs ?? TTL_5M }
+    if (hostCall.storage && typeof hostCall.storage.set === 'function') {
+      hostCall.storage.set('state-v1', {
+        schemaVersion: 1,
+        revision: 0,
+        config: seedConfig,
+        profiles: [],
+      })
+    }
+  }
 
   const spy = { resetBudget: [], confirmAttempt: [], markReview: [], flush: [] }
   const store = Object.assign({}, rawStore, {
@@ -652,15 +663,17 @@ test('비자체 fresh working은 store.resetBudget을 호출한다', async () =>
 // 3. 설정 disabled / unknown
 // ---------------------------------------------------------------------------
 
-test('설정 disabled면 전송하지 않는다', async () => {
+test('구 형태 enabled:false readSettings는 전송·스케줄에 영향을 주지 않는다', async () => {
   const h = createHarness({
-    settings: { known: true, profileId: 'p1', enabled: false, ttlMs: TTL_5M, readAt: 0 },
+    settings: { known: true, profileId: 'p1', enabled: false, source: 'index', readAt: 0 },
   })
   await startHarness(h)
-  await arm(h, h.clock.now())
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  // TTL은 config(기본 5분)에서 오고, enabled=false는 무시된다.
+  assert.equal(viewTerminal(h).expiresAt, t0 + TTL_5M)
   await advanceToDue(h)
-  await h.clock.advance(120000)
-  assert.equal(h.sendCalls.length, 0)
+  assert.equal(h.sendCalls.length, 1)
 })
 
 test('설정 unknown이면 전송하지 않는다', async () => {
@@ -669,7 +682,7 @@ test('설정 unknown이면 전송하지 않는다', async () => {
   await arm(h, h.clock.now())
   await h.clock.advance(TTL_5M + 1000)
   assert.equal(h.sendCalls.length, 0)
-  assert.equal(h.coordinator.getRuntimeView().appTimer.known, false)
+  assert.equal(h.coordinator.getRuntimeView().profileSettings.known, false)
 })
 
 test('설정 unknown 동안 만든 target도 known 프로필 전환 후 전송된다', async () => {
@@ -684,10 +697,7 @@ test('설정 unknown 동안 만든 target도 known 프로필 전환 후 전송�
   h.settingsBox.value = {
     known: true,
     profileId: 'p1',
-    enabled: true,
-    ttlMs: TTL_5M,
-    revision: 1,
-    source: 'sqlite',
+    source: 'index',
     readAt: 0,
   }
   await h.clock.advance(h.tickMs)
@@ -741,21 +751,20 @@ async function runGateProbe(makeHarness, prepare) {
   return { h, gates }
 }
 
-test('assertAllowed: settings 재읽기 결과를 반영한다', async () => {
+test('assertAllowed: 프로필 mismatch면 STALE_TARGET', async () => {
   const { gates } = await runGateProbe(
     () => createHarness(),
     (h) => {
       h.settingsBox.value = {
         known: true,
-        profileId: 'p1',
-        enabled: false,
-        ttlMs: TTL_5M,
+        profileId: 'p2',
+        source: 'index',
         readAt: 0,
       }
     },
   )
   assert.equal(gates.length, 1)
-  assert.deepEqual(gates[0], { allowed: false, reason: 'APP_TIMER_OFF' })
+  assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
 })
 
 test('assertAllowed: 정책 off를 반영한다', async () => {
@@ -783,6 +792,29 @@ test('assertAllowed: target generation 변경을 반영한다', async () => {
     () => createHarness(),
     (h) => h.coordinator.onWorktreeRemoved({ worktreeId: 'w1' }),
   )
+  assert.equal(gates.length, 1)
+  assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
+})
+
+test('assertAllowed: 전송 시작 뒤 config TTL이 바뀌면 STALE_TARGET으로 거절한다', async () => {
+  const h = createHarness()
+  const gates = []
+  h.setSendBehavior(async (args) => {
+    // 전송이 시작된 뒤(예: 다른 tick에서 설정 변경) TTL을 1시간으로 바꾼다.
+    await h.store.updateConfig({ claudeCacheTtlMs: 3600000 })
+    gates.push(await args.assertAllowed())
+    return {
+      kind: 'skipped',
+      reason: 'STALE_TARGET',
+      attemptId: null,
+      at: h.clock.now(),
+      framesSent: 0,
+    }
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+
   assert.equal(gates.length, 1)
   assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
 })
@@ -1026,11 +1058,10 @@ test('getRuntimeView: 계약 shape과 dueAt/expiresAt', async () => {
   assert.equal(view.userDataKey, 'key-p')
   assert.equal(view.profileId, 'p1')
   assert.deepEqual(view.connection, { state: 'connected', reason: null })
-  assert.deepEqual(view.appTimer, {
+  assert.equal('appTimer' in view, false, 'appTimer는 제거됐다')
+  assert.deepEqual(view.profileSettings, {
     known: true,
-    enabled: true,
-    ttlMs: TTL_5M,
-    source: 'sqlite',
+    source: 'index',
     readAt: 0,
     reason: null,
   })
@@ -1050,6 +1081,53 @@ test('getRuntimeView: 계약 shape과 dueAt/expiresAt', async () => {
   assert.equal(term.phase, 'ARMED')
   assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
   assert.equal(term.expiresAt, t0 + TTL_5M)
+})
+
+test('config에 claudeCacheTtlMs가 없으면 기본 1시간을 쓴다', async () => {
+  // 저장 config에 TTL이 없으면 parseConfig가 기본 1시간(3600000)을 채운다.
+  const h = createHarness({ storeConfig: {} })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, t0 + 3600000)
+  assert.equal(term.dueAt, t0 + 3600000 - 120000)
+})
+
+test('config TTL을 1h→5m로 바꾸면 ARMED due/expires를 재계산하고 마감이 지났으면 만료한다', async () => {
+  const h = createHarness({ storeConfig: { schemaVersion: 2, claudeCacheTtlMs: 3600000 } })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  assert.equal(viewTerminal(h).expiresAt, t0 + 3600000)
+
+  // 1시간 기준으로는 아직 due 전이지만, 5분 기준 마감(6분 전)은 이미 지났다.
+  await h.clock.advance(7 * 60000)
+  await h.store.updateConfig({ claudeCacheTtlMs: TTL_5M })
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'EXPIRED')
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(h.sendCalls.length, 0, '이미 지난 마감을 catch-up 전송하지 않는다')
+})
+
+test('config TTL 1h→5m 전환이 만료 전이면 새 due/expires로 예약한다', async () => {
+  const h = createHarness({ storeConfig: { schemaVersion: 2, claudeCacheTtlMs: 3600000 } })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+
+  await h.clock.advance(60000)
+  await h.store.updateConfig({ claudeCacheTtlMs: TTL_5M })
+  await h.clock.advance(h.tickMs)
+
+  const term = viewTerminal(h)
+  assert.equal(term.phase, 'ARMED')
+  assert.equal(term.expiresAt, t0 + TTL_5M)
+  assert.equal(term.dueAt, t0 + TTL_5M - MARGIN_5M)
 })
 
 test('basisAt: working→working(도구)→done이면 예약 dueAt이 마지막 working 기준이다', async () => {
@@ -1681,30 +1759,23 @@ test('U2: catalog가 불완전하면 due여도 전송 0, complete 복귀 후 재
 // 17. U3: 앱 타이머 off/unknown 전환은 예약 epoch를 폐기한다
 // ---------------------------------------------------------------------------
 
-test('U3: 앱 타이머 off 전환은 epoch를 폐기하고, 재켜도 새 turn 전에는 전송하지 않는다', async () => {
+test('U3: 프로필 unknown 전환은 epoch를 폐기하고, 복구돼도 새 turn 전에는 전송하지 않는다', async () => {
   const h = createHarness()
   await startHarness(h)
   await arm(h, h.clock.now())
   assert.equal(viewTerminal(h).phase, 'ARMED')
 
-  // enabled=true → false 전환.
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: false,
-    ttlMs: TTL_5M,
-    readAt: 0,
-  }
+  // known → unknown 전환.
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
   await h.clock.advance(h.tickMs)
   assert.equal(viewTerminal(h).phase, 'SUSPENDED')
-  assert.equal(viewTerminal(h).reason, 'APP_TIMER_OFF')
+  assert.equal(viewTerminal(h).reason, 'SETTINGS_UNKNOWN')
 
-  // 다시 켜도(만료 전) 옛 epoch가 살아나지 않는다.
+  // 같은 프로필로 복구돼도(만료 전) 옛 epoch가 살아나지 않는다.
   h.settingsBox.value = {
     known: true,
     profileId: 'p1',
-    enabled: true,
-    ttlMs: TTL_5M,
+    source: 'index',
     readAt: 0,
   }
   await h.clock.advance(h.tickMs)
@@ -1861,7 +1932,7 @@ test('title indicator: 옵션 on이면 supported target만 on=true로 원한다'
   ])
 })
 
-test('title indicator: paused이거나 앱 타이머가 off면 on=false', async () => {
+test('title indicator: paused이거나 프로필 unknown이면 on=false', async () => {
   const h = createHarness()
   await startHarness(h)
   await h.store.updateConfig({ tabTitleIndicator: true })
@@ -1874,17 +1945,32 @@ test('title indicator: paused이거나 앱 타이머가 off면 on=false', async 
   ])
 
   await h.store.setPaused(false)
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: false,
-    ttlMs: TTL_5M,
-    readAt: 0,
-  }
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
   await h.clock.advance(h.tickMs)
   desired = h.titleIndicators[0].calls.reconcile.at(-1)
   assert.equal(desired.length, 1)
   assert.equal(desired[0].on, false)
+})
+
+test('title indicator: 표시 on은 Orca 타이머 enabled/ttl과 무관하다', async () => {
+  const h = createHarness({
+    settings: {
+      known: true,
+      profileId: 'p1',
+      enabled: false,
+      ttlMs: 3600000,
+      source: 'index',
+      readAt: 0,
+    },
+  })
+  await startHarness(h)
+  await h.store.updateConfig({ tabTitleIndicator: true })
+  await h.clock.advance(h.tickMs)
+
+  const desired = h.titleIndicators[0].calls.reconcile.at(-1)
+  assert.deepEqual(desired, [
+    { worktreeId: 'w1', tabId: 'tab', leafId: 'leaf', handle: 'h1', on: true, cacheState: 'none' },
+  ])
 })
 
 test('title indicator: catalog 불완전/읽기 실패 tick은 off 제거만 수행한다', async () => {
@@ -2778,20 +2864,14 @@ test('cacheHistory: 정책 폐기(POLICY_INVALIDATED)는 이력을 남기고 폐
   const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.ok(before)
 
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: false,
-    ttlMs: TTL_5M,
-    readAt: 0,
-  }
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
   await h.clock.advance(h.tickMs)
 
   assert.equal(viewTerminal(h).phase, 'SUSPENDED')
   const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.ok(after)
   assert.equal(after.epochId, before.epochId)
-  assert.equal(after.lastBlockReason, 'APP_TIMER_OFF')
+  assert.equal(after.lastBlockReason, 'SETTINGS_UNKNOWN')
 })
 
 test('cacheHistory: SEND_REFUSED로 예약이 취소돼도 이력은 남는다', async () => {
@@ -2852,7 +2932,7 @@ test('cacheHistory: catalog 불완전으로 due 전송이 막히면 CATALOG_INCO
   )
 })
 
-test('cacheHistory: 설정 TTL이 바뀌면 살아 있는 이력을 RETIME한다', async () => {
+test('cacheHistory: config TTL이 바뀌면 살아 있는 이력을 RETIME한다', async () => {
   const h = createHarness()
   await startHarness(h)
   const t0 = h.clock.now()
@@ -2860,46 +2940,28 @@ test('cacheHistory: 설정 TTL이 바뀌면 살아 있는 이력을 RETIME한다
   const before = h.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.equal(before.expiresAt, t0 + TTL_5M)
 
-  const TTL_1H = 3600000
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: true,
-    ttlMs: TTL_1H,
-    revision: 2,
-    source: 'sqlite',
-    readAt: 0,
-  }
+  await h.store.updateConfig({ claudeCacheTtlMs: 3600000 })
   await h.clock.advance(h.tickMs)
 
   const after = h.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.equal(after.epochId, before.epochId)
-  assert.equal(after.expiresAt, t0 + TTL_1H)
+  assert.equal(after.expiresAt, t0 + 3600000)
 })
 
-test('cacheHistory: TTL을 모르면 OPEN을 보류하고, 알게 되면 OPEN한다', async () => {
+test('cacheHistory: TTL은 readSettings가 아니라 config에서 온다', async () => {
+  // config는 1시간인데 readSettings(구 형태)가 5분 ttlMs를 줘도 무시한다.
   const h = createHarness({
-    settings: { known: true, profileId: 'p1', enabled: true, ttlMs: undefined, readAt: 0 },
+    ttlMs: 3600000,
+    settings: { known: true, profileId: 'p1', ttlMs: TTL_5M, source: 'index', readAt: 0 },
   })
   await startHarness(h)
-  await arm(h, h.clock.now())
-  // TTL을 몰라 이력을 열지 않는다.
-  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
-
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: true,
-    ttlMs: TTL_5M,
-    revision: 2,
-    source: 'sqlite',
-    readAt: 0,
-  }
-  await h.clock.advance(h.tickMs)
+  const t0 = h.clock.now()
+  await arm(h, t0)
 
   const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
   assert.ok(hist)
-  assert.equal(hist.expiresAt, hist.basisAt + TTL_5M)
+  assert.equal(hist.expiresAt, t0 + 3600000)
+  assert.equal(viewTerminal(h).expiresAt, t0 + 3600000)
 })
 
 test('cacheHistory: 만료 후 24시간이 지나면 이력을 지운다', async () => {
@@ -3326,7 +3388,7 @@ test('projection: review는 indicatorOn true(⚠️)이며 PARTIAL_OR_UNKNOWN_SE
   assert.equal(desired[0].on, true)
 })
 
-test('indicatorOn: paused·설정 off·cwarm disabled면 getRuntimeView도 false', async () => {
+test('indicatorOn: paused·프로필 unknown·cwarm disabled면 getRuntimeView도 false', async () => {
   const h = createHarness()
   await startHarness(h)
 
@@ -3335,13 +3397,7 @@ test('indicatorOn: paused·설정 off·cwarm disabled면 getRuntimeView도 false
   assert.equal(viewTerminal(h).indicatorOn, false)
 
   await h.store.setPaused(false)
-  h.settingsBox.value = {
-    known: true,
-    profileId: 'p1',
-    enabled: false,
-    ttlMs: TTL_5M,
-    readAt: 0,
-  }
+  h.settingsBox.value = { known: false, reason: 'index_missing', readAt: 0 }
   await h.clock.advance(h.tickMs)
   assert.equal(viewTerminal(h).indicatorOn, false)
 
@@ -3581,4 +3637,39 @@ test('indicatorOn: 검토 필요 target이 여러 개여도 getRuntimeView는 sn
     1,
     `snapshot은 target 수와 무관하게 1회여야 한다: ${snapshotCalls}`,
   )
+})
+
+// ---------------------------------------------------------------------------
+// 30. 과거 APP_TIMER_OFF 이력 복원 호환 (새로 생성하지 않음)
+// ---------------------------------------------------------------------------
+
+test('호환: 과거 APP_TIMER_OFF 이력 레코드를 복원해도 만료 원인으로 유지한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const doneAt = 1_000_000
+  const basisAt = doneAt
+  const expiresAt = doneAt + TTL_5M
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'history',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt,
+    basisAt,
+    expiresAt,
+    lastBlockReason: 'APP_TIMER_OFF',
+    expiredAt: expiresAt,
+    savedAt: 1,
+  })
+  // clock을 expiresAt 이후로 두면 만료 이력으로 복원된다.
+  const h = createHarness({ epochMemory, clock: createFakeClock({ start: expiresAt + 1000 }) })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'EXPIRED')
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.lastBlockReason, 'APP_TIMER_OFF')
+  assert.equal(viewTerminal(h).expireCause, 'APP_TIMER_OFF')
 })

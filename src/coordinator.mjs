@@ -12,7 +12,7 @@
  * @module coordinator
  */
 
-import { REASON_CODES, TIMING, CACHE_HISTORY_RETENTION_MS } from './contracts.mjs'
+import { REASON_CODES, TIMING, CACHE_HISTORY_RETENTION_MS, ALLOWED_TTLS } from './contracts.mjs'
 import { reduceCacheHistory, normalizeBlockReason } from './cache-history.mjs'
 import { projectCacheStatus } from './cache-status.mjs'
 import { capFor } from './config.mjs'
@@ -82,7 +82,7 @@ const EPOCH_MEMORY_PRUNE_INTERVAL_MS = 3600000
  * @property {string|null} userDataKey
  * @property {string|null} profileId
  * @property {RuntimeConnection} connection
- * @property {{known:boolean, enabled:boolean, ttlMs:number|null, source:string|null, readAt:number|null, reason:string|null}} appTimer
+ * @property {{known:boolean, source:'index'|null, readAt:number|null, reason:string|null}} profileSettings 플러그인 프로필 설정 읽기 결과. config의 TTL과 별개다.
  * @property {RuntimeWorktreeView[]} worktrees
  *
  * @typedef {Object} Coordinator
@@ -260,7 +260,6 @@ export function createCoordinator({
   let currentProfileId = null
   let settingsInitialized = false
   let lastSettingsKnown = false
-  let lastSettingsEnabled = false
   /** @type {RuntimeConnection} */
   let connection = { state: 'starting', reason: null }
 
@@ -374,23 +373,25 @@ export function createCoordinator({
     } else {
       entry.expiredBy = null
     }
-    updateCacheHistory(key, before, entry.state, input)
+    updateCacheHistory(key, before, entry.state, input, config)
     syncEpochMemory(key, entry.state)
     refreshDecision(key, config)
     return entry.state
   }
 
   /**
-   * 현재 설정에서 알 수 있는 TTL(ms). known이고 ttlMs가 유한수일 때만 값이 있다.
-   * 캐시 이력의 예상 만료 시각 계산에 쓴다(decide와 같은 설정을 본다).
+   * 현재 플러그인 config에서 캐시 TTL(ms)을 읽는다. ALLOWED_TTLS(5분·1시간) 중
+   * 하나일 때만 값을 돌려주고, 그 밖은 null이다. lastSettings는 TTL 출처로 쓰지
+   * 않는다(프로필 설정과 무관). 인자 config가 주어지면 그것을, 없으면 store
+   * snapshot의 config를 쓴다(store.snapshot()은 전체 복제라 이미 읽은 경로는 넘겨
+   * 재사용한다).
+   * @param {object} [config]
    * @returns {number|null}
    */
-  function currentTtlMs() {
-    if (!isObject(lastSettings) || lastSettings.known !== true) {
-      return null
-    }
-    const ttlMs = lastSettings.ttlMs
-    return typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : null
+  function currentTtlMs(config) {
+    const cfg = config ?? store.snapshot().config
+    const ttlMs = isObject(cfg) ? cfg.claudeCacheTtlMs : null
+    return typeof ttlMs === 'number' && ALLOWED_TTLS.includes(ttlMs) ? ttlMs : null
   }
 
   /**
@@ -473,9 +474,10 @@ export function createCoordinator({
    * @param {any} before 적용 전 scheduler state.
    * @param {any} after 적용 후 scheduler state.
    * @param {any} input scheduler reduce 입력.
+   * @param {object} [config] 이번 적용에 쓸 config(생략 시 store snapshot).
    * @returns {void}
    */
-  function updateCacheHistory(key, before, after, input) {
+  function updateCacheHistory(key, before, after, input, config) {
     const entry = targets.get(key)
     if (!entry) {
       return
@@ -510,7 +512,7 @@ export function createCoordinator({
       }
     } else {
       const epoch = after.epoch
-      const ttlMs = currentTtlMs()
+      const ttlMs = currentTtlMs(config)
       if (isObject(epoch) && ttlMs !== null) {
         const basisAt =
           typeof epoch.basisAt === 'number' && Number.isFinite(epoch.basisAt)
@@ -1021,18 +1023,18 @@ export function createCoordinator({
     const state = entry.state
     const cfg = config ?? store.snapshot().config
     const settings = isObject(lastSettings) ? lastSettings : { known: false }
-    const policy = safePolicy(state.target, settings.ttlMs)
+    const profileKnown =
+      settings.known === true && typeof settings.profileId === 'string'
+    const ttlMs = currentTtlMs(cfg)
+    const decisionSettings = { known: profileKnown, ttlMs }
+    const policy = safePolicy(state.target, ttlMs)
     const raw = scheduler.decide(state, {
       now: clock.now(),
-      settings: {
-        known: settings.known === true,
-        enabled: settings.enabled === true,
-        ttlMs: settings.ttlMs,
-      },
+      settings: decisionSettings,
       policy,
       config: cfg,
     })
-    entry.decision = normalizeDecision(raw, state, settings, cfg)
+    entry.decision = normalizeDecision(raw, state, decisionSettings, cfg)
     return entry.decision
   }
 
@@ -1064,7 +1066,7 @@ export function createCoordinator({
   /**
    * store.isAllowedByPolicy를 안전하게 호출한다(scope/profileId 미확정 시 throw 금지).
    * @param {Record<string, any>} target
-   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
+   * @param {number|null} [ttlMs] 현재 config TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed:boolean, reason:string|null}}
    */
   function safePolicy(target, ttlMs) {
@@ -1134,7 +1136,7 @@ export function createCoordinator({
    * assertAllowed)와 분리되며 정책 판정 자체를 바꾸지 않는다. 기존 paused/settings/
    * connection/cwarm/scope/상한/storage 실패 조건을 유지하되, `PARTIAL_OR_UNKNOWN_SEND`
    * (검토 필요)는 표시를 끄는 이유에서 제외한다(그 뒤에 가려진 off 조건은 보존).
-   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, settingsEnabled:boolean, connectionOk:boolean, gateInfo?:{memoryPaused:boolean, config:any}|null}} gates
+   * @param {{cwarmBlocked:boolean, paused:boolean, settingsKnown:boolean, connectionOk:boolean, gateInfo?:{memoryPaused:boolean, config:any}|null}} gates
    * @param {Record<string, any>} target
    * @param {number|null} ttlMs
    * @returns {boolean}
@@ -1144,7 +1146,6 @@ export function createCoordinator({
       gates.cwarmBlocked ||
       gates.paused ||
       !gates.settingsKnown ||
-      !gates.settingsEnabled ||
       !gates.connectionOk
     ) {
       return false
@@ -1301,17 +1302,15 @@ export function createCoordinator({
     // getRuntimeView의 indicatorOn이 같은 gate를 동기적으로 쓰도록 캐시한다.
     cwarmBlockedCache = cwarmBlocked
     const settingsKnown = isObject(lastSettings) && lastSettings.known === true
-    const settingsEnabled = settingsKnown && lastSettings.enabled === true
     const connectionOk = connection.state === 'connected'
     const gates = {
       cwarmBlocked,
       paused: config.paused === true,
       settingsKnown,
-      settingsEnabled,
       connectionOk,
       gateInfo,
     }
-    const ttlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    const ttlMs = currentTtlMs(config)
     /** @type {Array<{worktreeId:string, tabId:string, leafId:string|null, handle:string, on:boolean, cacheState:string}>} */
     const desired = []
     for (const entry of targets.values()) {
@@ -1756,36 +1755,33 @@ export function createCoordinator({
   }
 
   /**
-   * 설정 snapshot을 반영한다. profileId 전환 시 target 전체 초기화, known/enabled 변화
-   * 시 diagnostics를 남긴다.
+   * 설정 snapshot을 반영한다. "활성"의 기준은 프로필 known이다(Orca 앱 타이머
+   * enabled는 더 이상 쓰지 않는다). profileId 전환 시 target 전체 초기화,
+   * known 변화 시 diagnostics를 남기고 known→unknown 전환 순간 모든 target의
+   * 예약을 폐기한다.
    * @param {any} settings
    */
   function applySettings(settings) {
     const known = settings.known === true
-    const enabled = settings.enabled === true
     const profileId = known && typeof settings.profileId === 'string' ? settings.profileId : null
-    // 전환 판정을 위해 갱신 전의 활성 여부를 잡아 둔다. "활성"=known AND enabled.
-    const wasActive = lastSettingsKnown === true && lastSettingsEnabled === true
-    const isActive = known && enabled
+    // 전환 판정을 위해 갱신 전의 활성 여부를 잡아 둔다. "활성"=known.
+    const wasActive = lastSettingsKnown === true
     let changed = false
 
     if (!settingsInitialized) {
       settingsInitialized = true
       lastSettingsKnown = known
-      lastSettingsEnabled = enabled
-    } else if (lastSettingsKnown !== known || lastSettingsEnabled !== enabled) {
+    } else if (lastSettingsKnown !== known) {
       lastSettingsKnown = known
-      lastSettingsEnabled = enabled
       changed = true
     }
 
-    // 앱 타이머가 켜짐에서 off/unknown으로 바뀌는 순간 예약 epoch를 폐기한다.
+    // 프로필 설정을 알 수 없게 되는 순간 예약 epoch를 폐기한다.
     // §5.4 "any -- 설정 off/끊김 --> SUSPENDED". 진행 중 전송은 generation 불일치로
     // assertAllowed가 STALE_TARGET을 주므로 별도 abort는 하지 않는다.
-    if (wasActive && !isActive) {
-      const reason = known ? 'APP_TIMER_OFF' : 'SETTINGS_UNKNOWN'
+    if (wasActive && !known) {
       for (const key of [...targets.keys()]) {
-        applyReduce(key, { type: 'POLICY_INVALIDATED', reason })
+        applyReduce(key, { type: 'POLICY_INVALIDATED', reason: 'SETTINGS_UNKNOWN' })
       }
     }
 
@@ -1806,7 +1802,7 @@ export function createCoordinator({
     if (changed) {
       diagnostics.record({
         event: 'settings_changed',
-        code: known ? (enabled ? 'enabled' : 'disabled') : 'unknown',
+        code: known ? 'known' : 'unknown',
       })
     }
   }
@@ -2084,6 +2080,9 @@ export function createCoordinator({
    */
   async function runSend(key, gen, epochId, target, controller) {
     const config = store.snapshot().config
+    // 전송 시작 시점의 config TTL. 진행 중 TTL이 바뀌면(STALE_TARGET) 재예약/전송을
+    // 거절해 옛 TTL 기준의 상한·만료 계산이 섞이지 않게 한다.
+    const startTtlMs = currentTtlMs(config)
     let reservedAttemptId = null
 
     const assertAllowed = async () => {
@@ -2096,10 +2095,15 @@ export function createCoordinator({
       if (!isObject(settings) || settings.known !== true) {
         return { allowed: false, reason: 'SETTINGS_UNKNOWN' }
       }
-      if (settings.enabled !== true || settings.profileId !== target.profileId) {
-        return { allowed: false, reason: 'APP_TIMER_OFF' }
+      if (settings.profileId !== target.profileId) {
+        return { allowed: false, reason: 'STALE_TARGET' }
       }
-      const policy = safePolicy(target, settings.ttlMs)
+      const currentConfig = store.snapshot().config
+      const ttlMs = currentTtlMs(currentConfig)
+      if (ttlMs !== startTtlMs) {
+        return { allowed: false, reason: 'STALE_TARGET' }
+      }
+      const policy = safePolicy(target, ttlMs)
       if (policy.allowed !== true) {
         // 이번 전송의 attempt가 이미 예약된 뒤(gate2/gate3)라면 reserveAttempt가
         // charged를 +1 했으므로 TTL별 상한(maxConsecutiveKeepalives5m/1h)에 정확히
@@ -2511,8 +2515,7 @@ export function createCoordinator({
     }
     const gateConfig = isObject(gateSnapshot) ? gateSnapshot.config : null
     const settingsKnown = isObject(lastSettings) && lastSettings.known === true
-    const settingsEnabled = settingsKnown && lastSettings.enabled === true
-    const gateTtlMs = settingsKnown && typeof lastSettings.ttlMs === 'number' ? lastSettings.ttlMs : null
+    const gateTtlMs = currentTtlMs(gateConfig)
     const gateInfo =
       gateSnapshot === null
         ? null
@@ -2521,7 +2524,6 @@ export function createCoordinator({
       cwarmBlocked: cwarmBlockedCache,
       paused: isObject(gateConfig) && gateConfig.paused === true,
       settingsKnown,
-      settingsEnabled,
       connectionOk: connection.state === 'connected',
       gateInfo,
     }
@@ -2622,11 +2624,9 @@ export function createCoordinator({
       userDataKey: binding ? binding.userDataKey : null,
       profileId: currentProfileId,
       connection: { state: connection.state, reason: connection.reason ?? null },
-      appTimer: {
+      profileSettings: {
         known: settings ? settings.known === true : false,
-        enabled: settings ? settings.enabled === true : false,
-        ttlMs: settings && typeof settings.ttlMs === 'number' ? settings.ttlMs : null,
-        source: settings && typeof settings.source === 'string' ? settings.source : null,
+        source: settings && settings.source === 'index' ? 'index' : null,
         readAt: settings && typeof settings.readAt === 'number' ? settings.readAt : null,
         reason: settings && typeof settings.reason === 'string' ? settings.reason : null,
       },
