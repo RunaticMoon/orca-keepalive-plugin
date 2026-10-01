@@ -21,7 +21,7 @@ install time. A release is a git tag whose commit contains `orca-plugin.json`,
 | Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Changing identity after install creates a different plugin. |
 | License | **Decided**: MIT (`LICENSE`, `package.json` `license`). | This repository implements its own code and does not copy `claude-cache-keepalive` code. |
 | Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin` (public). | Users install from this URL. |
-| Version tag | Manifest `version` is `0.1.9`. Tags are optional (e.g. `v0.1.0`). | If you tag, the tag must match the manifest version. |
+| Version tag | Manifest `version` is `0.1.10`. Tags are optional (e.g. `v0.1.0`). | If you tag, the tag must match the manifest version. |
 
 The manifest currently declares:
 
@@ -30,7 +30,7 @@ The manifest currently declares:
   "manifestVersion": 1,
   "id": "cache-keepalive",
   "publisher": "runaticmoon",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "engines": { "orca": ">=1.4.214" },
   "pluginApi": 1
 }
@@ -48,7 +48,7 @@ official or Stably-published.
 
 Add `https://github.com/RunaticMoon/orca-keepalive-plugin.git` with Git ref `main`
 in **Settings > Plugins > Manage sources**, then install Cache Keepalive from its
-listing. See the [README](../README.md#from-the-marketplace-recommended) for the
+listing. See the [README](../README.en.md#from-the-marketplace-recommended) for the
 update flow and existing-install migration caveat.
 
 The index lists `runaticmoon.cache-keepalive` and points to this repository's `main`.

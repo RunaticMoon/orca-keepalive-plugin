@@ -1,261 +1,247 @@
-# Cache Keepalive (Orca community plugin)
+# Cache Keepalive (Orca 커뮤니티 플러그인)
 
-Cache Keepalive sends a short keepalive message to **idle Claude terminals** in
-[Orca](https://github.com/stablyai/orca) shortly before the prompt cache TTL is
-expected to expire, so the cached prefix stays warm. It also provides per-worktree
-and per-terminal toggles, a global pause, and a small authenticated dashboard.
+**한국어** | [English](README.en.md)
 
-This is a **community, experimental** plugin. It is not an official Stably plugin.
+Cache Keepalive는 [Orca](https://github.com/stablyai/orca)의 **유휴 Claude 터미널**에,
+프롬프트 캐시 TTL이 만료될 것으로 예상되는 직전에 짧은 keepalive 메시지를 보내
+캐시된 프리픽스를 따뜻하게 유지합니다. 워크트리별·터미널별 토글, 전역 일시정지,
+그리고 작은 인증 대시보드도 제공합니다.
 
-- Plugin id: `cache-keepalive`
-- Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
-- License: MIT (see [LICENSE](LICENSE))
-- Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
-- Version: `0.1.9`
-- Minimum Orca engine declared: `>=1.4.214`
-- Plugin API: `pluginApi 1` (`contributes` is strict)
-- Runtime: Node >=22.5 (development has been done on Node 24); no build step, no npm dependencies
+이 플러그인은 **커뮤니티 실험** 플러그인입니다. 공식 Stably 플러그인이 아닙니다.
+
+- 플러그인 id: `cache-keepalive`
+- 게시자 slug: `runaticmoon` (플러그인 식별자 `runaticmoon.cache-keepalive`)
+- 라이선스: MIT ([LICENSE](LICENSE) 참고)
+- 저장소: https://github.com/RunaticMoon/orca-keepalive-plugin
+- 버전: `0.1.10`
+- 선언된 최소 Orca 엔진: `>=1.4.214`
+- 플러그인 API: `pluginApi 1` (`contributes`는 엄격 모드)
+- 런타임: Node >=22.5(개발은 Node 24에서 진행), 빌드 단계 없음, npm 의존성 없음
 
 ---
 
-## What it does
+## 무엇을 하는가
 
-The Orca setting **Settings > Agents > Prompt Cache Timer** only controls a timer
-inside Orca's renderer. This plugin does not start that timer and cannot read its
-exact start time. Instead it watches agent status events, and after it observes a
-turn complete it schedules one keepalive message per cache epoch.
+Orca 설정 **설정 > 에이전트 > 프롬프트 캐시 타이머**는 Orca 렌더러 내부의 타이머만
+제어합니다. 이 플러그인은 그 타이머를 시작하지 않고 정확한 시작 시각도 읽을 수
+없습니다. 대신 에이전트 상태 이벤트를 관찰하고, 턴 완료를 확인한 뒤 캐시 epoch마다
+keepalive 메시지를 하나 예약합니다.
 
-When all send conditions are met it sends two RPC requests to Orca's local runtime
-socket:
+모든 전송 조건이 충족되면 Orca 로컬 런타임 소켓에 RPC 요청 두 개를 보냅니다:
 
-1. a guarded bracketed-paste of the configured message, then
-2. a guarded Enter keystroke.
+1. 설정된 메시지를 가드된 괄호 붙여넣기(guarded bracketed-paste)로 전송하고,
+2. 가드된 Enter 키 입력을 보냅니다.
 
-### Conditions required before a send
+### 전송 전 필요한 조건
 
-A keepalive is only considered when **all** of these are true at inspection time:
+검사 시점에 다음이 **모두** 참일 때만 keepalive를 고려합니다:
 
-- Orca's own prompt cache timer is **on** (read from the active profile; see risks below).
-- The terminal's agent identity is `claude` (`agentIdentity === 'claude'`).
-- The execution host is local (`executionHostId === 'local'`).
-- The terminal is connected to a live PTY.
-- The agent has actually been observed finishing a turn (a fresh `working` then
-  `done`). A terminal that is already idle when the plugin starts is *not* scheduled
-  and waits for the next completed turn — unless the plugin itself had scheduled a
-  keepalive for that same terminal before a reload, which it restores. See
-  [Surviving a plugin reload](#surviving-a-plugin-reload).
-- The combined agent state is `done` and the optional `mainAgent` is `done` or absent.
-- `terminal.agentStatus` reports idle and running, and `terminal.show.agentWait`
-  is present and `null` (no permission/wait prompt is being judged).
-- The terminal screen has **no non-empty draft**, and output has been quiet for at
-  least `quietOutputMs` (default 2500 ms). A change in an observed draft starts an
-  input quiet window (`observedInputQuietMs`, default 30000 ms).
-- No global pause, the worktree/terminal scope is enabled, `~/.claude/cwarm.disabled`
-  is absent (when `respectCwarmDisabled` is on), and the consecutive keepalive cap
-  for the TTL currently reported by Orca's timer has not been reached (see
-  [Consecutive cap and reset](#consecutive-cap-and-reset)).
+- Orca의 프롬프트 캐시 타이머가 **켜져** 있음(활성 프로필에서 읽음, 아래 위험 참고).
+- 터미널의 에이전트 정체성이 `claude`임(`agentIdentity === 'claude'`).
+- 실행 호스트가 로컬임(`executionHostId === 'local'`).
+- 터미널이 살아 있는 PTY에 연결되어 있음.
+- 에이전트가 실제로 턴을 마치는 것이 관찰됨(새로운 `working` 후 `done`). 플러그인
+  시작 시 이미 유휴 상태인 터미널은 예약되지 않고 다음 완료 턴을 기다립니다. 단,
+  재로드 전에 플러그인 자체가 같은 터미널에 keepalive를 예약했던 경우에는 복원합니다.
+  [플러그인 재로드 후에도 유지](#플러그인-재로드-후에도-유지)를 참고하세요.
+- 결합된 에이전트 상태가 `done`이고, 선택적 `mainAgent`가 `done`이거나 없음.
+- `terminal.agentStatus`가 idle과 running을 보고하고, `terminal.show.agentWait`가
+  존재하며 `null`임(권한/대기 프롬프트를 판정 중이 아님).
+- 터미널 화면에 **비어 있지 않은 초안이 없고**, 출력이 최소 `quietOutputMs`(기본
+  2500 ms) 동안 조용함. 관찰된 초안이 바뀌면 입력 조용 구간
+  (`observedInputQuietMs`, 기본 30000 ms)이 시작됩니다.
+- 전역 일시정지가 아니고, 워크트리/터미널 범위가 켜져 있으며,
+  `~/.claude/cwarm.disabled`가 없고(`respectCwarmDisabled`가 켜져 있을 때), 현재 Orca
+  타이머가 보고하는 TTL에 대한 연속 keepalive 상한에 도달하지 않았음
+  ([연속 상한과 초기화](#연속-상한과-초기화) 참고).
 
-If any signal is unknown, the plugin refuses to send rather than guessing.
+신호가 하나라도 불확실하면 플러그인은 추측하지 않고 전송을 거부합니다.
 
-### Send timing
+### 전송 시점
 
-Timing is based on the **cache basis time** (`basisAt`) and the TTL reported by
-Orca's timer setting. Anthropic starts the prompt-cache TTL when the request that
-reads or writes the cache begins, and the response generation time is spent inside
-that TTL. Claude Code sends one API request per tool call, so the plugin uses the
-turn's last observed `state: 'working'` event (`basisAt`, ≈ the start of the last
-API request). If there is no such observation, or it is more than 3 minutes earlier
-than the completion event, the observed completion time (`doneAt`) is used instead.
-Only two TTL values are accepted: 5 minutes and 1 hour.
+타이밍은 **캐시 기준 시각**(`basisAt`)과 Orca 타이머 설정이 보고하는 TTL을 기준으로
+합니다. Anthropic은 캐시를 읽거나 쓰는 요청이 시작될 때 프롬프트 캐시 TTL을
+시작하며, 응답 생성 시간도 그 TTL 안에서 소모됩니다. Claude Code는 도구 호출마다 API
+요청을 하나씩 보내므로, 플러그인은 턴의 마지막으로 관찰된 `state: 'working'`
+이벤트(`basisAt`, ≈ 마지막 API 요청 시작)를 사용합니다. 그러한 관찰이 없거나, 완료
+이벤트보다 3분 넘게 이르면 관찰된 완료 시각(`doneAt`)을 대신 사용합니다. TTL 값은
+5분과 1시간 두 가지만 허용됩니다.
 
-| App TTL | Default margin | Target send time |
+| 앱 TTL | 기본 여유 | 목표 전송 시각 |
 |---|---|---|
-| `300000` ms (5 min) | `margin5mMs` = 60 s | `basisAt + TTL - 60 s` (≈ 4 minutes after the last request start) |
-| `3600000` ms (1 h) | `margin1hMs` = 120 s | `basisAt + TTL - 120 s` (≈ 58 minutes after the last request start) |
+| `300000` ms (5분) | `margin5mMs` = 60초 | `basisAt + TTL - 60초` (≈ 마지막 요청 시작 후 4분) |
+| `3600000` ms (1시간) | `margin1hMs` = 120초 | `basisAt + TTL - 120초` (≈ 마지막 요청 시작 후 58분) |
 
-- **At most one keepalive mutation per cache epoch.** A keepalive that is submitted
-  starts a new working→done cycle, which opens a *new* epoch, so at most roughly one
-  message per 4 minutes / 58 minutes.
-- **Catch-up is never done.** Once the expected expiry passes (with a minimum of
-  10 s remaining), the epoch is dropped; there is no "late" burst after sleep or a
-  clock jump.
+- **캐시 epoch당 최대 1회만 상태를 바꿉니다.** 제출된 keepalive는 새로운 working→done
+  주기를 시작해 *새* epoch을 열므로, 대략 4분/58분에 한 번만 메시지를 보냅니다.
+- **따라잡기는 절대 하지 않습니다.** 예상 만료가 지나면(최소 10초가 남아 있어야 함)
+  epoch은 버려지며, 절전이나 시계 점프 후 "늦은" 폭주는 없습니다.
 
-### Surviving a plugin reload
+### 플러그인 재로드 후에도 유지
 
-Disabling and re-enabling the plugin (or any other worker reload) clears the in-memory
-schedule. The plugin keeps two kinds of per-terminal record under Orca's plugin storage
-key `epochs-v1` (a separate key from the control state `state-v1`):
+플러그인을 끄고 다시 켜거나(또는 다른 worker 재로드가 발생하면) 메모리 내 스케줄이
+지워집니다. 플러그인은 Orca 플러그인 저장소 키 `epochs-v1`(제어 상태 `state-v1`과는
+별도의 키) 아래에 터미널별 기록 두 종류를 보관합니다:
 
-- an **armed** record while an epoch is **armed and not yet sent**, so a pending
-  keepalive is not lost; and
-- a **display-only history** record for the last observed cache epoch — its expected
-  expiry time and last recorded send block reason — so the tab symbol and the dashboard
-  can still show what was kept and why it ended.
+- epoch이 **무장(armed)되어 아직 전송되지 않은** 동안의 **armed** 기록 — 대기 중인
+  keepalive를 잃지 않기 위함
+- 마지막으로 관찰된 캐시 epoch에 대한 **표시 전용 기록(history)** — 예상 만료 시각과
+  마지막으로 기록된 전송 차단 사유를 담아, 탭 기호와 대시보드가 무엇이 유지되었고 왜
+  끝났는지 계속 보여줄 수 있게 함
 
-An armed record is written while the epoch is armed and not yet sent, and is removed as
-soon as the epoch leaves that state — work is observed, a send is attempted (an attempt
-is reserved), it expired, or the target changed. A history record is **not a
-reservation**: it is never turned back into a send. It is removed when the next real
-work turn starts, or 24 hours after its expected expiry. (A record that expires while
-the plugin is offline, or an armed record whose expected expiry already passed, is kept
-as history instead of being restored as a reservation.)
+armed 기록은 epoch이 무장되어 아직 전송되지 않은 동안 기록되며, epoch이 그 상태를
+벗어나는 즉시(작업이 관찰되거나, 전송이 시도되어 시도가 예약되거나, 만료되거나, 대상이
+바뀌면) 제거됩니다. history 기록은 **예약이 아닙니다**: 다시 전송으로 되돌아가지
+않습니다. 다음 실제 작업 턴이 시작되거나 예상 만료 후 24시간이 지나면 제거됩니다.
+(플러그인이 오프라인인 동안 만료된 기록, 또는 예상 만료가 이미 지난 armed 기록은
+예약으로 복원되지 않고 history로 유지됩니다.)
 
-On the next start the plugin restores an armed schedule only when the catalog still
-contains the **same terminal**: the same `userDataKey`, `profileId`, `worktreeId`, and
-`paneKey`, the same `ptyId`, and `doneAt` within the last hour. The `incarnationId` is
-**not** compared: a terminal whose incarnation changed (for example after an Orca restart
-or update) is restored too, and that restore is reported as an `epoch_restored` diagnostic
-with `code: 'incarnation_changed'`. An entry whose scope needs review (an open, failed, or
-uncertain attempt) is dropped instead of restored, and clearing the review also removes the
-record so the same keepalive cannot be sent twice. Expiry and send conditions are otherwise
-unchanged. After a restart the shell is new, so until Claude runs again (for example a
-session resume) the pre-send safety checks find the target unsupported and nothing is
-sent; only the schedule and expected expiry are shown. If the terminal finished another
-turn while the plugin was unloaded, the restored schedule is still based on the older
-completion time, so that one keepalive may be sent earlier than necessary; the idle,
-draft, and quiet checks immediately before each send still apply. Known limitation: after
-a restart, if you start a **new** Claude session in the same pane instead of resuming the
-old conversation, the restored schedule can send one keepalive to that new session
-(subject to the consecutive cap). Plugin reloads and marketplace updates keep the same
-identifiers and were already restorable; deleting and reinstalling the plugin clears
-Orca's `plugins-data` and is not restored.
+다음 시작 시 플러그인은 카탈로그에 **같은 터미널**이 아직 있을 때만 armed 스케줄을
+복원합니다: 같은 `userDataKey`, `profileId`, `worktreeId`, `paneKey`, 같은 `ptyId`,
+그리고 `doneAt`이 지난 1시간 이내. `incarnationId`는 **비교하지 않습니다**:
+incarnation이 바뀐 터미널(예: Orca 재시작이나 업데이트 후)도 복원되며, 그 복원은
+`code: 'incarnation_changed'`인 `epoch_restored` 진단으로 보고됩니다. 범위를 검토해야
+하는 항목(열린·실패·불확실한 시도)은 복원하지 않고 버리며, 검토를 해제하면 그 기록도
+제거되어 같은 keepalive가 두 번 전송될 수 없습니다. 만료와 전송 조건은 그 외에는
+동일합니다. 재시작 후에는 셸이 새로 만들어지므로, Claude가 다시 실행될 때까지(예: 세션
+재개) 전송 전 안전 검사가 대상을 지원 불가로 판정해 아무것도 보내지 않고 스케줄과 예상
+만료만 표시됩니다. 플러그인이 언로드된 동안 터미널이 다른 턴을 마쳤다면 복원된
+스케줄은 여전히 더 오래된 완료 시각에 기반하므로, 그 keepalive 하나는 필요보다 일찍
+전송될 수 있습니다. 그래도 매 전송 직전의 유휴·초안·조용 검사는 그대로 적용됩니다.
+알려진 한계: 재시작 후 이전 대화를 재개하지 않고 같은 pane에서 **새** Claude 세션을
+시작하면, 복원된 스케줄이 그 새 세션에 keepalive를 한 번 보낼 수 있습니다(연속 상한
+적용). 플러그인 재로드와 마켓플레이스 업데이트는 식별자를 그대로 유지해 이미 복원
+가능했고, 플러그인을 삭제 후 재설치하면 Orca의 `plugins-data`가 지워져 복원되지
+않습니다.
 
-A **display-only history** record (and an armed record whose expected expiry already
-passed) is restored without creating a schedule: the tab symbol and the dashboard show
-the earlier expiry and its last recorded block reason, but nothing is sent. History is
-**not** revived by restoring it. A record whose expected expiry is more than 24 hours
-old is dropped at startup and while the plugin is running; rewriting a record never
-extends this limit.
+**표시 전용 history** 기록(그리고 예상 만료가 이미 지난 armed 기록)은 스케줄을 만들지
+않고 복원됩니다: 탭 기호와 대시보드가 이전 만료와 마지막으로 기록된 차단 사유를
+보여주지만 아무것도 전송하지 않습니다. history는 복원해도 **되살아나지 않습니다**.
+예상 만료가 24시간보다 오래된 기록은 시작 시점과 플러그인 실행 중에 버려지며, 기록을
+다시 써도 이 한도는 연장되지 않습니다.
 
-The storage envelope is version **2**. Version 1 records are still read the old way, but
-no history is reconstructed from them because a version 1 record has no TTL information.
-An **older** plugin version cannot read a version 2 store and restores nothing from it,
-so downgrading loses the stored schedule and history. Expiry history that disappeared
-before you updated cannot be recovered; only history this version observed and saved is
-preserved.
+저장 envelope은 버전 **2**입니다. 버전 1 기록은 예전 방식으로 계속 읽지만, 버전 1
+기록에는 TTL 정보가 없어 history를 재구성하지 않습니다. **이전** 플러그인 버전은
+버전 2 저장소를 읽을 수 없고 그로부터 아무것도 복원하지 못하므로, 다운그레이드하면
+저장된 스케줄과 history를 잃습니다. 업데이트 전에 이미 사라진 만료 history는 복구할 수
+없고, 이 버전이 관찰해 저장한 history만 보존됩니다.
 
-### Consecutive cap and reset
+### 연속 상한과 초기화
 
-- Two caps are stored, one per TTL: `maxConsecutiveKeepalives5m` (default **8**) and
-  `maxConsecutiveKeepalives1h` (default **3**). Both are integers `0`–`1000`, where
-  `0` means unlimited. At a 5-minute TTL, 8 keepalives are about 4 minutes apart, so
-  the cache stays warm for roughly 37 minutes after the last real turn; at a 1-hour
-  TTL, 3 keepalives are about 58 minutes apart, so roughly 3 hours.
-- Which cap applies is decided by the TTL currently reported by Orca's timer
-  (`promptCacheTtlMs`, see [Send timing](#send-timing)). When the TTL cannot be read,
-  the **smaller** of the two caps is applied. The dashboard form edits the two values
-  separately (**연속 keepalive 상한 (5분 TTL)** and **(1시간 TTL)**), and the per-terminal
-  row `연속 x/상한 y` shows the cap for the current TTL.
-- The cap counts keepalives that were themselves submitted by the plugin. When a
-  fresh `working` turn appears that is **not** explained by the plugin's own recent
-  attempt, the budget for that target is automatically reset to 0. In practice: if
-  you do real work in the terminal, the counter starts over.
-- The dashboard's **reset budget** action also resets the counter without waiting.
-- The counter is not persisted across long idle periods as a scheduled time; on
-  restart, unfinished attempts are surfaced as "needs review" instead of being
-  retried.
-- The counter is **shared across TTLs**: it is one number per terminal, not one per
-  TTL. If you send several keepalives at a 5-minute TTL and then switch Orca's timer
-  to a 1-hour TTL, the count may already be at or above the 1-hour cap (default **3**),
-  so the plugin stops sending on that terminal until the next real work turn resets
-  the counter.
+- TTL별로 상한 두 개를 저장합니다: `maxConsecutiveKeepalives5m`(기본 **8**)와
+  `maxConsecutiveKeepalives1h`(기본 **3**). 둘 다 `0`–`1000` 정수이며 `0`은
+  무제한입니다. 5분 TTL에서 keepalive 8회는 약 4분 간격이라 마지막 실제 턴 이후 약
+  37분간 캐시가 유지되고, 1시간 TTL에서 3회는 약 58분 간격이라 약 3시간 유지됩니다.
+- 어느 상한을 적용할지는 현재 Orca 타이머가 보고하는 TTL(`promptCacheTtlMs`,
+  [전송 시점](#전송-시점) 참고)로 정합니다. TTL을 읽을 수 없으면 두 상한 중 **작은**
+  쪽을 적용합니다. 대시보드 폼에서는 두 값을 따로 편집하며(**연속 keepalive 상한
+  (5분 TTL)** 과 **(1시간 TTL)**), 터미널 행 `연속 x/상한 y`는 현재 TTL의 상한을
+  보여줍니다.
+- 상한은 플러그인 자체가 제출한 keepalive를 셉니다. 플러그인 자체의 최근 시도로
+  설명되지 **않는** 새 `working` 턴이 나타나면 그 대상의 예산이 자동으로 0으로
+  초기화됩니다. 실제로 터미널에서 실제 작업을 하면 카운터가 처음부터 다시 시작합니다.
+- 대시보드의 **예산 초기화(reset budget)** 동작도 기다리지 않고 카운터를 초기화합니다.
+- 카운터는 긴 유휴 기간을 넘겨 예약 시각으로 영속화되지 않으며, 재시작 시 미완료
+  시도는 재시도되지 않고 "확인 필요"로 표시됩니다.
+- 카운터는 **TTL 간에 공유**됩니다: TTL별이 아니라 터미널당 하나의 숫자입니다. 5분
+  TTL로 keepalive를 여러 번 보낸 뒤 Orca 타이머를 1시간 TTL로 바꾸면 카운트가 이미
+  1시간 상한(기본 **3**)에 도달했거나 넘었을 수 있어, 다음 실제 작업 턴이 카운터를
+  초기화할 때까지 그 터미널에서는 전송을 멈춥니다.
 
 ### `cwarm.disabled`
 
-When `respectCwarmDisabled` is on (default), the presence of
-`~/.claude/cwarm.disabled` blocks all sends. This is compatible with the concept of
-the reference tool [claude-cache-keepalive](https://github.com/fifthadj/claude-cache-keepalive);
-the file is only read, never written.
+`respectCwarmDisabled`가 켜져 있을 때(기본), `~/.claude/cwarm.disabled`가 존재하면 모든
+전송이 차단됩니다. 이는 참고 도구
+[claude-cache-keepalive](https://github.com/fifthadj/claude-cache-keepalive)의 개념과
+호환됩니다. 이 파일은 읽기만 하고 절대 쓰지 않습니다.
 
 ---
 
-## Installation
+## 설치
 
-There is no build or install command. The repository root *is* the plugin
-(`orca-plugin.json`, `main.mjs`, `src/`, `ui/`). This repository also provides a
-community marketplace through `orca-marketplace.json`.
+빌드나 설치 명령은 없습니다. 저장소 루트가 *곧* 플러그인입니다(`orca-plugin.json`,
+`main.mjs`, `src/`, `ui/`). 이 저장소는 `orca-marketplace.json`을 통해 커뮤니티
+마켓플레이스도 제공합니다.
 
-### From the marketplace (recommended)
+### 마켓플레이스에서 설치(권장)
 
-1. Open **Settings > Plugins > Manage sources** and add a marketplace:
+1. **설정 > Plugins > Manage sources**를 열고 마켓플레이스를 추가합니다:
    - **Git URL:** `https://github.com/RunaticMoon/orca-keepalive-plugin.git`
    - **Git ref:** `main`
-2. Find **Cache Keepalive** in the marketplace and click **Install**.
-3. Review and approve the requested permissions.
+2. 마켓플레이스에서 **Cache Keepalive**를 찾아 **Install**을 클릭합니다.
+3. 요청된 권한을 검토하고 승인합니다.
 
-For subsequent updates, click **Refresh**, then **Check for update** on the plugin,
-review the preview, and confirm the update. Refresh only reloads the marketplace
-listings; it does not install code automatically. The listing follows `main`, so
-updates use the latest published commit without entering the Git URL again.
-This is a community source, not an official Orca marketplace listing.
+이후 업데이트는 **Refresh**를 누른 뒤 플러그인의 **Check for update**를 누르고,
+미리보기를 검토한 뒤 업데이트를 확인합니다. Refresh는 마켓플레이스 목록만 다시
+불러올 뿐 코드를 자동으로 설치하지 않습니다. 목록은 `main`을 따라가므로, Git URL을
+다시 입력하지 않고도 최신 게시 커밋으로 업데이트됩니다. 이는 공식 Orca 마켓플레이스
+목록이 아니라 커뮤니티 소스입니다.
 
-Existing Git URL/local-folder installs do not automatically become marketplace
-installs when the source is added. Orca currently only shows **Check for update**
-for marketplace installs. Back up existing settings before any removal/reinstall
-needed to switch installation source; migration has not been verified in Orca.
-The marketplace UI requires an Orca version that provides **Manage sources**.
+기존 Git URL/로컬 폴더 설치는 소스를 추가해도 자동으로 마켓플레이스 설치가 되지
+않습니다. Orca는 현재 마켓플레이스 설치에만 **Check for update**를 표시합니다. 설치
+소스를 바꾸기 위해 제거·재설치가 필요할 때는 먼저 기존 설정을 백업하세요.
+마이그레이션은 Orca에서 검증되지 않았습니다. 마켓플레이스 UI는 **Manage sources**를
+제공하는 Orca 버전이 필요합니다.
 
-### From the Git URL
+### Git URL로 설치
 
-1. In Orca open **Settings > Plugins** and click **Install plugin**.
-2. Choose the **Git URL** tab and enter the repository URL with a `#ref`:
+1. Orca에서 **설정 > Plugins**를 열고 **Install plugin**을 클릭합니다.
+2. **Git URL** 탭을 선택하고 `#ref`가 붙은 저장소 URL을 입력합니다:
 
    ```text
    https://github.com/RunaticMoon/orca-keepalive-plugin#main
    ```
 
-   The dialog requires some `#ref`. It can be a branch (`#main`, follows the latest
-   code), a tag (e.g. `#v0.1.0`, a fixed release), or a full commit SHA. Orca copies
-   the plugin and shows the requested permissions for review.
-3. Approve the permissions, then run **Cache Keepalive: Open Dashboard** from the
-   command palette.
+   대화상자는 어떤 `#ref`든 요구합니다. 브랜치(`#main`, 최신 코드를 따라감),
+   태그(예: `#v0.1.0`, 고정 릴리스), 또는 전체 커밋 SHA일 수 있습니다. Orca가
+   플러그인을 복사하고 검토할 요청 권한을 표시합니다.
+3. 권한을 승인한 뒤 명령 팔레트에서 **Cache Keepalive: Open Dashboard**를 실행합니다.
 
-Updating: Orca does not auto-update plugins installed from a Git URL. To update,
-run **Install plugin** again with the same URL (`#main` picks up the newest commit)
-or with a newer tag. Orca replaces the installed copy in place, keeps the plugin's
-stored settings, and keeps the previous copy for rollback. You can also use the
-**Local folder** tab with a local clone.
+업데이트: Orca는 Git URL로 설치한 플러그인을 자동 업데이트하지 않습니다.
+업데이트하려면 같은 URL(`#main`은 최신 커밋을 가져옴) 또는 더 새로운 태그로
+**Install plugin**을 다시 실행합니다. Orca는 설치된 복사본을 제자리에서 교체하고,
+플러그인이 저장한 설정을 유지하며, 이전 복사본을 롤백용으로 보관합니다. 로컬
+클론과 함께 **Local folder** 탭을 사용할 수도 있습니다.
 
-### Development path
+### 개발 경로
 
-1. In Orca open **Settings > Plugins** and expand the **Development** section.
-2. In **Development plugin folder path**, enter the absolute path to this repository
-   and click **Add path**.
-3. Approve the requested permissions when Orca asks. Development plugins still go
-   through permission (capability) review.
-4. Run **Cache Keepalive: Open Dashboard** from the command palette.
+1. Orca에서 **설정 > Plugins**를 열고 **Development** 섹션을 펼칩니다.
+2. **Development plugin folder path**에 이 저장소의 절대 경로를 입력하고
+   **Add path**를 클릭합니다.
+3. Orca가 요청하면 요청된 권한을 승인합니다. 개발 플러그인도 여전히
+   권한(기능) 검토를 거칩니다.
+4. 명령 팔레트에서 **Cache Keepalive: Open Dashboard**를 실행합니다.
 
-Notes:
+참고:
 
-- Only files loaded when Orca actually starts the plugin worker cause side effects;
-  importing `main.mjs` starts nothing. Commands and event handlers are registered
-  synchronously, and startup work runs in the background.
-- If you change `main.mjs` and the plugin does not pick it up, bump `version` in
-  `orca-plugin.json` or disable/enable the plugin to force a fresh worker. (Orca may
-  keep an existing worker running after an in-place edit.)
+- Orca가 실제로 플러그인 worker를 시작할 때 로드되는 파일만 부작용을 일으킵니다.
+  `main.mjs`를 import하는 것만으로는 아무것도 시작되지 않습니다. 명령과 이벤트
+  핸들러는 동기적으로 등록되고, 시작 작업은 백그라운드에서 실행됩니다.
+- `main.mjs`를 바꿨는데 플러그인이 반영하지 않으면 `orca-plugin.json`의 `version`을
+  올리거나 플러그인을 껐다 켜서 새 worker를 강제하세요. (Orca는 제자리 편집 후에도
+  기존 worker를 계속 실행할 수 있습니다.)
 
-### Required capabilities
+### 필요한 권한
 
-`orca-plugin.json` requests five capabilities:
+`orca-plugin.json`은 다섯 개의 capability를 요청합니다:
 
-| Capability | Why it is needed |
+| Capability | 필요한 이유 |
 |---|---|
-| `workspace:read` | Read the plugin workspace context (terminal handles) so commands and the dashboard can resolve the current worktree. The plugin never guesses focus from a title. |
-| `terminal:send` | Declares intent to send terminal text/Enter. Without it the internal RPC sender is not started; command registration and diagnostics still work. |
-| `notifications:show` | Feedback for toggle/pause/resume/status commands, and the dashboard URL fallback when Orca's built-in browser cannot be opened. |
-| `storage` | Persist plugin state under host-storage keys (`state-v1` for controls and `epochs-v1` for the reload epoch memory). Orca's own settings are never written. |
-| `events:subscribe` | Subscribe to `agent.status.changed` and `worktree.removed`. |
+| `workspace:read` | 명령과 대시보드가 현재 워크트리를 해석할 수 있도록 플러그인 워크스페이스 컨텍스트(터미널 핸들)를 읽습니다. 플러그인은 제목으로 포커스를 추측하지 않습니다. |
+| `terminal:send` | 터미널 텍스트/Enter 전송 의도를 선언합니다. 이것이 없으면 내부 RPC 전송기가 시작되지 않으며, 명령 등록과 진단은 계속 동작합니다. |
+| `notifications:show` | 토글/일시정지/재개/상태 명령의 피드백, 그리고 Orca 내장 브라우저를 열 수 없을 때 대시보드 URL 대체 수단에 사용됩니다. |
+| `storage` | 호스트 저장소 키(`state-v1`은 제어용, `epochs-v1`은 재로드 epoch 기억용) 아래에 플러그인 상태를 영속화합니다. Orca 자체 설정은 절대 쓰지 않습니다. |
+| `events:subscribe` | `agent.status.changed`와 `worktree.removed`를 구독합니다. |
 
-`terminal:send` is a declaration, not a sandbox: the plugin's direct filesystem/socket
-access is not mediated by it. See [Limits and risks](#limits-and-risks).
+`terminal:send`는 샌드박스가 아니라 선언입니다: 플러그인의 직접 파일시스템/소켓
+접근은 이로써 중재되지 않습니다. [한계와 위험](#한계와-위험)을 참고하세요.
 
-### Commands and keybindings
+### 명령과 단축키
 
-Open the command palette with **⌘J** on macOS or **Ctrl+Shift+J** on
-Linux/Windows, then type `Cache Keepalive`. The manifest contributes eight
-commands:
+macOS에서는 **⌘J**, Linux/Windows에서는 **Ctrl+Shift+J**로 명령 팔레트를 열고
+`Cache Keepalive`를 입력합니다. 매니페스트는 여덟 개의 명령을 제공합니다:
 
-| Command id | Title | Context |
+| 명령 id | 제목 | 컨텍스트 |
 |---|---|---|
 | `keepalive-open` | Cache Keepalive: Open Dashboard | global |
 | `keepalive-toggle-pause` | Cache Keepalive: Pause/Resume All | global |
@@ -266,108 +252,101 @@ commands:
 | `keepalive-worktree-off` | Cache Keepalive: Turn Off for Current Worktree | worktree |
 | `keepalive-status` | Cache Keepalive: Show Status | global |
 
-Keybindings declared in the manifest:
+매니페스트에 선언된 단축키:
 
-- **Mod+Alt+O** → `keepalive-open` (opens the dashboard).
-- **Mod+Alt+P** → `keepalive-toggle-pause` (pause/resume all).
-- **Mod+Alt+K** → `keepalive-toggle-worktree` (toggle the current worktree).
+- **Mod+Alt+O** → `keepalive-open` (대시보드를 엽니다).
+- **Mod+Alt+P** → `keepalive-toggle-pause` (전체 일시정지/재개).
+- **Mod+Alt+K** → `keepalive-toggle-worktree` (현재 워크트리 토글).
 
-Orca runs plugin keybindings only when focus is on Orca's own UI, such as the sidebar. They do nothing while the cursor is in a terminal, a text field, the dashboard, or this plugin's panel, so click the sidebar first.
+Orca는 포커스가 사이드바처럼 Orca 자체 UI에 있을 때만 플러그인 단축키를 실행합니다.
+커서가 터미널, 텍스트 필드, 대시보드, 또는 이 플러그인 패널에 있으면 동작하지 않으므로
+먼저 사이드바를 클릭하세요.
 
-The three `context: worktree` commands are inactive while no worktree is active.
-They only change the current worktree when the plugin workspace context resolves
-to exactly one worktree; otherwise they tell you to use the dashboard. Plugins do
-not intercept the app's own Cmd/Ctrl-J command UI.
+`context: worktree`인 세 명령은 활성 워크트리가 없으면 비활성입니다. 플러그인
+워크스페이스 컨텍스트가 정확히 하나의 워크트리로 해석될 때만 현재 워크트리를 바꾸며,
+그렇지 않으면 대시보드를 사용하라고 안내합니다. 플러그인은 앱 자체의 Cmd/Ctrl-J 명령
+UI를 가로채지 않습니다.
 
-**Cache Keepalive: Show Status** posts a multi-line notification. The first line is
-the global state: `켜짐` or `꺼짐(일시정지)`, the Orca prompt-cache timer state
+**Cache Keepalive: Show Status**는 여러 줄 알림을 게시합니다. 첫 줄은 전역 상태:
+`켜짐` 또는 `꺼짐(일시정지)`, Orca 프롬프트 캐시 타이머 상태
 (`타이머 켜짐(5분)` / `타이머 켜짐(1시간)` / `Orca 프롬프트 캐시 타이머 꺼짐` /
-`앱 타이머 설정 알 수 없음`), the runtime connection state, and `워크트리 N개`.
-Each following line is one worktree:
+`앱 타이머 설정 알 수 없음`), 런타임 연결 상태, 그리고 `워크트리 N개`입니다.
+이후 각 줄은 워크트리 하나입니다:
 
-- `▶ ` marks the worktree of the terminal that invoked the command, when the
-  current worktree can be resolved (it is shown first).
-- The worktree's **cache state** is appended using the same symbol rule as the tab
-  title (`⚡` kept, `💤` no cache being kept, `⚠️` review) together with the counts
-  `유지 중 N · 만료 M · 확인 필요 K`. The worktree's own setting (`켜짐` / `꺼짐`,
-  `(기본값)` / `(직접 설정)`) is shown separately, so a worktree that is switched on
-  but has no cache being kept is not labelled kept. The cache segment is omitted when
-  no terminal in the worktree is on.
-- While the global pause is active, a worktree that is switched on shows
-  `켜짐(일시정지 중)` instead of `켜짐`.
-- `다음 전송 … 후` shows the next scheduled send for that worktree as a relative
-  time (for example `다음 전송 3분 12초 후`). It is omitted when nothing applies.
-- If the text would exceed 900 characters, trailing worktrees are dropped and the
-  message ends with `… 외 N개`.
+- `▶ `는 현재 워크트리를 해석할 수 있을 때 명령을 호출한 터미널의 워크트리를
+  표시합니다(맨 먼저 표시됨).
+- 워크트리의 **캐시 상태**는 탭 제목과 같은 기호 규칙(`⚡` 유지, `💤` 유지 중인 캐시
+  없음, `⚠️` 확인 필요)으로, 개수 `유지 중 N · 만료 M · 확인 필요 K`와 함께
+  덧붙습니다. 워크트리 자체 설정(`켜짐` / `꺼짐`, `(기본값)` / `(직접 설정)`)은 따로
+  표시되므로, 켜져 있어도 유지 중인 캐시가 없는 워크트리는 유지로 표시되지 않습니다.
+  워크트리에서 켜진 터미널이 하나도 없으면 캐시 구간은 생략됩니다.
+- 전역 일시정지가 활성인 동안 켜져 있는 워크트리는 `켜짐` 대신 `켜짐(일시정지 중)`을
+  보여줍니다.
+- `다음 전송 … 후`는 그 워크트리의 다음 예약 전송을 상대 시간으로 보여줍니다
+  (예: `다음 전송 3분 12초 후`). 해당 사항이 없으면 생략됩니다.
+- 텍스트가 900자를 넘으면 뒤쪽 워크트리를 버리고 메시지를 `… 외 N개`로 끝냅니다.
 
-The notification shows the worktree display name and terminal title from the
-snapshot; the plugin does not add raw worktree ids, paths, or tokens (a terminal title
-you set yourself is shown as-is).
+알림에는 스냅숏의 워크트리 표시 이름과 터미널 제목이 표시되며, 플러그인은 원시
+worktree id, 경로, 토큰을 추가하지 않습니다(직접 설정한 터미널 제목은 그대로
+표시됩니다).
 
-## Where to find the controls
+## 제어 수단 위치
 
-| Surface | How to open | What it is for |
+| 표면 | 여는 방법 | 용도 |
 |---|---|---|
-| Sidebar panel | Orca right sidebar activity bar → **zap** icon (panel `keepalive-panel`, entry `panel/index.html`) | Read-only orientation: current worktree name and terminal count, plus the command and terminal-command cheat sheets. See [Sidebar panel](#sidebar-panel) for why it cannot show live state. |
-| Command palette | **⌘J** (macOS) / **Ctrl+Shift+J** (Linux/Windows), then type `Cache Keepalive` | All eight commands above: open dashboard, toggle/pause/resume, per-worktree on/off, show status. |
-| Dashboard | **Cache Keepalive: Open Dashboard** (or **Mod+Alt+O**) | Worktree/terminal toggles, global pause, reset budget, clear "needs review", settings form. |
-| Terminal CLI | `node ~/.orca-cache-keepalive/keepalive.mjs <command>` | Scriptable status and toggles from any Orca terminal, including per-worktree `here`. |
-| Settings switch | **Settings > Plugins > Cache Keepalive** | Turn the whole plugin (worker) on/off. |
+| 사이드바 패널 | Orca 오른쪽 사이드바 activity bar → **zap** 아이콘(패널 `keepalive-panel`, 항목 `panel/index.html`) | 읽기 전용 안내: 현재 워크트리 이름과 터미널 수, 명령·터미널 명령 치트시트. 실시간 상태를 보여줄 수 없는 이유는 [사이드바 패널](#사이드바-패널)을 참고하세요. |
+| 명령 팔레트 | **⌘J**(macOS) / **Ctrl+Shift+J**(Linux/Windows) 후 `Cache Keepalive` 입력 | 위 여덟 개 명령 전부: 대시보드 열기, 토글/일시정지/재개, 워크트리별 on/off, 상태 표시. |
+| 대시보드 | **Cache Keepalive: Open Dashboard**(또는 **Mod+Alt+O**) | 워크트리/터미널 토글, 전역 일시정지, 예산 초기화, "확인 필요" 해제, 설정 폼. |
+| 터미널 CLI | `node ~/.orca-cache-keepalive/keepalive.mjs <command>` | 모든 Orca 터미널에서 상태와 토글을 스크립트로 제어하며, 워크트리별 `here` 포함. |
+| 설정 스위치 | **설정 > Plugins > Cache Keepalive** | 플러그인(worker) 전체를 켜고 끕니다. |
 
-The only place that changes plugin-wide state is one of the in-plugin controls
-(palette, dashboard, CLI). The Settings switch disables the plugin itself, and
-the Orca app timer under **Settings > Agents > Prompt Cache Timer** is a separate
-Orca setting the plugin only reads.
+플러그인 전역 상태를 바꾸는 유일한 곳은 플러그인 내부 제어 수단(팔레트, 대시보드,
+CLI) 중 하나입니다. 설정 스위치는 플러그인 자체를 비활성화하고, **설정 > 에이전트 >
+프롬프트 캐시 타이머** 아래의 Orca 앱 타이머는 플러그인이 읽기만 하는 별도의 Orca
+설정입니다.
 
-### Sidebar panel
+### 사이드바 패널
 
-The `keepalive-panel` panel is a **sandboxed iframe**. In Orca 1.4.214 the only
-host APIs a panel can call are `workspace.readContext`, `terminal.sendText`, and
-`notifications.show`; panel storage reads/writes, command execution, worker
-messaging, network access (`connect-src 'none'`), and navigation are all blocked.
-Because live keepalive state and toggles would need those blocked APIs, the panel
-**cannot show or change keepalive state**. It deliberately does not call
-`terminal.sendText` either.
+`keepalive-panel` 패널은 **샌드박스 iframe**입니다. Orca 1.4.214에서 패널이 호출할 수
+있는 호스트 API는 `workspace.readContext`, `terminal.sendText`,
+`notifications.show`뿐이며, 패널 저장소 읽기/쓰기, 명령 실행, worker 메시징, 네트워크
+접근(`connect-src 'none'`), navigation은 모두 차단됩니다. 실시간 keepalive 상태와
+토글은 그 차단된 API가 필요하므로 패널은 **keepalive 상태를 표시하거나 변경할 수
+없습니다**. 의도적으로 `terminal.sendText`도 호출하지 않습니다.
 
-What the panel actually does: the **새로고침 (Refresh)** button reads the current
-worktree through `workspace.readContext` and shows its display name/branch and
-terminal count (permission, rate-limit, timeout and unavailable errors each get a
-plain-language message). It lists the palette commands and terminal commands with
-copy buttons that fall back to selecting the text when the clipboard API is not
-available. Live status and toggles live in the dashboard, palette commands, and
-terminal CLI instead.
+패널이 실제로 하는 일: **새로고침 (Refresh)** 버튼이 `workspace.readContext`로 현재
+워크트리를 읽어 표시 이름/브랜치와 터미널 수를 보여줍니다(권한, 속도 제한, 타임아웃,
+사용 불가 오류는 각각 평이한 메시지를 표시). 팔레트 명령과 터미널 명령을 복사 버튼과
+함께 나열하며, 클립보드 API를 쓸 수 없으면 텍스트 선택으로 대체됩니다. 실시간 상태와
+토글은 대시보드, 팔레트 명령, 터미널 CLI에 있습니다.
 
-### Terminal CLI
+### 터미널 CLI
 
-When the plugin is active, the worker starts the dashboard server and writes a
-control file so a plain `node` CLI can reach it. The CLI itself is copied to a
-stable path:
+플러그인이 활성이면 worker가 대시보드 서버를 시작하고, 평범한 `node` CLI가 접근할 수
+있도록 제어 파일을 작성합니다. CLI 자체는 안정적인 경로로 복사됩니다:
 
-- Control directory: `~/.orca-cache-keepalive/` — created `0700`.
-- Control file: `~/.orca-cache-keepalive/control.json` — written `0600`, and
-  removed on shutdown. It contains the worker `pid`, the `127.0.0.1` port, and the
-  bearer token.
-- CLI copy: `~/.orca-cache-keepalive/keepalive.mjs` (`0700`).
+- 제어 디렉터리: `~/.orca-cache-keepalive/` — `0700`으로 생성.
+- 제어 파일: `~/.orca-cache-keepalive/control.json` — `0600`으로 작성하며, 종료 시
+  제거됩니다. worker `pid`, `127.0.0.1` 포트, bearer 토큰을 담습니다.
+- CLI 복사본: `~/.orca-cache-keepalive/keepalive.mjs`(`0700`).
 
-The CLI talks to the loopback dashboard API using the control file's port/token.
-`here` hashes `ORCA_WORKTREE_ID` the same way the snapshot does (sha256, first 16
-hex) to find the current worktree, and the dashboard API exposes that value as a
-per-worktree `worktreeHash` plus a `worktree-orca` action for setting a worktree
-by raw Orca id. Commands (`node bin/keepalive.mjs help` in a clone shows the same
-text):
+CLI는 제어 파일의 포트/토큰으로 루프백 대시보드 API와 통신합니다. `here`는 스냅숏과
+같은 방식(sha256, 앞 16 hex)으로 `ORCA_WORKTREE_ID`를 해시해 현재 워크트리를 찾고,
+대시보드 API는 그 값을 워크트리별 `worktreeHash`로, 그리고 원시 Orca id로 워크트리를
+설정하는 `worktree-orca` 동작으로 노출합니다. 명령(클론에서
+`node bin/keepalive.mjs help`도 같은 텍스트를 보여줍니다):
 
-| Command | What it does |
+| 명령 | 하는 일 |
 |---|---|
-| `status [--json]` | Show the current state (this is also the default with no arguments). `--json` prints a machine-readable summary. |
-| `on` / `off` | Turn all keepalive on / pause it (global pause). |
-| `here [on\|off\|default]` | Show or set the worktree of the Orca terminal you are running in. Uses `ORCA_WORKTREE_ID`, so it must run inside an Orca terminal. |
-| `worktree <number\|label> <on\|off\|default>` | Set a specific worktree by its 1-based `status` number or exact label. |
-| `url` | Print the dashboard URL, **including the token**, and warn not to share it. |
-| `help` | Print usage. |
+| `status [--json]` | 현재 상태를 표시합니다(인수 없이 실행하는 기본 동작이기도 함). `--json`은 기계가 읽을 수 있는 요약을 출력합니다. |
+| `on` / `off` | 모든 keepalive를 켜거나 일시정지합니다(전역 일시정지). |
+| `here [on\|off\|default]` | 실행 중인 Orca 터미널의 워크트리를 표시하거나 설정합니다. `ORCA_WORKTREE_ID`를 사용하므로 반드시 Orca 터미널 안에서 실행해야 합니다. |
+| `worktree <number\|label> <on\|off\|default>` | 1부터 시작하는 `status` 번호나 정확한 레이블로 특정 워크트리를 설정합니다. |
+| `url` | **토큰을 포함한** 대시보드 URL을 출력하고 공유하지 말라고 경고합니다. |
+| `help` | 사용법을 출력합니다. |
 
-Exit codes: `0` success, `1` error, `2` usage error (or `here` run outside an
-Orca terminal, when the plugin is running), `3` the plugin is not running (stale
-or missing control file).
+종료 코드: `0` 성공, `1` 오류, `2` 사용법 오류(또는 플러그인 실행 중 Orca 터미널
+밖에서 `here`를 실행한 경우), `3` 플러그인 미실행(제어 파일이 오래되었거나 없음).
 
 ```sh
 node ~/.orca-cache-keepalive/keepalive.mjs status
@@ -376,7 +355,7 @@ node ~/.orca-cache-keepalive/keepalive.mjs here off
 alias keepalive='node ~/.orca-cache-keepalive/keepalive.mjs'
 ```
 
-On Windows use the profile path:
+Windows에서는 프로필 경로를 사용합니다:
 
 ```powershell
 node %USERPROFILE%\.orca-cache-keepalive\keepalive.mjs status
@@ -384,289 +363,274 @@ node %USERPROFILE%\.orca-cache-keepalive\keepalive.mjs status
 
 ---
 
-## Dashboard
+## 대시보드
 
-**Cache Keepalive: Open Dashboard** asks Orca to open the already-running loopback
-HTTP server in Orca's built-in browser (`browser.tabCreate`, `placement: server`).
-The server itself starts during plugin activation (see [Terminal CLI](#terminal-cli)).
-If the browser cannot be opened, the command shows the URL in a notification so you
-can open it manually. While the server is starting, the command waits up to 5 seconds.
+**Cache Keepalive: Open Dashboard**는 Orca 내장 브라우저(`browser.tabCreate`,
+`placement: server`)에서 이미 실행 중인 루프백 HTTP 서버를 열도록 요청합니다. 서버
+자체는 플러그인 활성화 중에 시작됩니다([터미널 CLI](#터미널-cli) 참고). 브라우저를 열
+수 없으면 명령이 URL을 알림으로 보여주어 직접 열 수 있습니다. 서버가 시작되는 동안
+명령은 최대 5초 기다립니다.
 
-Server properties:
+서버 속성:
 
-- Listens on **`127.0.0.1` only**, with an ephemeral port and a fresh 256-bit random
-  token on each process start.
-- The token travels in the URL **fragment** (`http://127.0.0.1:<port>/#token=...`).
-  The page moves it into `sessionStorage` and erases the fragment. Every API request
-  must send it as `Authorization: Bearer <token>`.
-- Host/Origin are validated, plus a strict Content-Security-Policy. There is no
-  arbitrary file or RPC proxy endpoint.
+- **`127.0.0.1`에서만** 수신하며, 임시 포트와 프로세스 시작마다 새로 만든 256비트 난수
+  토큰을 씁니다.
+- 토큰은 URL **fragment**(`http://127.0.0.1:<port>/#token=...`)로 전달됩니다. 페이지가
+  이를 `sessionStorage`로 옮기고 fragment를 지웁니다. 모든 API 요청은
+  `Authorization: Bearer <token>`으로 보내야 합니다.
+- Host/Origin이 검증되고 엄격한 Content-Security-Policy가 적용됩니다. 임의 파일이나
+  RPC 프록시 엔드포인트는 없습니다.
 
-What you can do in the dashboard:
+에이전트가 실행되지 않은 일반 터미널(plain shell)은 대시보드 목록에 표시하지
+않습니다. 그 터미널에서 에이전트가 시작되면 다시 표시됩니다.
 
-- **Worktree toggle:** on / off / (default). The button label distinguishes an explicit
-  setting from an inherited default.
-- **기본값으로 (revert to default):** removes an explicit worktree override.
-- **Terminal toggle:** on / off / inherit (per terminal).
-- **Global pause / resume.**
-- **Reset budget ("횟수 초기화"):** zeroes the consecutive counter for one target.
-- **Clear "needs review":** acknowledges an uncertain send after you have checked the
-  terminal input line. It does not delete text or press Enter again.
-- **Settings form** (see below). Changes apply only after you press **저장 (Save)**.
-- **Diagnostics list:** the most recent events (up to 20). Each row shows the time,
-  level, and affected target as `worktree / terminal title`, a short Korean description,
-  and the original `event · code` in small text. Logs store only a hashed target; the
-  dashboard resolves the hash back to a label from the current catalog and falls back to
-  `#` plus the first six hash characters when no live terminal matches it.
+대시보드에서 할 수 있는 일:
 
-The dashboard keeps the **keepalive setting** and the **cache state** separate, so "the
-setting is on" is not read as "a cache is being kept". Each worktree and terminal row
-shows `유지 설정 켜짐/꺼짐` (whether the worktree/terminal policy allows keepalives)
-alongside a cache state phrase:
+- **워크트리 토글:** on / off / (기본값). 버튼 레이블이 직접 설정과 상속된 기본값을
+  구분합니다.
+- **기본값으로 (revert to default):** 직접 설정한 워크트리 재정의를 제거합니다.
+- **터미널 토글:** on / off / 상속(터미널별).
+- **전역 일시정지 / 재개.**
+- **예산 초기화("횟수 초기화"):** 한 대상의 연속 카운터를 0으로 만듭니다.
+- **"확인 필요" 해제:** 터미널 입력 줄을 확인한 뒤 불확실한 전송을 승인 처리합니다.
+  텍스트를 지우거나 Enter를 다시 누르지 않습니다.
+- **설정 폼**(아래 참고). 변경은 **저장 (Save)**을 누른 뒤에만 적용됩니다.
+- **진단 목록:** 가장 최근 이벤트(최대 20개). 각 행은 시각, 수준, 영향을 받은 대상을
+  `worktree / terminal title`로, 짧은 한국어 설명, 그리고 작은 글씨로 원본
+  `event · code`를 보여줍니다. 로그에는 해시된 대상만 저장되며, 대시보드는 현재
+  카탈로그에서 해시를 레이블로 되돌리고 일치하는 라이브 터미널이 없으면 `#`와 해시 앞
+  6자를 대신 보여줍니다.
 
-- `캐시 유지 중 · 작업 진행 중` — a turn was observed and is still running.
-- `캐시 유지 중 · 만료 예정 HH:MM` — a valid reservation exists.
-- `캐시 유지 중 · 유지 메시지 전송 중` / `캐시 유지 중 · 작업 시작 확인 중` — a
-  keepalive is being submitted / its turn start is being confirmed.
-- `캐시 만료됨 · HH:MM · <last recorded send block reason>` — the estimate passed.
-- `예약 없음 · …` — no valid reservation (this includes the scheduler's 10-second
-  safety stop and the initial "no turn observed yet" state).
-- `유지 중단 · …` — automatic keeping stopped (for example a permission/input wait).
-- `확인 필요 · 전송 결과를 확인하세요` — a send needs review.
+대시보드는 **keepalive 설정**과 **캐시 상태**를 분리해 두므로 "설정이 켜짐"이 "캐시가
+유지되는 중"으로 읽히지 않습니다. 각 워크트리와 터미널 행은 `유지 설정
+켜짐/꺼짐`(워크트리/터미널 정책이 keepalive를 허용하는지)을 캐시 상태 문구와 함께
+보여줍니다:
 
-Two honesty notes appear with these phrases. **Expiry times are an estimate** from the
-observed work and the configured TTL, not a reading of Anthropic's cache. The reason
-shown with an expiry is the **last recorded send block reason**, not a confirmed cause
-of expiry — see the DRAFT_PRESENT example under [Limits and risks](#limits-and-risks).
+- `캐시 유지 중 · 작업 진행 중` — 턴이 관찰되었고 아직 실행 중입니다.
+- `캐시 유지 중 · 만료 예정 HH:MM` — 유효한 예약이 있습니다.
+- `캐시 유지 중 · 유지 메시지 전송 중` / `캐시 유지 중 · 작업 시작 확인 중` —
+  keepalive를 제출 중이거나 그 턴 시작을 확인 중입니다.
+- `캐시 만료됨 · HH:MM · <마지막으로 기록된 전송 차단 사유>` — 추정 시각이 지났습니다.
+- `예약 없음 · …` — 유효한 예약이 없습니다(스케줄러의 10초 안전 정지와 초기 "아직
+  관찰된 턴 없음" 상태 포함).
+- `유지 중단 · …` — 자동 유지가 중단되었습니다(예: 권한/입력 대기).
+- `확인 필요 · 전송 결과를 확인하세요` — 전송을 검토해야 합니다.
 
-The top of the page shows the app timer state, runtime connection state and global
-pause state. The first screen also notes: *"메시지는 사용량을 소비하고 대화 기록에
-남습니다. 입력 감지는 제한적입니다."* (messages consume usage and remain in the
-conversation; input detection is limited).
+이 문구들과 함께 정직성에 관한 두 가지 설명이 표시됩니다. **만료 시각은 추정치**로,
+관찰된 작업과 설정된 TTL에서 나온 것이지 Anthropic 캐시를 읽은 값이 아닙니다. 만료와
+함께 표시되는 사유는 **마지막으로 기록된 전송 차단 사유**이지 확인된 만료 원인이
+아닙니다. [한계와 위험](#한계와-위험)의 DRAFT_PRESENT 예시를 참고하세요.
 
-### Settings fields
+페이지 상단에는 앱 타이머 상태, 런타임 연결 상태, 전역 일시정지 상태가 표시됩니다.
+첫 화면에는 *"메시지는 사용량을 소비하고 대화 기록에 남습니다. 입력 감지는
+제한적입니다."* 라는 안내도 있습니다(메시지는 사용량을 소비하고 대화에 남으며 입력
+감지는 제한적입니다).
 
-These are the `DEFAULT_CONFIG` fields. The dashboard form edits a subset of them
-(marked below); the rest are stored defaults / internal policy.
+### 설정 필드
 
-| Field | Default | Meaning |
+다음은 `DEFAULT_CONFIG` 필드입니다. 대시보드 폼은 그중 일부(아래 표시)를 편집하고,
+나머지는 저장된 기본값/내부 정책입니다.
+
+| 필드 | 기본값 | 의미 |
 |---|---|---|
-| `schemaVersion` | `2` | Config schema version. A stored config at version `1` is migrated to `2` on load (see [Config migration (v1 → v2)](#config-migration-v1--v2)). |
-| `runtimeUserDataPath` | `null` | Optional explicit Orca user-data directory. Editable in the form. `null` means auto-detect. |
-| `paused` | `false` | Plugin-global pause. Controlled by the pause button, not a text field. |
-| `defaultWorktreeEnabled` | `true` | Default state for worktrees without an explicit override. Editable in the form. |
-| `message` | `Cache keepalive. Reply only OK; do not use tools or continue previous work.` | Single-line message, 1–512 UTF-8 bytes, no control characters/newlines. Editable in the form. |
-| `margin5mMs` | `60000` | Margin before expiry for a 5-minute TTL (30000–120000 ms). Form edits it in **seconds**. |
-| `margin1hMs` | `120000` | Margin before expiry for a 1-hour TTL (60000–600000 ms). Form edits it in **seconds**. |
-| `quietOutputMs` | `2500` | Required output-quiet time before sending (2500–60000 ms). Editable in the form. |
-| `observedInputQuietMs` | `30000` | Wait after an observed draft change before sending (10000–300000 ms). Not in the form. |
-| `maxConsecutiveKeepalives5m` | `8` | Consecutive keepalive cap for a 5-minute TTL; `0` = unlimited (0–1000). Editable in the form as **연속 keepalive 상한 (5분 TTL)**. |
-| `maxConsecutiveKeepalives1h` | `3` | Consecutive keepalive cap for a 1-hour TTL; `0` = unlimited (0–1000). Editable in the form as **연속 keepalive 상한 (1시간 TTL)**. |
-| `respectCwarmDisabled` | `true` | Honor `~/.claude/cwarm.disabled`. Editable in the form. |
-| `tabTitleIndicator` | `true` | Prefix the Orca tab title of Claude terminals with a cache state symbol (`⚡` kept / `💤` no cache being kept / `⚠️` review). Editable in the form as **탭 이름에 캐시 상태 표시**. See [Tab title cache state indicator](#tab-title-cache-state-indicator). |
-| `logLevel` | `info` | Diagnostic level. Not in the form. |
+| `schemaVersion` | `2` | Config 스키마 버전. 저장된 config가 버전 `1`이면 로드 시 `2`로 마이그레이션됩니다([설정 마이그레이션 (v1 → v2)](#설정-마이그레이션-v1--v2) 참고). |
+| `runtimeUserDataPath` | `null` | 선택적 Orca 사용자 데이터 디렉터리 명시. 폼에서 편집 가능. `null`은 자동 감지를 뜻합니다. |
+| `paused` | `false` | 플러그인 전역 일시정지. 일시정지 버튼으로 제어하며 텍스트 필드가 아닙니다. |
+| `defaultWorktreeEnabled` | `true` | 명시적 재정의가 없는 워크트리의 기본 상태. 폼에서 편집 가능. |
+| `message` | `Cache keepalive. Reply only OK; do not use tools or continue previous work.` | 한 줄 메시지, 1–512 UTF-8 바이트, 제어 문자/줄바꿈 불가. 폼에서 편집 가능. |
+| `margin5mMs` | `60000` | 5분 TTL의 만료 전 여유(30000–120000 ms). 폼에서는 **초** 단위로 편집합니다. |
+| `margin1hMs` | `120000` | 1시간 TTL의 만료 전 여유(60000–600000 ms). 폼에서는 **초** 단위로 편집합니다. |
+| `quietOutputMs` | `2500` | 전송 전 필요한 출력 조용 시간(2500–60000 ms). 폼에서 편집 가능. |
+| `observedInputQuietMs` | `30000` | 관찰된 초안 변경 후 전송 전 대기(10000–300000 ms). 폼에는 없음. |
+| `maxConsecutiveKeepalives5m` | `8` | 5분 TTL의 연속 keepalive 상한. `0` = 무제한(0–1000). 폼에서 **연속 keepalive 상한 (5분 TTL)** 로 편집 가능. |
+| `maxConsecutiveKeepalives1h` | `3` | 1시간 TTL의 연속 keepalive 상한. `0` = 무제한(0–1000). 폼에서 **연속 keepalive 상한 (1시간 TTL)** 로 편집 가능. |
+| `respectCwarmDisabled` | `true` | `~/.claude/cwarm.disabled`를 존중. 폼에서 편집 가능. |
+| `tabTitleIndicator` | `true` | Claude 터미널의 Orca 탭 제목 앞에 캐시 상태 기호를 붙임(`⚡` 유지 / `💤` 유지 중인 캐시 없음 / `⚠️` 확인 필요). 폼에서 **탭 이름에 캐시 상태 표시**로 편집 가능. [탭 제목 캐시 상태 표시](#탭-제목-캐시-상태-표시) 참고. |
+| `logLevel` | `info` | 진단 수준. 폼에는 없음. |
 
-Time and counter fields are validated on the server; a rejected value is not applied.
+시간과 카운터 필드는 서버에서 검증하며, 거부된 값은 적용되지 않습니다.
 
-### Config migration (v1 → v2)
+### 설정 마이그레이션 (v1 → v2)
 
-Stored configs at `schemaVersion: 1` are migrated to `2` when they are loaded, and the
-migrated config is written back to plugin storage immediately (a single save). A config
-that is already version `2` is not rewritten on load.
+`schemaVersion: 1`인 저장 config는 로드될 때 `2`로 마이그레이션되고, 마이그레이션된
+config는 즉시 플러그인 저장소에 다시 기록됩니다(1회 저장). 이미 버전 `2`인 config는
+로드 시 다시 쓰지 않습니다.
 
-- The old single key `maxConsecutiveKeepalives` is split. If it was `3` (the old
-  default) the new defaults `8` / `3` are used instead; otherwise that value is
-  copied into **both** new keys. Sending the legacy key `maxConsecutiveKeepalives`
-  in a config patch is still accepted and applies the same value to both keys, so
-  older clients stay compatible.
-- `tabTitleIndicator` is turned **on** once during the upgrade, because the old
-  default (`false`) cannot be told apart from a user who had deliberately turned it
-  off. If you do not want the cache state symbols, turn it off again in the dashboard.
-  A config patch applied while the stored config is still version `1` does **not**
-  force it on; the stored value is kept.
+- 기존 단일 키 `maxConsecutiveKeepalives`를 분리합니다. 값이 `3`(옛 기본값)이면 새
+  기본값 `8`/`3`을 대신 사용하고, 그렇지 않으면 그 값을 새 키 **두 개 모두**에
+  복사합니다. config patch로 레거시 키 `maxConsecutiveKeepalives`를 보내는 것은
+  여전히 허용되며 두 키에 같은 값을 적용하므로, 구버전 클라이언트도 호환됩니다.
+- `tabTitleIndicator`는 업그레이드 중 한 번 **켜집니다**. 옛 기본값(`false`)과
+  사용자가 의도적으로 끈 값을 구분할 수 없기 때문입니다. 캐시 상태 기호를 원하지
+  않으면 대시보드에서 다시 끄세요. 저장 config가 아직 버전 `1`일 때 적용한 config
+  patch는 강제로 켜지 않으며, 저장된 값이 유지됩니다.
 
-After the upgrade the config is version `2` and stays that way, so editing settings in
-the stored config directly (see [Tab title cache state
-indicator](#tab-title-cache-state-indicator)) keeps working. An **older** plugin version
-that reads a version `2` config may reject it as `unsupported_schema`, so downgrading
-needs care.
+업그레이드 후 config는 버전 `2`가 되어 그대로 유지되므로, 저장된 config의 설정을 직접
+편집하는 것([탭 제목 캐시 상태 표시](#탭-제목-캐시-상태-표시) 참고)도 계속 동작합니다.
+버전 `2` config를 읽는 **이전** 플러그인 버전은 이를 `unsupported_schema`로 거부할 수
+있으므로 다운그레이드에 주의해야 합니다.
 
-### Change notifications
+### 변경 알림
 
-Changing state from the **dashboard** (browser) or the **terminal CLI**
-(`keepalive ...`) posts an Orca notification describing what changed. Both paths go
-through the same `POST /api/action` dispatch, so the wording is identical, and it
-shows only the worktree display name and terminal title from the snapshot — never a
-raw worktree id, path, or token. Examples:
+**대시보드**(브라우저)나 **터미널 CLI**(`keepalive ...`)에서 상태를 바꾸면 무엇이
+바뀌었는지 설명하는 Orca 알림이 게시됩니다. 두 경로 모두 같은 `POST /api/action`
+디스패치를 거치므로 문구가 동일하며, 스냅숏의 워크트리 표시 이름과 터미널 제목만
+표시하고 원시 worktree id, 경로, 토큰은 절대 넣지 않습니다. 예:
 
-- `main: keepalive 켜짐` / `main: keepalive 꺼짐` for a worktree, and
-  `main: 기본값 사용 (현재 켜짐)` when reverting to the default.
-- `main / claude #1: keepalive 켜짐` / `main / claude #1: 상속(현재 꺼짐)` for a
-  terminal.
-- `모든 keepalive를 껐습니다(일시정지).` / `모든 keepalive를 켰습니다.` for the
-  global pause.
-- Turning a scope on while the global pause is active appends
-  ` (전체 일시정지 중)`, because the on state is stored but not yet effective.
+- 워크트리의 경우 `main: keepalive 켜짐` / `main: keepalive 꺼짐`, 기본값으로 되돌릴 때
+  `main: 기본값 사용 (현재 켜짐)`.
+- 터미널의 경우 `main / claude #1: keepalive 켜짐` /
+  `main / claude #1: 상속(현재 꺼짐)`.
+- 전역 일시정지의 경우 `모든 keepalive를 껐습니다(일시정지).` /
+  `모든 keepalive를 켰습니다.`.
+- 전역 일시정지가 활성인데 범위를 켜면 켜짐 상태는 저장되지만 아직 유효하지 않으므로
+  ` (전체 일시정지 중)`이 덧붙습니다.
 
-Notifications are best-effort: if showing one fails, the change itself still
-succeeds. The palette commands (`keepalive-toggle-pause`,
-`keepalive-toggle-worktree`, and so on) post their own messages and do not use this
-path. `config`, `reset-budget`, and `clear-review` actions do not notify.
+알림은 최선 노력 방식입니다: 표시에 실패해도 변경 자체는 성공합니다. 팔레트 명령
+(`keepalive-toggle-pause`, `keepalive-toggle-worktree` 등)은 자체 메시지를 게시하며 이
+경로를 쓰지 않습니다. `config`, `reset-budget`, `clear-review` 동작은 알리지 않습니다.
 
-### Tab title cache state indicator
+### 탭 제목 캐시 상태 표시
 
-The setting **탭 이름에 캐시 상태 표시** (`tabTitleIndicator`, default **on**) prefixes
-a cache state symbol to the Orca tab title of Claude terminals:
+설정 **탭 이름에 캐시 상태 표시**(`tabTitleIndicator`, 기본 **켜짐**)는 Claude 터미널의
+Orca 탭 제목 앞에 캐시 상태 기호를 붙입니다:
 
-| Symbol | Meaning |
+| 기호 | 의미 |
 |---|---|
-| `⚡ ` | A cache is being kept: a turn is running, a reservation is scheduled, or a keepalive is being sent / its turn start is being confirmed. |
-| `💤 ` | No cache is being kept by the plugin right now: expired, no reservation, or automatic keeping stopped (for example a permission/input wait). This means "no automatic keepalive reservation", not necessarily that Anthropic's cache is gone. |
-| `⚠️ ` | A send result needs review / confirmation. |
-| (none) | The indicator is off, or keepalive does not apply to this tab. |
+| `⚡ ` | 캐시 유지 중: 턴이 실행 중이거나, 예약이 잡혀 있거나, keepalive를 전송 중이거나 그 턴 시작을 확인 중입니다. |
+| `💤 ` | 지금 플러그인이 유지하는 캐시가 없음: 만료, 예약 없음, 또는 자동 유지 중단(예: 권한/입력 대기). "자동 keepalive 예약 없음"을 뜻하며 Anthropic 캐시가 반드시 사라졌다는 뜻은 아닙니다. |
+| `⚠️ ` | 전송 결과를 검토/확인해야 함. |
+| (없음) | 표시가 꺼져 있거나 이 탭에 keepalive가 적용되지 않음. |
 
-The tab title is what Kanban (workspace board) cards show on the agent rows, so the
-symbol is visible there too.
+탭 제목은 칸반(워크스페이스 보드) 카드가 에이전트 행에 표시하는 것이므로, 기호가
+거기에도 보입니다.
 
-A tab can contain several panes. Only the panes where keepalive is **on** for that tab
-are combined, and the highest priority wins: **⚠️ > ⚡ > 💤**. So if one pane needs
-review the tab shows ⚠️, and if any pane is keeping a cache the tab shows ⚡ rather than
-💤. The per-pane details stay in the dashboard.
+한 탭에 pane이 여러 개일 수 있습니다. 그 탭에서 keepalive가 **켜진** pane만 합치고
+우선순위가 가장 높은 것이 이깁니다: **⚠️ > ⚡ > 💤**. 따라서 한 pane이 검토를 필요로
+하면 탭은 ⚠️를, 어느 pane이든 캐시를 유지 중이면 탭은 💤 대신 ⚡를 보여줍니다.
+pane별 세부 정보는 대시보드에 남습니다.
 
-A symbol is only decided while keepalive applies. The plugin stops showing it (and
-returns the tab to Orca's automatic name) when the plugin is globally paused, the Orca
-prompt-cache timer is off or unreadable, the runtime is disconnected, the worktree or
-terminal policy is off, the consecutive-keepalive cap is reached, or — when
-`respectCwarmDisabled` is on — `~/.claude/cwarm.disabled` exists. Within an on tab the
-per-pane cache state is what selects ⚡ vs 💤.
+기호는 keepalive가 적용될 때만 정해집니다. 플러그인이 전역 일시정지이거나, Orca
+프롬프트 캐시 타이머가 꺼져 있거나 읽을 수 없거나, 런타임 연결이 끊겼거나,
+워크트리/터미널 정책이 꺼져 있거나, 연속 keepalive 상한에 도달했거나,
+`respectCwarmDisabled`가 켜져 있을 때 `~/.claude/cwarm.disabled`가 존재하면 기호
+표시를 멈추고(탭을 Orca 자동 이름으로 되돌림) 표시하지 않습니다. 켜진 탭 안에서는
+pane별 캐시 상태가 ⚡와 💤를 선택합니다.
 
-Same-symbol rule: while the symbol does not change, the plugin does **not** rewrite the
-title. In particular it no longer refreshes the title on every completed turn. As a
-result, if you let the agent (or Orca) auto-generate the tab title, a new automatic
-title can appear late — it is not rewritten while the same symbol is shown. The title is
-only rewritten when the symbol changes, including the first application and a retry
-after a failed rename.
+같은 기호 규칙: 기호가 바뀌지 않는 동안 플러그인은 제목을 **다시 쓰지 않습니다**.
+특히 턴이 완료될 때마다 제목을 갱신하지 않습니다. 그 결과 에이전트(또는 Orca)가 탭
+제목을 자동 생성하게 두면 새 자동 제목이 늦게 나타날 수 있습니다. 같은 기호가 표시되는
+동안에는 다시 쓰지 않기 때문입니다. 제목은 기호가 바뀔 때만 다시 쓰이며, 최초 적용과
+이름 변경 실패 후 재시도도 포함됩니다.
 
-The option is on by default. To change it:
+이 옵션은 기본적으로 켜져 있습니다. 변경하려면:
 
-- Dashboard → **설정** form → check or clear **탭 이름에 캐시 상태 표시** → **저장
-  (Save)**. This sends a `{ "type": "config", "patch": { "tabTitleIndicator": true } }`
-  (or `false`) action, and the value is stored in the plugin config alongside the other
-  settings. After an upgrade from version 1 the option is on once (see
-  [Config migration (v1 → v2)](#config-migration-v1--v2)); clear it here if you do not
-  want the symbols.
-- Or set `tabTitleIndicator` in the stored plugin config directly. There is no CLI
-  command that edits config. (The next load migrates a version `1` config to version
-  `2` and turns the indicator on once — see
-  [Config migration (v1 → v2)](#config-migration-v1--v2); after that the stored value
-  is used as is.)
+- 대시보드 → **설정** 폼 → **탭 이름에 캐시 상태 표시**를 선택 또는 해제 → **저장
+  (Save)**. 그러면 `{ "type": "config", "patch": { "tabTitleIndicator": true } }`
+  (또는 `false`) 동작을 보내고, 값은 다른 설정과 함께 플러그인 config에 저장됩니다.
+  버전 1에서 업그레이드하면 옵션이 한 번 켜집니다([설정 마이그레이션 (v1 →
+  v2)](#설정-마이그레이션-v1--v2) 참고). 기호를 원하지 않으면 여기서 해제하세요.
+- 또는 저장된 플러그인 config에서 `tabTitleIndicator`를 직접 설정합니다. config를
+  편집하는 CLI 명령은 없습니다. (다음 로드에서 버전 `1` config가 버전 `2`로
+  마이그레이션되고 표시가 한 번 켜집니다 — [설정 마이그레이션 (v1 →
+  v2)](#설정-마이그레이션-v1--v2) 참고. 이후에는 저장된 값을 그대로 사용합니다.)
 
-When the option is on, the plugin sets the tab's `customTitle` through the Orca
-`terminal.rename` RPC. A symbol change replaces the previous symbol (including a title
-where several symbols were repeated) in one rename instead of clearing and re-applying.
-The plugin removes the symbol when the option is turned off, when keepalive no longer
-applies, or when the plugin shuts down, returning the tab to Orca's automatic name. A
-failed rename is retried on the next tick; after three consecutive failures a tab is
-skipped for the rest of that run.
+옵션이 켜져 있으면 플러그인은 Orca `terminal.rename` RPC로 탭의 `customTitle`을
+설정합니다. 기호가 바뀌면 이전 기호(여러 기호가 반복된 제목 포함)를 지우고 다시
+적용하는 대신 한 번의 rename으로 교체합니다. 옵션을 끄거나, keepalive가 더 이상
+적용되지 않거나, 플러그인이 종료될 때 기호를 제거해 탭을 Orca 자동 이름으로
+되돌립니다. 이름 변경 실패는 다음 tick에 재시도하며, 연속 3회 실패하면 그 탭은 이번
+실행이 끝날 때까지 건너뜁니다.
 
-Known limitations (read before enabling):
+알려진 한계(활성화 전에 읽어보세요):
 
-- A custom tab name you set **before** a symbol was applied is not restored. The symbol
-  is written as `⚡ <your name>` (or `💤`/`⚠️`), and turning the option off clears the
-  custom title, so the tab ends up with Orca's automatic name. Rename the tab again
-  afterwards if you need that name.
-- Orca's `session.tabs.list` reports the terminal's runtime title (OSC/PTY), not the
-  custom title, so the plugin cannot tell whether a tab's current name is one you set
-  yourself. A tab you rename **while** a symbol is applied can therefore have your name
-  cleared when the option is turned off, when the symbol changes, or when the plugin
-  shuts down. The tab then gets Orca's automatic name (or `<symbol> <automatic name>`);
-  rename it again afterwards if you need that name.
-- While a symbol is applied, Orca's automatic tab-title generation for that tab stops.
-  Because the plugin no longer refreshes on every turn, a new automatic title may only
-  appear when the symbol changes (for example after expiry). The tab title can flicker
-  when a symbol change is applied.
-- Orca stores the tab title, so an abnormal exit can leave a symbol behind on a tab. On
-  the next start the plugin removes a leftover symbol when the option is off; when the
-  option is on it re-applies the symbol only where the conditions above hold (saved
-  records from the previous run are treated as unconfirmed, so the symbol is rewritten
-  with the current terminal handle). A leftover symbol **without** a saved record is
-  replaced only when a known symbol is visible in the queried title; if no record and no
-  visible symbol can be found, the plugin cannot identify the tab and does not clean it
-  up. It never resets arbitrary tab titles.
-- Split panes in the same tab share one tab title. The combined symbol is shown for the
-  tab.
-- This is a best-effort integration over Orca internals. Failures are swallowed
-  (reported only as safe diagnostic codes), and a tab is skipped for the rest of the
-  current run after three consecutive failures.
+- 기호가 적용되기 **전에** 직접 설정한 사용자 지정 탭 이름은 복원되지 않습니다. 기호는
+  `⚡ <내 이름>`(또는 `💤`/`⚠️`)으로 기록되고, 옵션을 끄면 사용자 지정 제목이 지워져
+  탭은 Orca 자동 이름이 됩니다. 그 이름이 필요하면 이후에 탭 이름을 다시 바꾸세요.
+- Orca의 `session.tabs.list`는 터미널의 런타임 제목(OSC/PTY)을 보고하며 사용자 지정
+  제목은 보고하지 않으므로, 플러그인은 탭의 현재 이름이 직접 설정한 것인지 판별할 수
+  없습니다. 따라서 기호가 적용된 **동안** 이름을 바꾼 탭은 옵션을 끄거나, 기호가
+  바뀌거나, 플러그인이 종료될 때 그 이름이 지워질 수 있습니다. 그러면 탭은 Orca 자동
+  이름(또는 `<기호> <자동 이름>`)이 되며, 그 이름이 필요하면 이후에 다시 바꾸세요.
+- 기호가 적용되는 동안에는 그 탭에 대한 Orca의 자동 탭 제목 생성이 멈춥니다.
+  플러그인이 매 턴마다 갱신하지 않으므로 새 자동 제목은 기호가 바뀔 때(예: 만료 후)만
+  나타날 수 있습니다. 기호 변경이 적용될 때 탭 제목이 깜빡일 수 있습니다.
+- Orca는 탭 제목을 저장하므로 비정상 종료로 탭에 기호가 남을 수 있습니다. 다음 시작 시
+  옵션이 꺼져 있으면 잔여 기호를 제거하고, 켜져 있으면 위 조건이 성립하는 곳에만 기호를
+  다시 적용합니다(이전 실행에서 저장된 기록은 미확정으로 취급하므로 현재 터미널
+  핸들로 기호를 다시 씁니다). 저장된 기록이 **없는** 잔여 기호는 조회된 제목에서 알려진
+  기호가 보일 때만 교체되며, 기록도 없고 보이는 기호도 없으면 플러그인이 탭을 식별할
+  수 없어 정리하지 않습니다. 임의의 탭 제목을 초기화하지는 않습니다.
+- 같은 탭의 분할 pane은 탭 제목 하나를 공유합니다. 합쳐진 기호가 그 탭에 표시됩니다.
+- 이는 Orca 내부에 대한 최선 노력 통합입니다. 실패는 삼켜지고(안전한 진단 코드로만
+  보고) 연속 3회 실패 후에는 그 탭을 현재 실행이 끝날 때까지 건너뜁니다.
 
 ---
 
-## Limits and risks
+## 한계와 위험
 
-Read this section before enabling the plugin.
+플러그인을 활성화하기 전에 이 섹션을 읽어보세요.
 
-- **It depends on Orca internals, not a public plugin API.** To do its job the plugin
-  reads Orca's internal runtime RPC socket metadata (`orca-runtime.json`) and the
-  active profile's SQLite state (`profile-state.db`), **read-only**. These are not
-  part of the public plugin API and may change in any Orca update. The declared
-  `engines: ">=1.4.214"` is only a minimum gate; it does not guarantee that future
-  internal shapes keep working. If a required shape is missing, the plugin stops
-  sending instead of falling back.
-- **Every keepalive is a real user message.** It consumes model tokens/usage and
-  stays in the conversation transcript. There is no "free" keepalive.
-- **Draft detection is best-effort.** "Draft" is inferred from the terminal screen
-  emulator, not from input events. There is an unavoidable race between the final
-  draft check and pressing Enter. If a user types in that window, the message can
-  merge with their input. The plugin never sends Esc/Ctrl-U/Ctrl-C and never restores
-  a draft for you.
-- **The expiry cause is the last recorded send block reason, not a confirmed cause.**
-  The dashboard shows the last reason a send was blocked before an expected expiry, and
-  the tab/dashboard notes call it exactly that. It can be wrong for the real expiry
-  cause. Known example: Orca can read Claude Code's dimmed prompt suggestion as a
-  draft, so the plugin records `DRAFT_PRESENT` ("a draft was detected") even though the
-  input line is empty. Treat the reason as a hint, not a diagnosis.
-- **The scheduler stops sending 10 seconds before the expected expiry.** During that
-  window the dashboard shows `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 HH:MM` rather
-  than "kept". The state changes to `캐시 만료됨` only after the expected expiry time
-  passes; the two are intentionally not the same moment.
-- **A leftover tab symbol with no saved record may remain.** Orca stores tab titles,
-  and `session.tabs.list` does not expose the custom title, so if a symbol is left
-  behind after an abnormal exit and no saved record or visible symbol can be found, the
-  plugin cannot identify the tab and does not clear it. See
-  [Tab title cache state indicator](#tab-title-cache-state-indicator).
-- **Unknown means "do not send".** Missing agent identity, unknown wait state,
-  unreadable screen, or a truncated terminal list all result in refusal, not a
-  best-guess send. This favors protecting your input over maximizing cache warmth.
-- **No real Orca E2E has been run here.** The automated suite runs against a fake
-  Orca runtime; it does not prove the plugin works against a real Orca desktop. See
-  [docs/TESTING.md](docs/TESTING.md) for the status and a manual checklist.
-- **App-setting changes are not instantaneous.** Orca debounces settings writes
-  (about 1–5 s plus queueing), so turning the app timer off may not be observed by the
-  plugin immediately. Use the plugin's **global pause** for immediate stop. Bytes that
-  already reached Orca cannot be recalled.
-- **The dashboard token is stored in a plain file in your home directory.** For
-  the terminal CLI to work, the worker writes the bearer token to
-  `~/.orca-cache-keepalive/control.json` with mode `0600` (directory `0700`).
-  Any other process running as the same OS user can therefore read the token and
-  call the dashboard API — the same trust boundary as Orca's own runtime metadata.
-  On Windows POSIX modes do not apply, so protection relies on the user profile's
-  ACL. Treat the `url` output and the control file like a credential.
-- **The dashboard server listens whenever the plugin is active.** The loopback
-  server starts as part of plugin activation and stays up on `127.0.0.1` until the
-  plugin is disabled or the worker stops; it is not tied to the Open Dashboard
-  command. Pausing keepalive stops sends but does not stop the server.
-- **No cache-hit proof.** The plugin reports "message sent / turn started observed";
-  it does not verify that Anthropic's cache actually hit or that any billing was saved.
-- **The plugin API is experimental.** This plugin targets `pluginApi 1`, which may
-  change.
+- **공개 플러그인 API가 아니라 Orca 내부에 의존합니다.** 작업을 수행하기 위해
+  플러그인은 Orca 내부 런타임 RPC 소켓 메타데이터(`orca-runtime.json`)와 활성
+  프로필의 SQLite 상태(`profile-state.db`)를 **읽기 전용**으로 읽습니다. 이들은 공개
+  플러그인 API의 일부가 아니며 어떤 Orca 업데이트에서든 바뀔 수 있습니다. 선언된
+  `engines: ">=1.4.214"`는 최소 게이트일 뿐이며, 미래의 내부 구조가 계속 동작함을
+  보장하지 않습니다. 필요한 구조가 없으면 플러그인은 대체 동작으로 넘어가지 않고
+  전송을 멈춥니다.
+- **모든 keepalive는 실제 사용자 메시지입니다.** 모델 토큰/사용량을 소비하고 대화
+  기록에 남습니다. "공짜" keepalive는 없습니다.
+- **초안 감지는 최선 노력 방식입니다.** "초안"은 입력 이벤트가 아니라 터미널 화면
+  에뮬레이터에서 추정합니다. 마지막 초안 검사와 Enter 입력 사이에는 피할 수 없는
+  경쟁이 있습니다. 그 창에서 사용자가 입력하면 메시지가 사용자 입력과 섞일 수
+  있습니다. 플러그인은 Esc/Ctrl-U/Ctrl-C를 보내지 않고 초안을 대신 복원하지도
+  않습니다.
+- **만료 원인은 마지막으로 기록된 전송 차단 사유이지 확인된 원인이 아닙니다.**
+  대시보드는 예상 만료 전에 전송이 차단된 마지막 사유를 보여주며, 탭/대시보드
+  안내도 정확히 그렇게 부릅니다. 실제 만료 원인과 다를 수 있습니다. 알려진 예:
+  Orca가 Claude Code의 흐린 프롬프트 제안을 초안으로 읽어 입력 줄이 비어 있는데도
+  플러그인이 `DRAFT_PRESENT`("초안이 감지됨")를 기록할 수 있습니다. 사유는 진단이
+  아니라 힌트로 취급하세요.
+- **스케줄러는 예상 만료 10초 전에 전송을 멈춥니다.** 그 구간에는 대시보드가 "유지
+  중" 대신 `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 HH:MM`을 보여줍니다.
+  상태는 예상 만료 시각이 지난 뒤에야 `캐시 만료됨`으로 바뀝니다. 둘은 의도적으로
+  같은 순간이 아닙니다.
+- **저장된 기록이 없는 잔여 탭 기호가 남을 수 있습니다.** Orca는 탭 제목을 저장하고
+  `session.tabs.list`는 사용자 지정 제목을 노출하지 않으므로, 비정상 종료 후 기호가
+  남았는데 저장된 기록이나 보이는 기호도 없으면 플러그인이 탭을 식별할 수 없어 지우지
+  못합니다. [탭 제목 캐시 상태 표시](#탭-제목-캐시-상태-표시)를 참고하세요.
+- **불확실하면 "보내지 않음"입니다.** 에이전트 정체성 누락, 알 수 없는 대기 상태, 읽을
+  수 없는 화면, 잘린 터미널 목록은 모두 추측 전송이 아니라 거부로 이어집니다. 이는
+  캐시 유지 최대화보다 입력 보호를 우선합니다.
+- **여기서 실제 Orca E2E는 실행되지 않았습니다.** 자동화 스위트는 가짜 Orca 런타임에
+  대해 실행되며, 실제 Orca 데스크톱에서 동작함을 증명하지 않습니다. 상태와 수동
+  체크리스트는 [docs/TESTING.md](docs/TESTING.md)를 참고하세요.
+- **앱 설정 변경은 즉각적이지 않습니다.** Orca는 설정 쓰기를 디바운스하므로(약
+  1–5초에 큐잉 추가) 앱 타이머를 꺼도 플러그인이 즉시 관찰하지 못할 수 있습니다. 즉시
+  중지하려면 플러그인의 **전역 일시정지**를 사용하세요. 이미 Orca에 도달한 바이트는
+  되돌릴 수 없습니다.
+- **대시보드 토큰은 홈 디렉터리의 평문 파일에 저장됩니다.** 터미널 CLI가 동작하려면
+  worker가 bearer 토큰을 `~/.orca-cache-keepalive/control.json`에 모드
+  `0600`(디렉터리 `0700`)으로 씁니다. 따라서 같은 OS 사용자로 실행되는 다른 프로세스가
+  토큰을 읽고 대시보드 API를 호출할 수 있습니다. 이는 Orca 자체 런타임 메타데이터와
+  같은 신뢰 경계입니다. Windows에서는 POSIX 모드가 적용되지 않아 보호가 사용자
+  프로필 ACL에 의존합니다. `url` 출력과 제어 파일을 자격 증명처럼 다루세요.
+- **대시보드 서버는 플러그인이 활성인 동안 항상 수신합니다.** 루프백 서버는 플러그인
+  활성화의 일부로 시작되어 플러그인을 비활성화하거나 worker가 중지될 때까지
+  `127.0.0.1`에서 계속 열려 있습니다. Open Dashboard 명령과는 무관합니다. keepalive를
+  일시정지하면 전송은 멈추지만 서버는 멈추지 않습니다.
+- **캐시 적중 증거는 없습니다.** 플러그인은 "메시지 전송됨 / 턴 시작 관찰됨"을 보고할
+  뿐, Anthropic 캐시가 실제로 적중했는지나 청구가 절약되었는지는 검증하지 않습니다.
+- **플러그인 API는 실험적입니다.** 이 플러그인은 바뀔 수 있는 `pluginApi 1`을
+  대상으로 합니다.
 
-If you need atomic input protection (host-owned keepalive with an input revision),
-that is not achievable with the current Orca API. See DESIGN.md §12 for the proposed
-upstream contract. The current implementation is offered as an experimental release.
+원자적 입력 보호(입력 리비전이 있는 호스트 소유 keepalive)가 필요하다면, 이는 현재
+Orca API로는 달성할 수 없습니다. 제안된 업스트림 계약은 DESIGN.md §12를 참고하세요.
+현재 구현은 실험적 릴리스로 제공됩니다.
 
 ---
 
-## Repository layout
+## 저장소 구조
 
 ```text
 orca-plugin.json     manifest
@@ -683,123 +647,5 @@ docs/TESTING.md      how to test
 docs/PUBLISHING.md   how to release and install from Git
 ```
 
-No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22.5).
-
----
-
-## 한국어 요약
-
-- **무엇:** Orca에서 Claude 터미널이 턴을 마친 뒤, 프롬프트 캐시 TTL 만료 직전에
-  짧은 keepalive 메시지를 보내 캐시를 유지하는 커뮤니티 실험 플러그인입니다.
-- **조건:** Orca의 "설정 > 에이전트 > 프롬프트 캐시 타이머"가 켜져 있어야 하며,
-  대상이 `claude` 에이전트·로컬 호스트·연결된 PTY이고, 초안 없음·출력 조용·
-  권한/대기 아님일 때만 보냅니다. 판정 불가는 전송하지 않습니다.
-- **타이밍:** 캐시 기준 시각(`basisAt`) 기준 5분 TTL은 `basisAt+TTL-60초`, 1시간 TTL은
-  `basisAt+TTL-120초`. `basisAt`은 턴의 마지막 `working` 이벤트 수신 시각(≈마지막 API 요청
-  시작)입니다. Anthropic 규칙상 TTL은 캐시를 읽거나 쓴 요청의 시작부터 흐르고 응답 생성
-  시간도 TTL을 소모합니다. 도구별 working 이벤트가 없거나 완료 시각(`doneAt`)과 3분 넘게
-  차이 나면 `doneAt`을 씁니다. 캐시 epoch당 최대 1회만 보내고, 마감이 지나면 따라잡지 않습니다.
-- **보존:** 마지막으로 관측한 만료 이력(예상 만료 시각과 마지막 전송 차단 사유)은 플러그인·
-  Orca를 재시작해도 저장 키 `epochs-v1`(envelope **v2**)에 유지됩니다. 다음 실제 작업이
-  시작되면 지워지고, 그 전이라도 만료 후 **24시간**이 지나면 지워집니다. 이 이력은 표시
-  전용이라 전송 예약으로 되살아나지 않습니다. 이전 버전으로 다운그레이드하면 v2 저장소를
-  복원하지 못하며, 업데이트 이전에 이미 사라진 이력은 복구할 수 없습니다.
-- **상한:** TTL별로 두 값 `maxConsecutiveKeepalives5m`(기본 8)·
-  `maxConsecutiveKeepalives1h`(기본 3)를 저장합니다(0=무제한, 0~1000). 5분 TTL에서는 약
-  4분 간격으로 마지막 실제 턴 이후 약 37분, 1시간 TTL에서는 약 58분 간격으로 약 3시간
-  유지됩니다. 현재 Orca 타이머 TTL에 해당하는 상한을 적용하고, TTL을 알 수 없으면 두 값 중
-  작은 쪽을 적용합니다. 대시보드 설정 폼에서 두 값을 따로 편집하며, 터미널 행 `연속 x/상한 y`는
-  현재 TTL 기준 상한을 보여줍니다. 자체 전송이 아닌 새 working 턴이
-  관측되면 카운터가 자동 초기화됩니다. 카운터는 TTL별로 따로가 아니라 터미널마다 하나로,
-  TTL과 무관하게 공유됩니다. 예를 들어 5분 TTL로 여러 번 보낸 뒤 Orca 타이머 TTL을 1시간으로
-  바꾸면 공유 카운터가 이미 1시간 상한(기본 3)에 도달해, 다음 실제 작업 턴이 카운터를 초기화할
-  때까지 그 터미널에서는 더 보내지 않습니다. `~/.claude/cwarm.disabled`를 존중합니다.
-- **설정 마이그레이션(v1→v2):** 저장된 v1 설정은 로드 시 v2로 변환되고 그 결과가 즉시 1회
-  저장됩니다(이미 v2인 저장값은 다시 쓰지 않음). 기존 저장값 `maxConsecutiveKeepalives`가 옛
-  기본값 3이면 새 기본값(8/3)을 쓰고, 3이 아니면 그 값을 두 키에 복사합니다. patch에 레거시 키를
-  보내면 두 키에 같은 값이 적용됩니다(호환). 업그레이드 시 `tabTitleIndicator`가 한 번 켜집니다
-  (옛 기본 false와 사용자가 끈 값을 구분할 수 없기 때문). 다만 저장값이 아직 v1일 때 적용하는
-  patch 경로에서는 강제로 켜지 않고 저장된 값을 유지합니다. 원치 않으면 대시보드에서 다시 끄면
-  됩니다. 새 버전 설정(v2)을 이전 버전 플러그인이 읽으면 `unsupported_schema`로 거부될 수
-  있으므로 다운그레이드에 주의하세요.
-- **설치/업데이트:** 이 저장소 자체가 커뮤니티 marketplace입니다. Orca 설정 >
-  Plugins > Manage sources에서 Git URL에
-  `https://github.com/RunaticMoon/orca-keepalive-plugin.git`, Git ref에 `main`을
-  넣고 추가한 뒤 Cache Keepalive를 설치합니다. 이후 **Refresh → Check for update →
-  변경 확인 및 적용**으로 업데이트합니다. 새로고침만으로 자동 설치되지는 않습니다.
-  기존 Git URL/로컬 설치는 자동 전환되지 않으며, 전환을 위해 삭제·재설치할 경우
-  먼저 설정을 백업하세요(실제 전환은 미검증). Git URL 직접 설치와 Development 폴더
-  등록도 계속 지원합니다.
-- **권한 5개:** workspace:read, terminal:send, notifications:show, storage,
-  events:subscribe.
-- **명령 8개 + 단축키:** 팔레트는 ⌘J(macOS)/Ctrl+Shift+J(Linux/Windows)로 열고
-  "Cache Keepalive" 입력. keepalive-open(Mod+Alt+O),
-  keepalive-toggle-pause(Mod+Alt+P), keepalive-pause, keepalive-resume,
-  keepalive-toggle-worktree(Mod+Alt+K), keepalive-worktree-on,
-  keepalive-worktree-off, keepalive-status. worktree 명령은 활성 워크트리가 없으면
-  비활성입니다.
-- **UI 진입점:** 오른쪽 사이드바 activity bar의 번개(zap) 아이콘 패널(읽기 전용),
-  명령 팔레트, 대시보드, 터미널 CLI, Settings > Plugins의 플러그인 on/off 스위치.
-- **사이드바 패널:** sandboxed iframe이라 Orca 1.4.214에서 호출 가능한 host API가
-  `workspace.readContext`·`terminal.sendText`·`notifications.show`뿐이고 storage·
-  명령 실행·worker 메시지·네트워크·navigation이 막혀 있어 **실시간 상태·토글은 표시할
-  수 없습니다**. 현재 워크트리 이름/터미널 수와 명령·터미널 명령 안내만 보여줍니다.
-- **터미널 CLI:** 플러그인이 켜지면 worker가 대시보드 서버를 시작하고
-  `~/.orca-cache-keepalive/control.json`(디렉터리 0700·파일 0600, pid·127.0.0.1 포트·
-  토큰)을 쓰며 CLI를 `~/.orca-cache-keepalive/keepalive.mjs`로 복사합니다. 종료 시
-  제어 파일을 삭제합니다. 명령: `status [--json]`, `on`, `off`,
-  `here [on|off|default]`(Orca 터미널 안에서만), `worktree <번호|label> <on|off|default>`,
-  `url`, `help`. 종료 코드 0/1/2/3(3=플러그인 미실행).
-  예: `node ~/.orca-cache-keepalive/keepalive.mjs status`.
-- **상태 요약(Show Status 명령):** 첫 줄에 전역 상태(켜짐/꺼짐(일시정지) · 타이머 ·
-  연결 · 워크트리 N개), 이후 워크트리별 한 줄(현재 `▶`, 설정 `켜짐`/`꺼짐` +
-  `(기본값)`/`(직접 설정)`, 캐시 상태 기호와 `유지 중 N · 만료 M · 확인 필요 K`,
-  일시정지 중 `켜짐(일시정지 중)`, `다음 전송 … 후`)을 보여줍니다. 기호는 설정값이 아니라
-  켜진 터미널의 실제 캐시 상태로만 붙습니다. 900자를 넘으면 `… 외 N개`로 줄입니다. 원시
-  worktreeId·경로·토큰은 넣지 않습니다.
-- **변경 알림:** 대시보드나 터미널 CLI로 상태를 바꾸면(예: `main: keepalive 켜짐`,
-  `main / claude #1: keepalive 꺼짐`, `모든 keepalive를 껐습니다(일시정지).`) Orca
-  알림이 표시됩니다. 문구에는 스냅숏의 워크트리 표시 이름과 터미널 제목만 쓰고 원시
-  worktreeId·경로·토큰은 넣지 않습니다. 전역 일시정지 중 켜기는 `(전체 일시정지 중)`이
-  붙고, config·예산 초기화·확인 필요 해제는 알리지 않습니다. 팔레트 명령은 자체 문구를
-  씁니다.
-- **탭 캐시 상태 표시:** 설정 `tabTitleIndicator`(기본 켜짐, 설정 이름 **탭 이름에 캐시 상태
-  표시**)가 켜져 있으면 Claude 탭 이름 앞에 캐시 상태 기호를 붙여 칸반(워크스페이스) 보드
-  카드에서도 보입니다. `⚡ ` 캐시 유지 중(작업 중·예약됨·전송 중·작업 시작 확인 중),
-  `💤 ` 유지 중인 캐시 없음(만료·예약 없음·권한/입력 대기 등 자동 유지 중단), `⚠️ ` 전송
-  결과 확인 필요, 기호 없음 = keepalive 꺼짐입니다. 한 탭에 pane이 여러 개면 켜진 pane만
-  모아 **⚠️ > ⚡ > 💤** 순서로 하나를 고릅니다. 같은 기호가 유지되는 동안에는 제목을 다시
-  쓰지 않으므로(턴 완료 때마다 갱신하지 않음), 에이전트가 만든 자동 제목이 늦게 반영될 수
-  있습니다. 기호는 전체 일시정지 아님 + Orca 앱 타이머 켜짐 + 런타임 연결됨 + 해당
-  워크트리/터미널 정책 켜짐(연속 전송 상한 도달 등으로 일시 해제될 수 있음) +
-  (`respectCwarmDisabled`일 때) `cwarm.disabled` 없음일 때만 정해집니다. 대시보드 설정에서
-  체크/해제한 뒤 저장하거나 저장된 config 값으로 바꿉니다(CLI의 config 명령은 없음). v1에서
-  업그레이드하면 옵션이 한 번 켜지므로 원치 않으면 대시보드에서 끄면 됩니다. rename 실패는
-  다음 주기에 재시도하고, 연속 실패가 상한(3회)에 달하면 그 탭은 이번 실행 동안 건너뜁니다.
-  조건이 안 맞거나 끄면, 플러그인 종료 시 Orca 자동 이름으로 되돌립니다. 비정상 종료 뒤 남은
-  기호는 다음 시작 시 옵션이 꺼져 있으면 제거되고, 켜져 있으면 조건에 맞는 탭에 새 handle로
-  재적용됩니다(이전 실행 기록은 미확정으로 취급). `session.tabs.list` title로는 수동 변경을
-  판별할 수 없어, 기호가 붙어 있는 동안 직접 이름을 바꾼 탭도 플러그인이 덮어쓰거나 해제할
-  수 있습니다(끄기·기호 변경·재시작 후 재적용·플러그인 종료 시). 반대로 기호가 붙기 **전에**
-  직접 지정한 탭 이름은 복원되지 않고 끄면 Orca 자동 이름이 됩니다. 기록도 없고 조회된
-  제목에도 기호가 보이지 않는 잔여물은 식별할 수 없어 자동 정리하지 않습니다. 한계: 기호가
-  붙은 동안 Orca 자동 제목 갱신이 멈추고, 같은 기호에서는 제목을 다시 쓰지 않아 새 자동
-  제목이 늦게 보일 수 있으며, 같은 탭 분할 창은 이름을 공유합니다.
-- **대시보드:** Orca 내장 브라우저로 열리며 127.0.0.1 루프백 + URL fragment 토큰으로
-  인증합니다. 워크트리/터미널 on/off/기본값, 전역 일시정지/재개, 예산 초기화,
-  "확인 필요" 해제, 설정 편집(저장 버튼)을 제공합니다. 각 행은 keepalive 설정
-  (`유지 설정 켜짐/꺼짐`)과 별도로 캐시 상태 문구(캐시 유지 중 · …, 캐시 만료됨 · …,
-  예약 없음 · …, 유지 중단 · …, 확인 필요 · …)를 보여줍니다. 만료 시각은 관측한 작업과
-  설정 TTL 기준의 **예상**이고, 만료 사유는 실제 원인이 아니라 **마지막으로 기록된 전송
-  차단 사유**입니다. 서버는 Open Dashboard와 무관하게 플러그인 활성화 동안 계속
-  127.0.0.1에서 대기합니다.
-- **한계(정직하게):** 공개 플러그인 API만으로는 불가능해 Orca 내부 런타임 RPC
-  소켓과 프로필 SQLite를 읽기 전용으로 사용하므로 Orca 업데이트로 깨질 수 있습니다.
-  대시보드 토큰은 사용자 홈의 0600 파일에 저장되므로 같은 OS 사용자로 실행되는
-  프로세스는 API를 호출할 수 있습니다(Windows는 POSIX 모드가 없어 프로필 ACL에
-  의존). keepalive 한 번은 실제 메시지로 토큰/사용량을 소모하고 대화에 남습니다. 초안
-  검출은 화면 기반 추정이라 마지막 검사와 Enter 사이 경쟁이 남고, "입력창 초안 감지"
-  같은 차단 사유는 오판일 수 있습니다(예: Orca가 Claude Code의 흐린 프롬프트 제안을
-  초안으로 오인해 DRAFT_PRESENT로 기록). scheduler는 실제 만료 10초 전에 전송을 멈추며,
-  그 구간은 `예약 없음 · 안전 전송 시간이 지남`으로 표시합니다. 실제 Orca E2E는 아직
-  미검증이며 pluginApi 1은 실험적입니다.
+`dependencies`/`devDependencies`는 없고, 테스트 러너는 `node --test`입니다
+(Node >=22.5).
