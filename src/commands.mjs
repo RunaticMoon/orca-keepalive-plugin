@@ -232,7 +232,7 @@ function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, contro
           NOTIFICATION_TITLE,
           paused
             ? '모든 keepalive를 껐습니다(일시정지).'
-            : '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+            : '모든 keepalive를 켰습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
         )
       }),
 
@@ -267,13 +267,13 @@ function createHandlers({ notifySafe, timeoutMs, statusWorktreeTimeoutMs, contro
         await notifySafe(NOTIFICATION_TITLE, '모든 keepalive를 일시정지했습니다.')
       }),
 
-    /** 전역 재개(멱등). budget/앱 timer off를 무시하지 않는다. */
+    /** 전역 재개(멱등). budget(연속 상한)을 무시하지 않는다. */
     [COMMAND_IDS.resume]: () =>
       withGuard(async () => {
         await controller.setPaused(false)
         await notifySafe(
           NOTIFICATION_TITLE,
-          'keepalive를 재개했습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+          'keepalive를 재개했습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
         )
       }),
 
