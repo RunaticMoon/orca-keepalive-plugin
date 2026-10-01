@@ -122,7 +122,7 @@ function createFakeCoordinator() {
         userDataKey: null,
         profileId: null,
         connection: { state: 'starting', reason: null },
-        appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null },
+        profileSettings: { known: false, source: null, readAt: null, reason: null },
         worktrees: [],
       }
     },
