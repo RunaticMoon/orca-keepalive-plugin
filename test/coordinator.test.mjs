@@ -796,27 +796,97 @@ test('assertAllowed: target generation 변경을 반영한다', async () => {
   assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
 })
 
-test('assertAllowed: 전송 시작 뒤 config TTL이 바뀌면 STALE_TARGET으로 거절한다', async () => {
+test('assertAllowed: 전송 시작 뒤 config TTL이 바뀌면 다음 gate에서 STALE_TARGET으로 거절한다', async () => {
   const h = createHarness()
   const gates = []
   h.setSendBehavior(async (args) => {
+    // gate1(예약 전): 전송 시작 시점의 TTL(5분)로는 허용된다.
+    const first = await args.assertAllowed()
+    gates.push(first)
+    if (first.allowed !== true) {
+      // 전제가 깨졌으면 조용히 넘어가지 않고 그대로 드러낸다.
+      return {
+        kind: 'skipped',
+        reason: first.reason ?? 'GATE1',
+        attemptId: null,
+        at: h.clock.now(),
+        framesSent: 0,
+      }
+    }
+    // 예약 단계(guarded-send 3단계): attempt를 만들고 상태에 반영한다.
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
     // 전송이 시작된 뒤(예: 다른 tick에서 설정 변경) TTL을 1시간으로 바꾼다.
     await h.store.updateConfig({ claudeCacheTtlMs: 3600000 })
-    gates.push(await args.assertAllowed())
-    return {
-      kind: 'skipped',
-      reason: 'STALE_TARGET',
-      attemptId: null,
-      at: h.clock.now(),
-      framesSent: 0,
+    // gate2(예약 후, paste 전): 시작 시점 TTL과 달라졌으므로 거절된다.
+    const second = await args.assertAllowed()
+    gates.push(second)
+    if (second.allowed !== true) {
+      await args.journal.refuseAttempt(attemptId)
+      return {
+        kind: 'refused',
+        reason: second.reason ?? 'STALE_TARGET',
+        attemptId,
+        at: h.clock.now(),
+        framesSent: 0,
+      }
     }
+    return { kind: 'submitted', reason: null, attemptId, at: h.clock.now(), framesSent: 0 }
   })
   await startHarness(h)
   await arm(h, h.clock.now())
   await advanceToDue(h)
 
-  assert.equal(gates.length, 1)
-  assert.deepEqual(gates[0], { allowed: false, reason: 'STALE_TARGET' })
+  // 시작 시점 TTL로 gate1은 허용되고, 진행 중 TTL 변경 뒤 같은 전송의 다음 gate는 거절된다.
+  assert.equal(gates.length, 2)
+  assert.deepEqual(gates[0], { allowed: true, reason: null })
+  assert.deepEqual(gates[1], { allowed: false, reason: 'STALE_TARGET' })
+
+  // 거절은 paste 전에 확정돼 attempt가 폐기되고(중복 전송 없음) 다음 턴을 기다린다.
+  assert.equal(h.sendCalls.length, 1)
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h).reason, 'STALE_TARGET')
+  assert.deepEqual(h.spy.confirmAttempt, [])
+  assert.equal(h.store.getBudget(SCOPE).charged, 0)
+})
+
+test('assertAllowed: config TTL이 바뀌지 않으면 모든 gate를 허용한다', async () => {
+  const h = createHarness()
+  const gates = []
+  h.setSendBehavior(async (args) => {
+    const first = await args.assertAllowed()
+    gates.push(first)
+    const attemptId = await args.journal.reserveAttempt(args.target, args.epochId, h.clock.now())
+    args.onPhase?.('reserved', { attemptId, at: h.clock.now() })
+    const second = await args.assertAllowed()
+    gates.push(second)
+    if (second.allowed !== true) {
+      await args.journal.refuseAttempt(attemptId)
+      return {
+        kind: 'refused',
+        reason: second.reason ?? 'GATE2',
+        attemptId,
+        at: h.clock.now(),
+        framesSent: 0,
+      }
+    }
+    // 실제 전송처럼 paste/submitted 단계까지 진행한다.
+    await args.journal.recordAttempt(attemptId, 'pasted')
+    args.onPhase?.('pasted', { attemptId })
+    await args.journal.recordAttempt(attemptId, 'submitted')
+    const at = h.clock.now()
+    args.onPhase?.('submitted', { attemptId, at })
+    return { kind: 'submitted', reason: null, attemptId, at, framesSent: 2 }
+  })
+  await startHarness(h)
+  await arm(h, h.clock.now())
+  await advanceToDue(h)
+
+  assert.equal(gates.length, 2)
+  assert.deepEqual(gates[0], { allowed: true, reason: null })
+  assert.deepEqual(gates[1], { allowed: true, reason: null })
+  assert.equal(h.sendCalls.length, 1)
+  assert.equal(viewTerminal(h).phase, 'AWAITING_TURN')
 })
 
 // ---------------------------------------------------------------------------
