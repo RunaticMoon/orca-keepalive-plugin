@@ -13,7 +13,7 @@ This is a **community, experimental** plugin. It is not an official Stably plugi
 - Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
 - License: MIT (see [LICENSE](LICENSE))
 - Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
-- Version: `0.2.1`
+- Version: `0.2.2`
 - Minimum Orca engine declared: `>=1.4.214`
 - Plugin API: `pluginApi 1` (`contributes` is strict)
 - Runtime: Node >=22.5 (development has been done on Node 24); no build step, no npm dependencies
@@ -69,8 +69,13 @@ as waiting/blocked and **never sends automatically**: typing into a choice or pe
 screen would answer on the user's behalf. Instead of dropping the reservation it keeps the
 pre-wait observation as a *hold* and keeps showing the cache basis and estimated expiry in
 the tab and dashboard. Once the user answers and work starts (`working`), a normal new turn
-schedules a fresh reservation after it completes. The hold lives in memory only, so a
-plugin restart does not restore it (limitation).
+schedules a fresh reservation after it completes. A hold that has not been sent yet and whose
+estimated expiry is known is saved to `epochs-v1` as `kind='hold'`, so after a plugin restart
+the same terminal restores the waiting state plus the saved cache basis and estimated expiry
+and shows ⚡ (cache kept · waiting for a reply); nothing is sent before the reply either. If
+the estimated expiry passed while the plugin was offline the hold is restored as display-only
+expiry history (💤), and a hold that was already attempted or whose estimated expiry is
+unknown is saved as history only.
 
 ### Send timing
 
@@ -109,11 +114,14 @@ reading of Anthropic's cache.
 ### Surviving a plugin reload
 
 Disabling and re-enabling the plugin (or any other worker reload) clears the in-memory
-schedule. The plugin keeps two kinds of per-terminal record under Orca's plugin storage
+schedule. The plugin keeps three kinds of per-terminal record under Orca's plugin storage
 key `epochs-v1` (a separate key from the control state `state-v1`):
 
 - an **armed** record while an epoch is **armed and not yet sent**, so a pending
-  keepalive is not lost; and
+  keepalive is not lost;
+- a **hold** record while a choice/permission wait is showing and **nothing has been sent
+  yet and the estimated expiry is known** — it restores the waiting state plus the cache
+  basis and estimated expiry as ⚡, but never sends before the reply; and
 - a **display-only history** record for the last observed cache epoch — its expected
   expiry time and last recorded send block reason — so the tab symbol and the dashboard
   can still show what was kept and why it ended.
@@ -126,7 +134,7 @@ work turn starts, or 24 hours after its expected expiry. (A record that expires 
 the plugin is offline, or an armed record whose expected expiry already passed, is kept
 as history instead of being restored as a reservation.)
 
-On the next start the plugin restores an armed schedule only when the catalog still
+On the next start the plugin restores an armed schedule or a hold only when the catalog still
 contains the **same terminal**: the same `userDataKey`, `profileId`, `worktreeId`, and
 `paneKey`, the same `ptyId`, and `doneAt` within the last hour. The `incarnationId` is
 **not** compared: a terminal whose incarnation changed (for example after an Orca restart
@@ -146,6 +154,13 @@ old conversation, the restored schedule can send one keepalive to that new sessi
 identifiers and were already restorable; deleting and reinstalling the plugin clears
 Orca's `plugins-data` and is not restored.
 
+A **hold** record is restored the same way when the terminal is the same: the waiting state
+plus the saved cache basis and estimated expiry come back and show ⚡ (cache kept · waiting
+for a reply), nothing is sent before the reply, and if the estimated expiry passed while the
+plugin was offline it is restored as display-only expiry history (💤). A hold that was already
+attempted or whose estimated expiry is unknown comes back as history only (no reservation);
+an entry whose scope needs review (open/uncertain attempt) restores the display only.
+
 A **display-only history** record (and an armed record whose expected expiry already
 passed) is restored without creating a schedule: the tab symbol and the dashboard show
 the earlier expiry and its last recorded block reason, but nothing is sent. History is
@@ -155,10 +170,12 @@ extends this limit.
 
 The storage envelope is version **2**. Version 1 records are still read the old way, but
 no history is reconstructed from them because a version 1 record has no TTL information.
-An **older** plugin version cannot read a version 2 store and restores nothing from it,
-so downgrading loses the stored schedule and history. Expiry history that disappeared
-before you updated cannot be recovered; only history this version observed and saved is
-preserved.
+A `hold` record only adds a new `kind` without bumping the envelope version, so an earlier
+release that reads a version 2 envelope ignores the `hold` record alone and still reads
+armed and history records. An **older** plugin version cannot read a version 2 store and
+restores nothing from it, so downgrading loses the stored schedule and history. Expiry
+history that disappeared before you updated cannot be recovered; only history this version
+observed and saved is preserved.
 
 ### Consecutive cap and reset
 
