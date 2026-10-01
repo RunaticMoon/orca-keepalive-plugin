@@ -267,6 +267,143 @@ test('v1: 비유한수 doneAt은 버린다', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// hold (대기 중 재시작 복원용)
+// ---------------------------------------------------------------------------
+
+test('hold: remember→get 왕복, 저장 envelope version 2·kind hold', async () => {
+  const host = createFakeHost();
+  const hold = rec({ kind: 'hold' });
+  const first = createEpochMemory({ hostCall: host.hostCall, now: () => 111 });
+  first.remember('hold', hold);
+  await first.flush();
+
+  const stored = host.read();
+  assert.equal(stored.version, 2);
+  assert.equal(stored.entries.hold.kind, 'hold');
+  assert.deepEqual(stored.entries.hold, { ...hold, savedAt: 111 });
+
+  const second = createEpochMemory({ hostCall: host.hostCall, now: () => 999 });
+  await second.load();
+  assert.deepEqual(second.get('hold'), { ...hold, savedAt: 111 });
+  assert.equal(second.get('hold').kind, 'hold');
+});
+
+test('hold: expiresAt이 null이면 거부, expiredAt 값이 있으면 거부', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 1000 });
+
+  memory.remember('noExpires', rec({ kind: 'hold', expiresAt: null }));
+  memory.remember('expired', rec({ kind: 'hold', expiresAt: 300000, expiredAt: 300000 }));
+  await memory.flush();
+
+  assert.equal(memory.get('noExpires'), null);
+  assert.equal(memory.get('expired'), null);
+  assert.equal(host.setCount(), 0);
+});
+
+test('load: v2 envelope의 hold를 적재하고, v1 레코드는 armed로 읽는다', async () => {
+  const hold = rec({ kind: 'hold', doneAt: 50000, basisAt: 49000, expiresAt: 100000 });
+  const host = createFakeHost({
+    initial: { version: 2, entries: { hold: { ...hold, savedAt: 7 } } },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  assert.deepEqual(memory.get('hold'), { ...hold, savedAt: 7 });
+  assert.equal(memory.get('hold').kind, 'hold');
+
+  const v1host = createFakeHost({
+    initial: { version: 1, entries: { armed: { ...v1rec(), savedAt: 7 } } },
+  });
+  const v1memory = createEpochMemory({ hostCall: v1host.hostCall });
+  await v1memory.load();
+  assert.equal(v1memory.get('armed').kind, 'armed');
+});
+
+test('load: v2 envelope에 armed·history·hold가 섞여 있으면 셋 다 적재한다', async () => {
+  const armed = rec({ doneAt: 10000, basisAt: 9000, expiresAt: 310000 });
+  const pending = rec({ doneAt: 20000, basisAt: 19000, kind: 'history', expiresAt: 320000 });
+  const expired = rec({
+    doneAt: 30000,
+    basisAt: 29000,
+    kind: 'history',
+    expiresAt: 330000,
+    expiredAt: 330000,
+  });
+  const hold = rec({ doneAt: 40000, basisAt: 39000, kind: 'hold', expiresAt: 340000 });
+  const host = createFakeHost({
+    initial: {
+      version: 2,
+      entries: {
+        armed: { ...armed, savedAt: 1 },
+        pending: { ...pending, savedAt: 2 },
+        expired: { ...expired, savedAt: 3 },
+        hold: { ...hold, savedAt: 4 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  assert.equal(memory.get('armed').kind, 'armed');
+  assert.equal(memory.get('pending').kind, 'history');
+  assert.equal(memory.get('pending').expiredAt, null);
+  assert.equal(memory.get('expired').kind, 'history');
+  assert.equal(memory.get('expired').expiredAt, 330000);
+  assert.equal(memory.get('hold').kind, 'hold');
+  assert.deepEqual(memory.get('armed'), { ...armed, savedAt: 1 });
+  assert.deepEqual(memory.get('pending'), { ...pending, savedAt: 2 });
+  assert.deepEqual(memory.get('expired'), { ...expired, savedAt: 3 });
+  assert.deepEqual(memory.get('hold'), { ...hold, savedAt: 4 });
+});
+
+test('prune: 만료된 hold는 history + expiredAt=expiresAt으로 전환', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 5000 });
+  memory.remember('expired', rec({ kind: 'hold', doneAt: 1000, basisAt: 1000, expiresAt: 2000 }));
+  await memory.flush();
+
+  memory.prune(3600000);
+  await memory.flush();
+
+  const record = memory.get('expired');
+  assert.notEqual(record, null);
+  assert.equal(record.kind, 'history');
+  assert.equal(record.expiredAt, 2000);
+  assert.equal(record.expiresAt, 2000);
+  assert.equal(host.read().entries.expired.kind, 'history');
+  assert.equal(host.read().entries.expired.expiredAt, 2000);
+});
+
+test('prune: 만료 24시간을 넘긴 hold는 제거', async () => {
+  const now = 2000 + RETENTION;
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => now });
+  memory.remember('ancient', rec({ kind: 'hold', doneAt: 1000, basisAt: 1000, expiresAt: 2000 }));
+  await memory.flush();
+
+  memory.prune(3600000);
+  await memory.flush();
+
+  assert.equal(memory.get('ancient'), null);
+});
+
+test('prune: maxAge를 넘긴 미만료 hold는 제거하고 유효한 hold는 유지', async () => {
+  const host = createFakeHost();
+  const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 10000 });
+  memory.remember('old', rec({ kind: 'hold', doneAt: 8000, basisAt: 8000, expiresAt: 500000 }));
+  memory.remember('fresh', rec({ kind: 'hold', doneAt: 9900, basisAt: 9900, expiresAt: 500000 }));
+  await memory.flush();
+
+  memory.prune(500);
+  await memory.flush();
+
+  assert.equal(memory.get('old'), null);
+  assert.notEqual(memory.get('fresh'), null);
+  assert.equal(memory.get('fresh').kind, 'hold');
+});
+
+// ---------------------------------------------------------------------------
 // round-trip
 // ---------------------------------------------------------------------------
 

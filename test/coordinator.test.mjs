@@ -3264,17 +3264,17 @@ test('epochMemoryI: 열린 attempt는 예약 복원만 차단하고 이력으로
   assert.equal(h2.sendCalls.length, 0)
 })
 
-test('epochMemoryI: history 레코드는 재시작 후 due가 지나도 전송 예약을 만들지 않는다', async () => {
+test('epochMemoryI: 대기 hold 레코드는 재시작 후 due가 지나도 전송 예약을 만들지 않는다', async () => {
   const epochMemory = createFakeEpochMemory()
   const h1 = createHarness({ epochMemory })
   await startHarness(h1)
   const t0 = h1.clock.now()
   await arm(h1, t0)
-  // 만료 전 예약 취소(blocked/waiting): phase SUSPENDED, 이력은 남는다.
+  // 만료 전 예약 취소(blocked/waiting): phase SUSPENDED, 대기 hold로 저장된다.
   worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
   await h1.clock.settle()
   assert.equal(viewTerminal(h1).phase, 'SUSPENDED')
-  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
   assert.equal(epochMemory.store.get(EPOCH_KEY).expiredAt, null)
   await h1.coordinator.stop()
 
@@ -3292,7 +3292,7 @@ test('epochMemoryI: history 레코드는 재시작 후 due가 지나도 전송 �
   assert.equal(h2.sendCalls.length, 0)
 })
 
-test('epochMemoryI: 복원된 history 뒤 fresh working→done은 새 ARMED와 새 이력을 만든다', async () => {
+test('epochMemoryI: 복원된 대기 hold 뒤 fresh working→done은 새 ARMED와 새 이력을 만든다', async () => {
   const epochMemory = createFakeEpochMemory()
   const h1 = createHarness({ epochMemory })
   await startHarness(h1)
@@ -3305,7 +3305,7 @@ test('epochMemoryI: 복원된 history 뒤 fresh working→done은 새 ARMED와 �
   const h2 = createHarness({ epochMemory })
   await startHarness(h2)
   assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
-  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
 
   const t1 = h2.clock.now()
   await arm(h2, t1)
@@ -3855,4 +3855,518 @@ test('호환: 과거 APP_TIMER_OFF 이력 레코드를 복원해도 만료 원�
   assert.ok(hist)
   assert.equal(hist.lastBlockReason, 'APP_TIMER_OFF')
   assert.equal(viewTerminal(h).expireCause, 'APP_TIMER_OFF')
+})
+
+// ---------------------------------------------------------------------------
+// 31. epochMemory: 대기 hold 영속 저장·복원 (작업 M)
+// ---------------------------------------------------------------------------
+// KASL-0367 계약: 대기(hold) 중 재시작해도 ⚡(kept/interactive-wait)를 유지하고,
+// working 없이 done이면 저장된 basisAt으로 재예약한다.
+
+test('epochMemoryHold: working→waiting 대기 hold를 kind=hold로 저장한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h, 'w1', 'waiting', waitingAt)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  const record = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(record.kind, 'hold')
+  assert.equal(record.doneAt, waitingAt)
+  assert.equal(record.basisAt, waitingAt)
+  assert.equal(record.expiresAt, waitingAt + TTL_5M)
+  assert.equal(record.lastBlockReason, 'INTERACTIVE_WAIT')
+  assert.equal(record.expiredAt, null)
+  assert.equal(record.ptyId, 'pty1')
+})
+
+test('epochMemoryHold: ARMED→waiting hold는 kind=hold, attempted=true hold는 kind=history', async () => {
+  // attempted=false: 아직 전송하지 않은 예약이 대기로 넘어간 경우.
+  const em1 = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory: em1 })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  await arm(h1, t0)
+  worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
+  await h1.clock.settle()
+
+  const rec1 = em1.store.get(EPOCH_KEY)
+  assert.equal(rec1.kind, 'hold')
+  assert.equal(rec1.doneAt, t0 + 1000)
+  assert.equal(rec1.basisAt, t0)
+  assert.equal(rec1.lastBlockReason, 'INTERACTIVE_WAIT')
+
+  // attempted=true: 이미 전송을 시도한 예약은 대기로 넘어가도 재전송 예약으로 저장하지 않는다.
+  const em2 = createFakeEpochMemory()
+  const h2 = createHarness({ epochMemory: em2 })
+  await startHarness(h2)
+  const t2 = h2.clock.now()
+  await arm(h2, t2)
+  await advanceToDue(h2)
+  assert.ok(h2.sendCalls.length >= 1)
+
+  worktreeEvent(h2, 'w1', 'waiting', h2.clock.now() + 1000)
+  await h2.clock.settle()
+
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  const rec2 = em2.store.get(EPOCH_KEY)
+  assert.equal(rec2.kind, 'history')
+  assert.equal(rec2.expiredAt, null)
+})
+
+test('epochMemoryHold: 재시작 후 대기 hold를 복원해 kept/interactive-wait로 표시하고 전송하지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h1, 'w1', 'waiting', waitingAt)
+  await h1.clock.settle()
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'hold')
+  await h1.coordinator.stop()
+
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+
+  const term = viewTerminal(h2)
+  assert.equal(term.phase, 'SUSPENDED')
+  assert.equal(term.cacheState, 'kept')
+  assert.equal(term.cacheStatus, 'interactive-wait')
+  assert.equal(term.expiresAt, stored.expiresAt)
+  assert.equal(term.dueAt, null)
+
+  const hist = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.expiresAt, stored.expiresAt)
+  assert.equal(hist.lastBlockReason, 'INTERACTIVE_WAIT')
+
+  const restored = h2.diagEvents.filter((entry) => entry.event === 'epoch_restored')
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].targetId, EPOCH_KEY)
+  assert.equal(restored[0].code, undefined)
+
+  await h2.clock.advance(TTL_5M * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: 복원 뒤 working 없이 done은 저장 basisAt으로 재예약한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h1, 'w1', 'waiting', waitingAt)
+  await h1.clock.settle()
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'hold')
+  await h1.coordinator.stop()
+
+  // (A) 복원 뒤 working 없이 done → ARMED, 저장된 basisAt으로 재예약.
+  const h2 = createHarness({ epochMemory })
+  await startHarness(h2)
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+
+  worktreeEvent(h2, 'w1', 'done', stored.basisAt + 1000)
+  await h2.clock.settle()
+
+  assert.equal(viewTerminal(h2).phase, 'ARMED')
+  const hist = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.basisAt, stored.basisAt)
+  assert.equal(hist.expiresAt, stored.basisAt + TTL_5M)
+  assert.equal(viewTerminal(h2).expiresAt, stored.basisAt + TTL_5M)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'armed')
+  await h2.coordinator.stop()
+})
+
+test('epochMemoryHold: 복원 뒤 working은 hold를 버리고 BUSY가 되며 저장 레코드를 지운다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h1, 'w1', 'waiting', waitingAt)
+  await h1.clock.settle()
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'hold')
+  await h1.coordinator.stop()
+
+  const h3 = createHarness({ epochMemory })
+  await startHarness(h3)
+  assert.equal(viewTerminal(h3).phase, 'SUSPENDED')
+
+  worktreeEvent(h3, 'w1', 'working', stored.basisAt + 1000)
+  await h3.clock.settle()
+
+  assert.equal(viewTerminal(h3).phase, 'BUSY')
+  assert.equal(h3.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+test('epochMemoryHold: 오프라인 중 만료된 hold는 EXPIRED 표시로 낮추고 전송하지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const doneAt = 1_000_000
+  const basisAt = doneAt
+  const expiresAt = doneAt + TTL_5M
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'hold',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt,
+    basisAt,
+    expiresAt,
+    lastBlockReason: 'INTERACTIVE_WAIT',
+    expiredAt: null,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory, clock: createFakeClock({ start: expiresAt + 1000 }) })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'EXPIRED')
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.expiredAt, expiresAt)
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'INTERACTIVE_WAIT')
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'history')
+  assert.equal(stored.expiredAt, expiresAt)
+  assert.equal(h.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  await h.clock.advance(TTL_5M * 2)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: needsReview scope는 hold 복원을 막고 표시 전용으로 낮춘다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const hostCall = createHostCall()
+  const h1 = createHarness({ epochMemory, hostCall })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
+  await h1.clock.settle()
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
+  await h1.coordinator.stop()
+
+  await h1.rawStore.markReview(SCOPE)
+  assert.equal(h1.rawStore.getBudget(SCOPE).needsReview, true)
+
+  const h2 = createHarness({ epochMemory, hostCall, store: h1.rawStore })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'history')
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  // hold 없이 표시만 복원됐으므로 working 없는 done이 와도 ARMED가 되지 않는다.
+  worktreeEvent(h2, 'w1', 'done', h2.clock.now() + 1000)
+  await h2.clock.settle()
+  assert.notEqual(viewTerminal(h2).phase, 'ARMED')
+
+  await h2.clock.advance(TTL_5M * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: ptyId가 다른 hold는 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const doneAt = 1_000_000
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'hold',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt,
+    basisAt: doneAt,
+    expiresAt: doneAt + TTL_5M,
+    lastBlockReason: 'INTERACTIVE_WAIT',
+    expiredAt: null,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory, terminals: [makeRow({ ptyId: 'pty2' })] })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+})
+
+test('epochMemoryHold: 대기 중 이력이 만료 확정되면 저장이 history(expiredAt=expiresAt)로 낮아진다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+  await arm(h, t0)
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  const expiresAt = t0 + TTL_5M
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
+
+  await h.clock.advance(expiresAt - h.clock.now() + h.tickMs)
+
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'history')
+  assert.equal(stored.expiresAt, expiresAt)
+  assert.equal(stored.expiredAt, expiresAt)
+})
+
+// ---------------------------------------------------------------------------
+// 32. epochMemoryHold 보강: 차단·TTL 불일치·불량 레코드 방어 (KASL-0367 Q)
+// ---------------------------------------------------------------------------
+
+test('epochMemoryHold: 열린 attempt(reserved)는 hold 복원을 막고 표시 전용으로 낮춘다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h1 = createHarness({ epochMemory })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  worktreeEvent(h1, 'w1', 'waiting', t0 + 2000)
+  await h1.clock.settle()
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
+  await h1.coordinator.stop()
+
+  // budget lastAttempt.phase='reserved'(열린 attempt). 재시작 load()의 needsReview 승격과
+  // 무관하게 "열린 attempt" 하나만으로 예약 복원이 차단되는지 보기 위해 getBudget을
+  // reserved·needsReview=false로 고정한다.
+  const h2 = createHarness({ epochMemory })
+  const realGetBudget = h2.store.getBudget
+  h2.store.getBudget = (scope) => ({
+    ...realGetBudget(scope),
+    needsReview: false,
+    lastAttempt: { attemptId: 'att-x', epochId: 1, phase: 'reserved', at: h2.clock.now() },
+  })
+  await startHarness(h2)
+  h2.store.getBudget = realGetBudget
+
+  // hold가 없으므로 kept가 아니라 none/interactive-wait(표시 전용)다.
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h2).cacheState, 'none')
+  assert.equal(viewTerminal(h2).cacheStatus, 'interactive-wait')
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'history')
+  assert.equal(h2.coordinator.__debugCacheHistory(EPOCH_KEY).lastBlockReason, 'INTERACTIVE_WAIT')
+  assert.equal(h2.diagEvents.filter((entry) => entry.event === 'epoch_restored').length, 0)
+
+  // 표시 이력이 열린 attempt 때문에 재예약되지 않으므로 만료 뒤에도 전송은 0건이다.
+  worktreeEvent(h2, 'w1', 'done', h2.clock.now() + 1000)
+  await h2.clock.settle()
+  assert.notEqual(viewTerminal(h2).phase, 'ARMED')
+  await h2.clock.advance(TTL_5M * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: 저장 TTL(1h)과 복원 config TTL(5m)이 다르면 저장값 유지 후 다음 적용에서 RETIME한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const hostCall = createHostCall()
+  const h1 = createHarness({
+    epochMemory,
+    hostCall,
+    storeConfig: { schemaVersion: 2, claudeCacheTtlMs: 3600000 },
+  })
+  await startHarness(h1)
+  const t0 = h1.clock.now()
+  worktreeEvent(h1, 'w1', 'working', t0)
+  await h1.clock.settle()
+  const waitingAt = t0 + 2000
+  worktreeEvent(h1, 'w1', 'waiting', waitingAt)
+  await h1.clock.settle()
+  const stored = epochMemory.store.get(EPOCH_KEY)
+  assert.equal(stored.kind, 'hold')
+  assert.equal(stored.expiresAt, stored.basisAt + 3600000)
+  await h1.coordinator.stop()
+  const rememberCountBefore = epochMemory.calls.remember.length
+
+  // 복원 config TTL을 5분으로 바꾼다.
+  await h1.rawStore.updateConfig({ claudeCacheTtlMs: TTL_5M })
+
+  const h2 = createHarness({ epochMemory, hostCall, store: h1.rawStore })
+  await startHarness(h2)
+
+  assert.equal(viewTerminal(h2).phase, 'SUSPENDED')
+  // 실제 코드: 복원은 저장 당시 expiresAt(1h)을 먼저 그대로 저장한 뒤, 같은 시작
+  // tick의 applyReduce(TICK)가 기존 RETIME 규칙(같은 epoch·만료 전)으로 basisAt+새
+  // TTL(5m)로 갱신한다. 따라서 시작 tick 뒤에는 이미 5m이고, 중간의 "저장값 유지"
+  // 단계는 remember 호출 기록으로 확인한다.
+  const h2Remembered = epochMemory.calls.remember
+    .slice(rememberCountBefore)
+    .filter((call) => call.key === EPOCH_KEY)
+    .map((call) => call.record.expiresAt)
+  assert.ok(
+    h2Remembered.includes(stored.expiresAt),
+    `복원이 저장값을 유지하는 단계가 없다: ${JSON.stringify(h2Remembered)}`,
+  )
+  const retimed = h2.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(retimed)
+  assert.equal(retimed.expiresAt, stored.basisAt + TTL_5M)
+  assert.equal(retimed.epochId, 1)
+  assert.equal(viewTerminal(h2).expiresAt, stored.basisAt + TTL_5M)
+  assert.equal(h2Remembered[h2Remembered.length - 1], stored.basisAt + TTL_5M)
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
+
+  // 이후 applyReduce(waiting HOOK 재수신)에도 RETIME 결과(5m)가 유지된다.
+  worktreeEvent(h2, 'w1', 'waiting', h2.clock.now() + 1000)
+  await h2.clock.settle()
+  assert.equal(
+    h2.coordinator.__debugCacheHistory(EPOCH_KEY).expiresAt,
+    stored.basisAt + TTL_5M,
+  )
+
+  await h2.clock.advance(TTL_5M * 2)
+  assert.equal(h2.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: config TTL을 모르면 hold 전이를 kind=hold로 저장하지 않는다(이력 부재/불일치)', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+  const t0 = h.clock.now()
+
+  // config TTL을 알 수 없게 만든다(허용 밖 값). 이력은 OPEN되지 못해 hold.id와 맞지 않으므로
+  // holdRecordFrom이 kind='hold'를 거부한다(여기서는 이력 자체가 없어 forget된다).
+  const rawSnapshot = h.rawStore.snapshot
+  h.store.snapshot = (...args) => {
+    const snap = rawSnapshot.apply(h.rawStore, args)
+    return { ...snap, config: { ...snap.config, claudeCacheTtlMs: 12345 } }
+  }
+
+  worktreeEvent(h, 'w1', 'working', t0)
+  await h.clock.settle()
+  worktreeEvent(h, 'w1', 'waiting', t0 + 2000)
+  await h.clock.settle()
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+})
+
+test('epochMemoryHold: 복원 시 config TTL을 모르면 저장 이력으로 보류를 유지하고 전송하지 않는다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const doneAt = 1_000_000
+  const basisAt = doneAt
+  const expiresAt = doneAt + TTL_5M
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'hold',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt,
+    basisAt,
+    expiresAt,
+    lastBlockReason: 'INTERACTIVE_WAIT',
+    expiredAt: null,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory })
+  // 복원 시 config TTL을 알 수 없게 만든다(허용 밖 값). 저장된 expiresAt은 유지되고,
+  // RETIME 근거(TTL)가 없으므로 다음 적용에서도 시각이 바뀌지 않는다.
+  const rawSnapshot = h.rawStore.snapshot
+  h.store.snapshot = (...args) => {
+    const snap = rawSnapshot.apply(h.rawStore, args)
+    return { ...snap, config: { ...snap.config, claudeCacheTtlMs: 12345 } }
+  }
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'SUSPENDED')
+  assert.equal(viewTerminal(h).cacheState, 'kept')
+  assert.equal(viewTerminal(h).cacheStatus, 'interactive-wait')
+  assert.equal(viewTerminal(h).expiresAt, expiresAt)
+  const hist = h.coordinator.__debugCacheHistory(EPOCH_KEY)
+  assert.ok(hist)
+  assert.equal(hist.expiresAt, expiresAt)
+  assert.equal(hist.lastBlockReason, 'INTERACTIVE_WAIT')
+  assert.equal(epochMemory.store.get(EPOCH_KEY).kind, 'hold')
+  const restored = h.diagEvents.filter((entry) => entry.event === 'epoch_restored')
+  assert.equal(restored.length, 1)
+
+  await h.clock.advance(TTL_5M * 2)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: doneAt이 비유한수인 hold 레코드는 크래시 없이 복원하지 않고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'hold',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt: Number.NaN,
+    basisAt: 1_000_000,
+    expiresAt: 1_300_000,
+    lastBlockReason: 'INTERACTIVE_WAIT',
+    expiredAt: null,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  await h.clock.advance(TTL_5M * 2)
+  assert.equal(h.sendCalls.length, 0)
+})
+
+test('epochMemoryHold: expiredAt이 expiresAt과 다른 hold 레코드는 RESTORE_HOLD 전에 거부하고 forget한다', async () => {
+  const epochMemory = createFakeEpochMemory()
+  const doneAt = 1_000_000
+  const basisAt = doneAt
+  const expiresAt = doneAt + TTL_5M
+  // fake epochMemory가 정규화를 우회해 expiredAt(expiresAt과 불일치)을 그대로 돌려준다.
+  epochMemory.store.set(EPOCH_KEY, {
+    kind: 'hold',
+    userDataKey: 'key-p',
+    profileId: 'p1',
+    worktreeId: 'w1',
+    paneKey: 'tab:leaf',
+    ptyId: 'pty1',
+    incarnationId: 'inc1',
+    doneAt,
+    basisAt,
+    expiresAt,
+    lastBlockReason: 'INTERACTIVE_WAIT',
+    expiredAt: expiresAt - 1000,
+    savedAt: 1,
+  })
+  const h = createHarness({ epochMemory })
+  await startHarness(h)
+
+  // step 4의 historyFromRecord null 가드가 없으면 epochId만 있는 불량 이력이 남고 hold도
+  // 저장된다. 가드가 결과를 버리고 forget한다.
+  assert.equal(viewTerminal(h).phase, 'UNKNOWN')
+  assert.equal(h.coordinator.__debugCacheHistory(EPOCH_KEY), null)
+  assert.ok(epochMemory.calls.forget.includes(EPOCH_KEY))
+  assert.equal(epochMemory.store.has(EPOCH_KEY), false)
+  await h.clock.advance(TTL_5M * 2)
+  assert.equal(h.sendCalls.length, 0)
 })
