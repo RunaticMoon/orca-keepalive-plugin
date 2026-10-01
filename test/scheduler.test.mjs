@@ -45,7 +45,7 @@ function reduce(state, input) {
 }
 
 function settings(overrides = {}) {
-  return { known: true, enabled: true, ttlMs: TTL_5M, ...overrides };
+  return { known: true, ttlMs: TTL_5M, ...overrides };
 }
 
 function policy(overrides = {}) {
@@ -232,11 +232,49 @@ test('decide: ARMED가 아니면 state.reason으로 wait', () => {
   assert.deepEqual(decideWith(state, 0), { kind: 'wait', reason: 'NO_FRESH_TURN' });
 });
 
-test('decide: settings unknown/disabled/잘못된 TTL', () => {
+test('decide: settings unknown/잘못된 TTL은 차단한다', () => {
   const state = armed(1000);
   assert.equal(decideWith(state, 5000, { known: false }).reason, 'SETTINGS_UNKNOWN');
-  assert.equal(decideWith(state, 5000, { enabled: false }).reason, 'APP_TIMER_OFF');
   assert.equal(decideWith(state, 5000, { ttlMs: 600000 }).reason, 'SETTINGS_UNKNOWN');
+});
+
+test('decide: 구 형태 enabled:false는 스케줄 결정에 영향을 주지 않는다', () => {
+  const done = 1_000_000;
+  const state = armed(done);
+  const expiresAt = done + TTL_5M;
+  const dueAt = expiresAt - 60000; // done + 240000
+
+  const send = decideWith(state, dueAt, { enabled: false });
+  assert.equal(send.kind, 'send');
+  assert.equal(send.reason, null);
+  assert.equal(send.epochId, 1);
+  assert.equal(send.dueAt, dueAt);
+  assert.equal(send.expiresAt, expiresAt);
+
+  const wait = decideWith(state, dueAt - 1, { enabled: false });
+  assert.equal(wait.kind, 'wait');
+  assert.equal(wait.reason, null);
+  assert.equal(wait.nextAt, dueAt);
+  assert.equal(wait.dueAt, dueAt);
+  assert.equal(wait.expiresAt, expiresAt);
+});
+
+test('decide: enabled 필드가 없어도 due/send 결정을 낸다', () => {
+  const done = 1_000_000;
+  const state = armed(done);
+  const expiresAt = done + TTL_5M;
+  const dueAt = expiresAt - 60000; // done + 240000
+
+  const send = decide(state, {
+    now: dueAt,
+    settings: { known: true, ttlMs: TTL_5M },
+    policy: policy(),
+    config: CONFIG,
+  });
+  assert.equal(send.kind, 'send');
+  assert.equal(send.epochId, 1);
+  assert.equal(send.dueAt, dueAt);
+  assert.equal(send.expiresAt, expiresAt);
 });
 
 test('decide: policy false는 reason을 그대로, nextAt 없음', () => {
@@ -257,14 +295,24 @@ test('decide: epoch.attempted면 NO_FRESH_TURN', () => {
   assert.equal(result.reason, 'NO_FRESH_TURN');
 });
 
-test('decide: TTL 변경 시 dueAt 재계산, 이미 지났으면 expire', () => {
+test('decide: 같은 epoch에서 ttlMs를 바꾸면 dueAt/expiresAt를 새 TTL로 재계산한다', () => {
   const done = 1000;
   const state = armed(done);
+  const basis = state.epoch.basisAt;
   const now = done + 250000;
-  assert.equal(decideWith(state, now, { ttlMs: TTL_5M }).kind, 'send');
-  assert.equal(decideWith(state, now, { ttlMs: TTL_1H }).kind, 'wait');
+
+  const five = decideWith(state, now, { ttlMs: TTL_5M });
+  assert.equal(five.kind, 'send');
+  assert.equal(five.expiresAt, basis + TTL_5M);
+  assert.equal(five.dueAt, basis + TTL_5M - 60000);
+
+  const hour = decideWith(state, now, { ttlMs: TTL_1H });
+  assert.equal(hour.kind, 'wait');
+  assert.equal(hour.expiresAt, basis + TTL_1H);
+  assert.equal(hour.dueAt, basis + TTL_1H - 120000);
+
   assert.equal(
-    decideWith(state, done + TTL_5M - TIMING.minimumRemainingMs, { ttlMs: TTL_5M }).kind,
+    decideWith(state, basis + TTL_5M - TIMING.minimumRemainingMs, { ttlMs: TTL_5M }).kind,
     'expire',
   );
 });

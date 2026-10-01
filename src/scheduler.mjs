@@ -647,7 +647,7 @@ export function reduceTarget(state, input) {
  * @param {SchedulerState} state
  * @param {{
  *   now: number,
- *   settings: {known:boolean, enabled:boolean, ttlMs:number},
+ *   settings: {known:boolean, ttlMs:number},
  *   policy: {allowed:boolean, reason:string|null},
  *   config: MarginConfig,
  * }} env
@@ -661,9 +661,6 @@ export function decide(state, env) {
   }
   if (settings === null || settings === undefined || settings.known !== true) {
     return { kind: 'wait', reason: 'SETTINGS_UNKNOWN' };
-  }
-  if (settings.enabled !== true) {
-    return { kind: 'wait', reason: 'APP_TIMER_OFF' };
   }
   const margin = marginFor(settings.ttlMs, config);
   if (margin === null) {
