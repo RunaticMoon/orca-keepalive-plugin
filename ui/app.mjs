@@ -389,6 +389,12 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
         const enabled =
           wt.enabled === true ? true : wt.enabled === false ? false : null;
         const scopeOn = enabled === null ? defaultWorktreeEnabled : enabled;
+        const mappedTerminals = Array.isArray(wt.terminals) ? wt.terminals.map(mapTerminal) : [];
+        // 터미널에서 에이전트가 실행되지 않은 일반 터미널(NO_AGENT)은 목록에서 숨긴다.
+        // 숨긴 개수는 유지해 빈 목록이 된 이유를 안내 문구로 구분한다.
+        const terminals = mappedTerminals.filter(
+          (terminal) => !(terminal.supported === false && terminal.reason === 'NO_AGENT'),
+        );
         return {
           id: typeof wt.id === 'string' ? wt.id : '',
           label: typeof wt.label === 'string' ? wt.label : '',
@@ -403,7 +409,8 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
           effectiveEnabled: wt.effectiveEnabled === true,
           reason: typeof wt.reason === 'string' ? wt.reason : null,
           reasonText: typeof wt.reason === 'string' ? reasonText(wt.reason) : '',
-          terminals: Array.isArray(wt.terminals) ? wt.terminals.map(mapTerminal) : [],
+          terminals,
+          hiddenPlainTerminals: mappedTerminals.length - terminals.length,
         };
       })
     : [];
@@ -903,7 +910,13 @@ function boot() {
 
         const list = el('div', 'terminals');
         if (worktree.terminals.length === 0) {
-          list.appendChild(el('div', 'terminal terminal-empty', '표시할 세션이 없습니다.'));
+          list.appendChild(el(
+            'div',
+            'terminal terminal-empty',
+            worktree.hiddenPlainTerminals > 0
+              ? '에이전트가 실행 중인 터미널이 없습니다.'
+              : '표시할 세션이 없습니다.',
+          ));
         } else {
           for (const terminal of worktree.terminals) {
             list.appendChild(renderTerminal(terminal, vm));

@@ -48,7 +48,7 @@ official or Stably-published.
 
 Add `https://github.com/RunaticMoon/orca-keepalive-plugin.git` with Git ref `main`
 in **Settings > Plugins > Manage sources**, then install Cache Keepalive from its
-listing. See the [README](../README.md#from-the-marketplace-recommended) for the
+listing. See the [README](../README.en.md#from-the-marketplace-recommended) for the
 update flow and existing-install migration caveat.
 
 The index lists `runaticmoon.cache-keepalive` and points to this repository's `main`.

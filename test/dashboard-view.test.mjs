@@ -388,7 +388,7 @@ test('toViewModel: needsReview and unsupported terminals are surfaced', () => {
   assert.equal(t3.remainingText, '\u2014');
 });
 
-test('toViewModel: NO_AGENT 사유는 문구를 숨기되 reason 필드는 유지한다', () => {
+test('toViewModel: NO_AGENT 터미널은 목록에서 숨기고 hiddenPlainTerminals로 집계한다', () => {
   const snap = makeSnapshot();
   snap.worktrees[0].terminals.push({
     id: 't-4',
@@ -405,13 +405,39 @@ test('toViewModel: NO_AGENT 사유는 문구를 숨기되 reason 필드는 유�
     supported: false,
   });
   const vm = toViewModel(snap, 0);
-  const t4 = vm.worktrees[0].terminals[3];
-  assert.equal(t4.supported, false);
-  assert.equal(t4.reason, 'NO_AGENT');
-  assert.equal(t4.reasonText, '');
-  // UNSUPPORTED_AGENT(예: codex)는 기존 문구를 그대로 유지한다.
+  assert.equal(vm.worktrees[0].terminals.length, 3, 'NO_AGENT 터미널은 제외되어야 한다');
+  assert.equal(vm.worktrees[0].hiddenPlainTerminals, 1);
+  assert.equal(
+    vm.worktrees[0].terminals.some((terminal) => terminal.reason === 'NO_AGENT'),
+    false,
+  );
+  // UNSUPPORTED_AGENT(예: codex)는 숨기지 않고 기존 문구를 그대로 유지한다.
   const t3 = vm.worktrees[0].terminals[2];
+  assert.equal(t3.supported, false);
   assert.equal(t3.reasonText, reasonText('UNSUPPORTED_AGENT'));
+});
+
+test('toViewModel: supported=false라도 NO_AGENT가 아니면 숨기지 않는다', () => {
+  const snap = makeSnapshot();
+  snap.worktrees[0].terminals = [{
+    id: 't-codex',
+    title: 'codex',
+    phase: 'UNKNOWN',
+    enabledOverride: null,
+    effectiveEnabled: false,
+    reason: 'UNSUPPORTED_AGENT',
+    dueAt: null,
+    expiresAt: null,
+    charged: 0,
+    confirmed: 0,
+    needsReview: false,
+    supported: false,
+  }];
+  const vm = toViewModel(snap, 0);
+  assert.equal(vm.worktrees[0].terminals.length, 1, 'NO_AGENT가 아닌 미지원 터미널은 숨기지 않는다');
+  assert.equal(vm.worktrees[0].terminals[0].supported, false);
+  assert.equal(vm.worktrees[0].terminals[0].reasonText, reasonText('UNSUPPORTED_AGENT'));
+  assert.equal(vm.worktrees[0].hiddenPlainTerminals, 0);
 });
 
 test('toViewModel: paused snapshot reports resume label', () => {
@@ -880,7 +906,7 @@ test('config form: missing, true, and false snapshots render; Save sends changed
   }
 });
 
-test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UNSUPPORTED_AGENT는 유지한다', async () => {
+test('renderTerminal: NO_AGENT 행은 숨기고 UNSUPPORTED_AGENT는 이유/읽기 전용 표시와 함께 유지한다', async () => {
   const globals = Object.fromEntries(
     ['document', 'window', 'sessionStorage', 'fetch'].map((key) => [key, globalThis[key]]),
   );
@@ -985,21 +1011,15 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     await settle();
 
     const rows = findAllByClass(nodes.get('worktrees'), 'terminal');
-    assert.equal(rows.length, terminals.length, '모든 캐시 상태 행이 렌더링되어야 한다');
+    assert.equal(rows.length, terminals.length - 1, 'NO_AGENT를 제외한 캐시 상태 행만 렌더링되어야 한다');
 
     const titleOf = (row) => findAllByClass(row, 'terminal-title')[0]?.textContent;
     const noAgentRow = rows.find((row) => titleOf(row) === 'bash');
     const codexRow = rows.find((row) => titleOf(row) === 'codex');
-    assert.ok(noAgentRow, 'NO_AGENT 행을 찾아야 한다');
+    assert.equal(noAgentRow, undefined, 'NO_AGENT 행은 렌더링하지 않아야 한다');
     assert.ok(codexRow, 'UNSUPPORTED_AGENT 행을 찾아야 한다');
 
-    // NO_AGENT: 이유 문구와 '읽기 전용 · 미지원' 표시가 모두 없어야 한다.
-    assert.equal(findAllByClass(noAgentRow, 'terminal-reason').length, 0);
-    assert.equal(findAllByClass(noAgentRow, 'readonly-note').length, 0);
-    assert.equal(findAllByClass(noAgentRow, 'terminal-cache-text')[0]?.textContent,
-      '캐시 유지 대상 아님 · 일반 터미널');
-
-    // UNSUPPORTED_AGENT(codex 등): 둘 다 있고 문구가 그대로여야 한다.
+    // UNSUPPORTED_AGENT(codex 등): 이유 문구와 '읽기 전용 · 미지원' 표시가 모두 있어야 한다.
     const reasonNode = findAllByClass(codexRow, 'terminal-reason');
     const readonlyNode = findAllByClass(codexRow, 'readonly-note');
     assert.equal(reasonNode.length, 1);
@@ -1008,9 +1028,7 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
     assert.equal(reasonNode[0].textContent, '이 터미널의 에이전트는 지원하지 않습니다.');
     assert.equal(findAllByClass(codexRow, 'terminal-cache-text')[0]?.textContent,
       '캐시 유지 미지원 · 이 터미널의 에이전트는 지원하지 않습니다.');
-    for (const row of [noAgentRow, codexRow]) {
-      assert.doesNotMatch(findAllByClass(row, 'terminal-cache-text')[0]?.textContent ?? '', /플러그인 시작 후/);
-    }
+    assert.doesNotMatch(findAllByClass(codexRow, 'terminal-cache-text')[0]?.textContent ?? '', /플러그인 시작 후/);
     for (const source of terminals.slice(2)) {
       const row = rows.find((candidate) => titleOf(candidate) === source.title);
       assert.ok(row, source.cacheStatus);
@@ -1023,6 +1041,95 @@ test('renderTerminal: NO_AGENT는 이유/읽기 전용 표시를 생략하고 UN
       assert.equal(findAllByClass(row, 'badge-cache').length, 1);
       assert.match(findAllByClass(row, 'terminal-applied')[0]?.textContent ?? '', /^유지 설정 (켜짐|꺼짐)$/);
     }
+  } finally {
+    for (const [key, value] of Object.entries(globals)) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
+  }
+});
+
+test('renderWorktrees: 모든 터미널이 NO_AGENT면 워크트리 행은 남고 에이전트 없음 문구를 표시한다', async () => {
+  const globals = Object.fromEntries(
+    ['document', 'window', 'sessionStorage', 'fetch'].map((key) => [key, globalThis[key]]),
+  );
+  const nodes = new Map();
+  const intervals = [];
+
+  function makeNode() {
+    return {
+      checked: false,
+      value: '',
+      disabled: false,
+      textContent: '',
+      children: [],
+      listeners: new Map(),
+      classList: { add() {}, remove() {}, toggle() {} },
+      setAttribute() {},
+      addEventListener(type, listener) { this.listeners.set(type, listener); },
+      appendChild(child) { this.children.push(child); return child; },
+    };
+  }
+
+  const classTokens = (node) =>
+    typeof node.className === 'string' ? node.className.split(/\s+/).filter(Boolean) : [];
+  const findAllByClass = (root, className) => {
+    const found = [];
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (classTokens(node).includes(className)) found.push(node);
+      for (const child of Array.isArray(node.children) ? node.children : []) walk(child);
+    };
+    walk(root);
+    return found;
+  };
+
+  const plainTerminal = (id) => ({
+    id,
+    title: `bash ${id}`,
+    phase: 'UNKNOWN',
+    enabledOverride: null,
+    effectiveEnabled: false,
+    reason: 'NO_AGENT',
+    dueAt: null,
+    expiresAt: null,
+    charged: 0,
+    confirmed: 0,
+    needsReview: false,
+    supported: false,
+  });
+  const worktree = {
+    ...makeSnapshot().worktrees[0],
+    terminals: [plainTerminal('t-plain-1'), plainTerminal('t-plain-2')],
+  };
+  const state = makeSnapshot({ worktrees: [worktree], diagnostics: [] });
+
+  try {
+    globalThis.document = {
+      getElementById(id) {
+        if (!nodes.has(id)) nodes.set(id, makeNode());
+        return nodes.get(id);
+      },
+      createElement: makeNode,
+      querySelectorAll: () => [],
+    };
+    globalThis.window = {
+      location: { hash: '', pathname: '/', search: '' },
+      setInterval(callback) { intervals.push(callback); },
+    };
+    globalThis.sessionStorage = { getItem: () => 'test-token' };
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state });
+
+    await import('../ui/app.mjs?hidden-plain-terminals-dom-test');
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    await settle();
+
+    const root = nodes.get('worktrees');
+    assert.equal(findAllByClass(root, 'worktree').length, 1, '워크트리 행은 남아야 한다');
+    assert.equal(findAllByClass(root, 'terminal-title').length, 0, '일반 터미널 행은 렌더링하지 않아야 한다');
+    const empty = findAllByClass(root, 'terminal-empty');
+    assert.equal(empty.length, 1, '빈 목록 안내를 표시해야 한다');
+    assert.equal(empty[0].textContent, '에이전트가 실행 중인 터미널이 없습니다.');
   } finally {
     for (const [key, value] of Object.entries(globals)) {
       if (value === undefined) delete globalThis[key];
