@@ -107,7 +107,7 @@
  * @property {number|null} lastHookAt
  * @property {boolean} seenWorking
  * @property {TargetEpoch|null} epoch
- * @property {SchedulerHold|null} hold 대기(waiting/blocked) 직전 관측. 대기 중 캐시 기준·예상 만료를 잇기 위한 메모리 전용 값이며 전송 예약이 아니다. 대기 중에는 자동 전송을 하지 않는다(§5.4).
+ * @property {SchedulerHold|null} hold 대기(waiting/blocked) 직전 관측. 대기 중 캐시 기준·예상 만료를 잇는 값이며 전송 예약이 아니다. 대기 중에는 자동 전송을 하지 않는다(§5.4). 대기 중 재시작에 대비해 epoch-memory에 kind='hold'로 저장된다(attempted=false이고 유효한 이력이 있을 때).
  * @property {AttemptRef|null} attempt
  * @property {number|null} lastObservedInputAt
  * @property {string|null} reason reason/진단 코드.
@@ -139,7 +139,7 @@
  * envelope version만 EPOCH_MEMORY_VERSION으로 올린다. 시각은 유한수를 검증하고,
  * expiredAt !== null이면 expiresAt과 같아야 하며 반드시 kind='history'다.
  * @typedef {Object} EpochMemoryRecordV2
- * @property {'armed'|'history'} kind armed=복원 가능한 예약(ARMED && attempted=false), history=표시 전용(전송 예약으로 복원 금지).
+ * @property {'armed'|'history'|'hold'} kind armed=복원 가능한 예약(ARMED && attempted=false), history=표시 전용(전송 예약으로 복원 금지), hold=대기 중 재시작 복원용 예약(SUSPENDED/INTERACTIVE_WAIT && hold.attempted=false, expiresAt 필수).
  * @property {string} userDataKey
  * @property {string} profileId
  * @property {string} worktreeId
@@ -164,6 +164,22 @@
  * @property {boolean} expired true면 만료 이력(EXPIRED/EXPIRED)으로, false면 만료 전 취소 이력(SUSPENDED)으로 복원한다.
  * @property {string} [reason] 만료 이력의 마지막 차단 reason(선택, EXPIRE_CAUSE_REASONS 중 하나). 알 수 없는 값은 기록하지 않는다.
  * @property {number} [at] 이벤트 시각(ms).
+ */
+
+/**
+ * 내부 전용 scheduler 입력: 저장된 hold 복원(§2-4 epoch-memory kind='hold'). MACHINE_INPUT_TYPES에는
+ * 넣지 않는다(RESTORE_EPOCH/RESTORE_CACHE_HISTORY와 같은 내부 전용 취급). basisAt·now가 유한수이고
+ * basisAt <= now + TIMING.clockSkewMs이며 phase가 UNKNOWN이고 epoch·attempt가 null이고
+ * seenWorking=false, lastHook!=='working'일 때만 적용된다. 아니면 상태를 그대로 반환한다.
+ * 적용되면 seenWorking=true, lastHook='waiting', lastHookAt=max(lastHookAt ?? -Infinity, basisAt),
+ * epochSeq를 1 늘린 뒤 hold={id:새 epochSeq, basisAt, attempted:false}를 두고 epoch·attempt=null,
+ * phase='SUSPENDED', reason='INTERACTIVE_WAIT'로 전환한다. generation·budgetResetSeq·selfTurnSeq는
+ * 바꾸지 않는다. 이후 동작은 기존 reduceHook(waiting 재수신→hold 유지, working→새 턴, done→hold 기준 ARMED)을
+ * 따른다.
+ * @typedef {Object} RestoreHoldInput
+ * @property {'RESTORE_HOLD'} type
+ * @property {number} basisAt hold 기준 시각(ms). 저장된 record.basisAt ?? record.doneAt.
+ * @property {number} now 이벤트 시각(ms).
  */
 
 /**

@@ -13,8 +13,9 @@
  *    kind='armed'로 취급하고 basisAt이 없으면 doneAt을 쓴다. v1에는 TTL 정보가
  *    없으므로 expiresAt을 null로 두고 만료 시각·원인을 추정하지 않는다.
  *  - kind='armed'는 복원 가능한 예약, kind='history'는 표시 전용이다. history는
- *    전송 예약으로 복원하지 않는다. expiredAt !== null이면 반드시 history이며
- *    expiresAt과 같은 값이어야 한다.
+ *    전송 예약으로 복원하지 않는다. kind='hold'는 대기(waiting/blocked) 중 재시작
+ *    복원용 예약으로 expiresAt이 필수이며 expiredAt은 null이어야 한다. expiredAt !==
+ *    null이면 반드시 history이며 expiresAt과 같은 값이어야 한다.
  *  - load는 없음/형식 오류/호출 실패 시 빈 상태로 시작한다(throw 금지).
  *  - remember/forget/prune은 동기이며 throw하지 않는다. 변경 시 persist를 예약한다.
  *  - persist는 직렬화·coalesce되며 storage.set 실패는 삼키고 다음 변경 때 재시도한다.
@@ -42,7 +43,8 @@ export const EPOCH_MEMORY_MAX_BYTES = 256 * 1024;
 /**
  * 영속되는 epoch 한 건(§2-4 EpochMemoryRecordV2).
  * @typedef {Object} EpochRecord
- * @property {'armed'|'history'} kind armed=복원 가능한 예약, history=표시 전용.
+ * @property {'armed'|'history'|'hold'} kind armed=복원 가능한 예약, history=표시 전용,
+ *   hold=대기 중 재시작 복원용 예약(expiresAt 필수, expiredAt은 null).
  * @property {string} userDataKey
  * @property {string} profileId
  * @property {string} worktreeId
@@ -73,7 +75,7 @@ const RECORD_FIELDS = [
   'savedAt',
 ];
 
-const ALLOWED_KINDS = ['armed', 'history'];
+const ALLOWED_KINDS = ['armed', 'history', 'hold'];
 
 /**
  * @param {unknown} value
@@ -146,6 +148,7 @@ function normalizeIdentity(raw) {
 /**
  * version 2 raw 값을 EpochRecord로 검증·정규화한다. 실패 시 null.
  * 잘못된 kind는 armed로 추정하지 않고 레코드 전체를 버린다.
+ * kind='hold'는 expiresAt이 필수이고 expiredAt은 null이어야 한다.
  * @param {unknown} raw
  * @param {number} [savedAt] remember 경로에서 강제할 savedAt.
  * @returns {EpochRecord|null}
@@ -185,8 +188,13 @@ function normalizeV2Record(raw, savedAt) {
   if (kind === 'history' && expiresAt === null) {
     return null;
   }
+  // hold는 대기 중 재시작 복원에 만료 시각이 필수다(전환·보존 경계 계산).
+  if (kind === 'hold' && expiresAt === null) {
+    return null;
+  }
 
   // expiredAt: null 또는 expiresAt과 같은 유한수. 값이 있으면 kind는 반드시 history다.
+  // (armed/hold는 값이 있으면 거부된다.)
   let expiredAt = null;
   if (raw.expiredAt !== null && raw.expiredAt !== undefined) {
     if (
@@ -212,7 +220,7 @@ function normalizeV2Record(raw, savedAt) {
   }
 
   return {
-    kind: /** @type {'armed'|'history'} */ (kind),
+    kind: /** @type {'armed'|'history'|'hold'} */ (kind),
     userDataKey: identity.userDataKey,
     profileId: identity.profileId,
     worktreeId: identity.worktreeId,
@@ -627,10 +635,12 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
   }
 
   /**
-   * 보존 기간이 지난 레코드를 제거하고, 만료된 v2 armed를 history로 전환한다.
+   * 보존 기간이 지난 레코드를 제거하고, 만료된 v2 armed/hold를 history로 전환한다.
    * - armed: `now() - doneAt >= maxAgeMs`이면 제거(기존 규칙). 단 expiresAt이 이미
    *   지났으면 삭제 전에 kind='history', expiredAt=expiresAt으로 전환하며, 그 이력이
    *   24시간 보존을 이미 넘겼으면 바로 제거한다.
+   * - hold: armed와 같은 분기로 처리한다. expiresAt이 지났으면 history로 전환하고
+   *   24시간 보존을 넘겼으면 제거한다.
    * - history: `now() >= expiresAt + CACHE_HISTORY_RETENTION_MS`이면 제거한다.
    * savedAt 갱신은 보존 기간을 연장하지 않는다.
    * @param {number} maxAgeMs
@@ -648,7 +658,7 @@ export function createEpochMemory({ hostCall, now = Date.now } = {}) {
         }
         continue;
       }
-      // armed: 실제 만료가 지났으면 삭제보다 표시 이력 전환을 우선한다.
+      // armed/hold: 실제 만료가 지났으면 삭제보다 표시 이력 전환을 우선한다.
       if (record.expiresAt !== null && at >= record.expiresAt) {
         if (at >= record.expiresAt + CACHE_HISTORY_RETENTION_MS) {
           deleteEntry(key);
