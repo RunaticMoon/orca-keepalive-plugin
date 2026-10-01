@@ -693,6 +693,47 @@ export function createCoordinator({
   }
 
   /**
+   * 대기(hold)를 저장 레코드(kind='hold')로 변환한다. 대기 중 재시작 복원용
+   * 예약이며 expiresAt이 필수다. 같은 id의 cacheHistory가 아직 만료 확정 전이고
+   * TTL 정보가 있어야만 hold로 승격한다. attempted=true(이미 전송을 시도한) hold는
+   * 예약으로 되살리면 중복 전송 위험이 있으므로 null을 돌려 history 경로로 낮춘다.
+   * @param {any} target
+   * @param {any} hold
+   * @param {any} history
+   * @returns {object|null}
+   */
+  function holdRecordFrom(target, hold, history) {
+    const identity = identityFromTarget(target)
+    if (identity === null || !isObject(hold)) {
+      return null
+    }
+    if (!isFiniteNumber(hold.id) || !isFiniteNumber(hold.basisAt) || hold.attempted !== false) {
+      return null
+    }
+    if (!isObject(history) || history.epochId !== hold.id) {
+      return null
+    }
+    if (history.expiredAt !== null && history.expiredAt !== undefined) {
+      return null
+    }
+    if (!isFiniteNumber(history.doneAt) || !isFiniteNumber(history.expiresAt)) {
+      return null
+    }
+    if (history.expiresAt <= history.doneAt) {
+      return null
+    }
+    return {
+      kind: 'hold',
+      ...identity,
+      doneAt: history.doneAt,
+      basisAt: Math.min(hold.basisAt, history.doneAt),
+      expiresAt: history.expiresAt,
+      lastBlockReason: normalizeBlockReason(history.lastBlockReason),
+      expiredAt: null,
+    }
+  }
+
+  /**
    * 저장 레코드에서 표시 이력을 만든다(cache-history RESTORE). 불량 입력은 null.
    * @param {any} record
    * @returns {import('./contracts.mjs').CacheHistory|null}
@@ -738,6 +779,9 @@ export function createCoordinator({
    * - ARMED이고 epoch가 아직 attempted=false이며 target 식별자가 유효하면 현재
    *   예약을 kind='armed'로 remember한다. 같은 epoch의 cacheHistory가 있으면 그
    *   expiresAt·lastBlockReason도 함께 저장한다.
+   * - SUSPENDED/INTERACTIVE_WAIT 대기 중이고 hold.attempted=false이며 같은 id의
+   *   cacheHistory가 아직 만료 확정 전이면 kind='hold'로 저장한다(재시작 복원용).
+   *   조건이 안 맞으면 기존 history 경로로 낮춘다.
    * - ARMED가 아니더라도 cacheHistory가 있으면 kind='history'로 저장한다(표시 전용,
    *   어떤 경우에도 전송 예약으로 복원하지 않는다).
    * - 이력도 유효한 ARMED도 없으면 forget한다.
@@ -763,6 +807,13 @@ export function createCoordinator({
           return
         }
       }
+      if (isObject(state) && state.phase === 'SUSPENDED' && state.reason === 'INTERACTIVE_WAIT') {
+        const hold = holdRecordFrom(target, state.hold, history)
+        if (hold !== null) {
+          epochMemory.remember(key, hold)
+          return
+        }
+      }
       const historyRecord = historyRecordFrom(target, history)
       if (historyRecord !== null) {
         epochMemory.remember(key, historyRecord)
@@ -782,6 +833,11 @@ export function createCoordinator({
    *   아직 지나지 않았으면 RESTORE_EPOCH로 예약을 되살리고 이력도 함께 복원한다.
    * - kind='armed'인데 expiresAt이 이미 지났으면(오프라인 만료) 예약을 버리고
    *   expiredAt=expiresAt인 이력으로 낮춰 표시한다(전송 0건).
+   * - kind='hold'는 대기 중 예약이다. expiresAt이 없으면 forget, 이미 지났으면
+   *   만료 이력으로 표시하고(전송 0건), 아직 신선하고 budgetBlocksRestore가 아니면
+   *   RESTORE_HOLD로 대기(hold)를 되살린다. 결과가 SUSPENDED/hold가 아니거나
+   *   needsReview·열린 attempt·오래된 hold면 표시 이력만 복원한다(저장 레코드는
+   *   sync가 history로 낮춘다). hold를 RESTORE_EPOCH로 되살리지 않는다.
    * - kind='history'는 표시 이력만 복원하고 절대 RESTORE_EPOCH하지 않는다.
    * - needsReview·열린 attempt(budgetBlocksRestore)는 예약 복원만 차단하고 표시
    *   이력은 복원한다(저장 레코드는 history로 낮춰 재전송 복원을 막는다).
@@ -830,6 +886,69 @@ export function createCoordinator({
     const at = clock.now()
     const expiresAt = isFiniteNumber(record.expiresAt) ? record.expiresAt : null
     const doneAt = isFiniteNumber(record.doneAt) ? record.doneAt : null
+
+    // 대기(hold) 예약 레코드: 전송 예약(RESTORE_EPOCH)으로 되살리지 않는다.
+    if (record.kind === 'hold') {
+      // 1. expiresAt이 없으면 복원 근거가 없다.
+      if (expiresAt === null) {
+        forget()
+        return
+      }
+      // 2. 오프라인 중 만료: 예약을 버리고 만료 이력으로 낮춘다(전송 0건).
+      if (at >= expiresAt) {
+        if (at >= expiresAt + CACHE_HISTORY_RETENTION_MS) {
+          forget()
+          return
+        }
+        const expiredHistory = historyFromRecord({ ...record, expiresAt, expiredAt: expiresAt })
+        if (expiredHistory === null) {
+          forget()
+          return
+        }
+        restoreCacheHistoryDisplay(key, { ...expiredHistory, expiredAt: expiresAt }, true)
+        return
+      }
+      // 3. 예약 복원을 막는 조건(검토 필요·열린 attempt·오래된 hold)이면 표시 전용.
+      const holdFresh = doneAt !== null && at - doneAt < EPOCH_MEMORY_MAX_AGE_MS
+      if (!holdFresh || budgetBlocksRestore(target)) {
+        const displayHistory = historyFromRecord({ ...record, expiresAt })
+        if (displayHistory === null) {
+          forget()
+          return
+        }
+        restoreCacheHistoryDisplay(key, displayHistory, false)
+        return
+      }
+      // 4. 저장된 basisAt으로 대기 상태를 되살린다. 예약(epoch/attempt)은 만들지 않는다.
+      const holdState = applyReduce(key, {
+        type: 'RESTORE_HOLD',
+        basisAt: isFiniteNumber(record.basisAt) ? record.basisAt : doneAt,
+        now: at,
+      })
+      if (holdState !== null && holdState.phase === 'SUSPENDED' && isObject(holdState.hold)) {
+        const holdEntry = targets.get(key)
+        if (holdEntry) {
+          // 저장된 expiresAt·lastBlockReason을 유지하고, 대기 이력이 같은 hold id를
+          // 이어받게 한다. 이후 BLOCK이 같은 id로 기록된다.
+          holdEntry.cacheHistory = {
+            ...historyFromRecord(record),
+            epochId: holdState.hold.id,
+            expiredAt: null,
+          }
+          syncEpochMemory(key, holdState)
+        }
+        recordEpochRestored(key, record, target)
+        return
+      }
+      // 적용 조건이 맞지 않으면 표시 전용 복원으로 폴백한다.
+      const fallbackHistory = historyFromRecord({ ...record, expiresAt })
+      if (fallbackHistory === null) {
+        forget()
+        return
+      }
+      restoreCacheHistoryDisplay(key, fallbackHistory, false)
+      return
+    }
 
     // 표시 이력 전용 레코드: 예약은 절대 되살리지 않는다.
     if (record.kind === 'history') {
