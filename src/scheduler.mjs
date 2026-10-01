@@ -17,6 +17,8 @@
  * - `REVIEW_CLEARED`: NEEDS_REVIEW를 해제한다.
  * - `EXPIRE`: 'expire' 결정 뒤 epoch를 닫는다.
  * - `RESTORE_EPOCH`: 리로드 전 저장한 doneAt(및 basisAt)으로 초기 상태에 epoch를 복원한다.
+ * - `RESTORE_HOLD`: 리로드 전 저장한 인터랙티브 대기 hold(basisAt)로 초기 상태에
+ *   SUSPENDED/INTERACTIVE_WAIT와 hold를 복원한다. 예약(epoch/attempt)은 만들지 않는다.
  * - `RESTORE_CACHE_HISTORY`: 표시 이력 전용 복원. 초기 상태에 만료/취소 phase만 세우고
  *   예약(epoch/attempt)은 만들지 않는다.
  *
@@ -647,6 +649,42 @@ function reduceRestoreEpoch(state, input) {
 }
 
 /**
+ * 리로드 복원: 저장해 둔 인터랙티브 대기 hold의 basisAt으로 대기 상태를 되살린다.
+ * 예약 이력이 전혀 없는 초기 상태에서만 적용하며, 조건이 맞지 않으면 그대로 반환한다.
+ * epoch/attempt는 만들지 않는다(대기 중 전송 금지). basisAt은 저장값을 그대로 쓴다.
+ * @param {SchedulerState} state
+ * @param {{basisAt?:number, now?:number}} input
+ * @returns {SchedulerState}
+ */
+function reduceRestoreHold(state, input) {
+  const { basisAt, now } = input;
+  const eligible =
+    isFiniteNumber(basisAt) &&
+    isFiniteNumber(now) &&
+    basisAt <= now + TIMING.clockSkewMs &&
+    state.phase === 'UNKNOWN' &&
+    state.epoch === null &&
+    state.attempt === null &&
+    state.seenWorking === false &&
+    state.lastHook !== 'working';
+  if (!eligible) {
+    return copyState(state);
+  }
+  const next = copyState(state);
+  next.seenWorking = true;
+  next.lastHook = 'waiting';
+  next.lastHookAt = Math.max(state.lastHookAt ?? -Infinity, basisAt);
+  const holdId = state.epochSeq + 1;
+  next.epochSeq = holdId;
+  next.hold = { id: holdId, basisAt, attempted: false };
+  next.epoch = null;
+  next.attempt = null;
+  next.phase = 'SUSPENDED';
+  next.reason = 'INTERACTIVE_WAIT';
+  return next;
+}
+
+/**
  * 표시 이력 전용 복원(§2-5): 예약 이력이 전혀 없는 초기 상태에서만 저장된 만료/취소
  * 상태를 되살린다. 예약(epoch/attempt)은 만들지 않고, seenWorking=false와 모든 단조
  * 카운터를 그대로 둔다. 조건이 맞지 않으면 상태를 변경하지 않고 반환한다.
@@ -720,6 +758,8 @@ export function reduceTarget(state, input) {
       return reduceExpire(state, input);
     case 'RESTORE_EPOCH':
       return reduceRestoreEpoch(state, input);
+    case 'RESTORE_HOLD':
+      return reduceRestoreHold(state, input);
     case 'RESTORE_CACHE_HISTORY':
       return reduceRestoreCacheHistory(state, input);
     default:

@@ -1258,3 +1258,148 @@ test('deepFreeze한 state에 RESTORE_CACHE_HISTORY를 적용해도 throw하지 �
   const rejected = deepFreeze(armed(2000));
   assert.doesNotThrow(() => reduce(rejected, restoreHistory(false, { reason: 'X' })));
 });
+
+// ---------------------------------------------------------------------------
+// RESTORE_HOLD: 리로드 후 저장 hold로 인터랙티브 대기 복원
+// ---------------------------------------------------------------------------
+
+/** RESTORE_HOLD 입력을 만든다. */
+function restoreHold(basisAt, now) {
+  return { type: 'RESTORE_HOLD', basisAt, now };
+}
+
+test('RESTORE_HOLD: 초기 상태에서 대기 hold를 복원한다', () => {
+  const base = initialTargetState(TARGET);
+  const basisAt = 5000;
+  const state = reduce(base, restoreHold(basisAt, basisAt + 1000));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.reason, 'INTERACTIVE_WAIT');
+  assert.deepEqual(state.hold, { id: base.epochSeq + 1, basisAt, attempted: false });
+  assert.equal(state.epochSeq, base.epochSeq + 1);
+  assert.equal(state.seenWorking, true);
+  assert.equal(state.lastHook, 'waiting');
+  assert.equal(state.lastHookAt, basisAt);
+  assert.equal(state.epoch, null);
+  assert.equal(state.attempt, null);
+  // 다른 단조 카운터는 그대로.
+  assert.equal(state.generation, base.generation);
+  assert.equal(state.budgetResetSeq, base.budgetResetSeq);
+  assert.equal(state.selfTurnSeq, base.selfTurnSeq);
+
+  // 입력 state 불변.
+  assert.equal(base.phase, 'UNKNOWN');
+  assert.equal(base.seenWorking, false);
+  assert.equal(base.hold, null);
+});
+
+test('RESTORE_HOLD: 복원 뒤 waiting HOOK은 hold id·basisAt를 유지한다', () => {
+  const basisAt = 5000;
+  let state = reduce(initialTargetState(TARGET), restoreHold(basisAt, basisAt + 1000));
+  const hold = { ...state.hold };
+  state = reduce(state, hook('waiting', basisAt + 500));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.reason, 'INTERACTIVE_WAIT');
+  assert.deepEqual(state.hold, hold);
+  assert.equal(state.epochSeq, hold.id);
+});
+
+test('RESTORE_HOLD: 복원 뒤 working 없이 done은 hold 기준으로 ARMED', () => {
+  const basisAt = 5000;
+  let state = reduce(initialTargetState(TARGET), restoreHold(basisAt, basisAt + 1000));
+  const hold = { ...state.hold };
+  const doneAt = basisAt + 2000;
+  state = reduce(state, hook('done', doneAt));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.reason, null);
+  assert.equal(state.epoch.id, hold.id);
+  assert.equal(state.epoch.basisAt, hold.basisAt);
+  assert.equal(state.epoch.doneAt, doneAt);
+  assert.equal(state.epochSeq, hold.id);
+  assert.equal(state.hold, null);
+});
+
+test('RESTORE_HOLD: 복원 뒤 working HOOK은 일반 새 턴(BUSY, hold 해제)', () => {
+  const basisAt = 5000;
+  let state = reduce(initialTargetState(TARGET), restoreHold(basisAt, basisAt + 1000));
+  state = reduce(state, hook('working', basisAt + 500));
+  assert.equal(state.phase, 'BUSY');
+  assert.equal(state.epoch, null);
+  assert.equal(state.hold, null);
+  assert.equal(state.reason, 'BUSY');
+});
+
+test('RESTORE_HOLD: 부적격 상태면 그대로 반환한다', () => {
+  const basisAt = 5000;
+  const now = basisAt + 1000;
+
+  // phase가 UNKNOWN이 아님.
+  const busy = reduce(initialTargetState(TARGET), hook('working', 1000));
+  assert.deepEqual(reduce(busy, restoreHold(basisAt, now)), busy);
+
+  const armedState = armed(2000);
+  assert.deepEqual(reduce(armedState, restoreHold(basisAt, now)), armedState);
+
+  const review = reduce(awaitingTurn(3100), {
+    type: 'TICK',
+    now: 3100 + TIMING.turnStartConfirmMs + 1,
+  });
+  assert.equal(review.phase, 'NEEDS_REVIEW');
+  assert.deepEqual(reduce(review, restoreHold(basisAt, now)), review);
+
+  const base = initialTargetState(TARGET);
+
+  // seenWorking true.
+  const seen = { ...base, seenWorking: true };
+  assert.deepEqual(reduce(seen, restoreHold(basisAt, now)), seen);
+
+  // lastHook 'working'.
+  const lastWorking = { ...base, lastHook: 'working' };
+  assert.deepEqual(reduce(lastWorking, restoreHold(basisAt, now)), lastWorking);
+
+  // attempt 있음.
+  const withAttemptState = { ...base, attempt: { id: 'a1' } };
+  assert.deepEqual(reduce(withAttemptState, restoreHold(basisAt, now)), withAttemptState);
+
+  // epoch 있음.
+  const withEpoch = { ...base, epoch: { id: 1, doneAt: 1, basisAt: 1, attempted: false } };
+  assert.deepEqual(reduce(withEpoch, restoreHold(basisAt, now)), withEpoch);
+
+  // basisAt 비유한수.
+  assert.deepEqual(reduce(base, restoreHold(NaN, now)), base);
+  assert.deepEqual(reduce(base, restoreHold(undefined, now)), base);
+  assert.deepEqual(reduce(base, restoreHold('5000', now)), base);
+
+  // now 비유한수.
+  assert.deepEqual(reduce(base, restoreHold(basisAt, NaN)), base);
+
+  // basisAt > now + clockSkewMs.
+  assert.deepEqual(
+    reduce(base, restoreHold(now + TIMING.clockSkewMs + 1, now)),
+    base,
+  );
+
+  // 경계(now + clockSkewMs)는 허용.
+  const boundary = reduce(base, restoreHold(now + TIMING.clockSkewMs, now));
+  assert.equal(boundary.phase, 'SUSPENDED');
+});
+
+test('RESTORE_HOLD: 복원된 대기 상태에서 decide는 send를 내지 않는다', () => {
+  const basisAt = 1_000_000;
+  let state = reduce(initialTargetState(TARGET), restoreHold(basisAt, basisAt + 1000));
+  // TTL을 한참 지난 시각에도 대기 중이므로 전송 금지.
+  const result = decideWith(state, basisAt + TTL_5M * 10);
+  assert.notEqual(result.kind, 'send');
+  assert.equal(result.kind, 'wait');
+  assert.equal(result.reason, 'INTERACTIVE_WAIT');
+
+  // 응답으로 done이 오면 그때 ARMED가 된다.
+  state = reduce(state, hook('done', basisAt + 5000));
+  assert.equal(state.phase, 'ARMED');
+});
+
+test('deepFreeze한 state에 RESTORE_HOLD를 적용해도 throw하지 않는다', () => {
+  const frozen = deepFreeze(initialTargetState(TARGET));
+  assert.doesNotThrow(() => reduce(frozen, restoreHold(5000, 6000)));
+  const rejected = deepFreeze(armed(2000));
+  assert.doesNotThrow(() => reduce(rejected, restoreHold(5000, 6000)));
+});
