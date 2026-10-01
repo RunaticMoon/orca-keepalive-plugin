@@ -20,6 +20,8 @@ import { createPlugin } from '../../main.mjs'
 import { createCoordinator } from '../../src/coordinator.mjs'
 import { createEpochMemory } from '../../src/epoch-memory.mjs'
 import { CACHE_HISTORY_RETENTION_MS } from '../../src/contracts.mjs'
+import { DEFAULT_CONFIG } from '../../src/config.mjs'
+import { STATE_KEY } from '../../src/state-store.mjs'
 import { createFakeClock } from '../fixtures/fake-clock.mjs'
 import { startFakeRuntime } from '../fixtures/fake-runtime.mjs'
 import { createOrcaUserData } from '../fixtures/orca-userdata.mjs'
@@ -28,6 +30,9 @@ import { createFakeHost } from '../fixtures/fake-host.mjs'
 const TTL_5M = 300000
 const MARGIN_5M = 60000
 const DUE_5M = TTL_5M - MARGIN_5M // 240000
+const TTL_1H = 3600000
+const MARGIN_1H = 120000
+const DUE_1H = TTL_1H - MARGIN_1H // 3480000
 const TICK_MS = 2000
 const PANE_KEY = 'tab1:leaf1'
 const HANDLE = 'h1'
@@ -104,6 +109,10 @@ function requestJson({ method = 'GET', host = '127.0.0.1', port, path, token, or
  * 실제 createPlugin을 활성화한다. 캡처한 coordinator 인스턴스로 내부 이력도 본다.
  *
  * @param {Object} [options]
+ * @param {boolean} [options.enabled] Orca fixture의 promptCacheTimerEnabled(이제 TTL·게이트와 무관).
+ * @param {number} [options.pluginTtlMs] 플러그인 config TTL(ms)로 심는 값. 기본 5분(TTL_5M).
+ * @param {string} [options.profileId] Orca 활성 프로필 id.
+ * @param {number} [options.ttlMs] Orca fixture 타이머 TTL(호환용, 스케줄에는 쓰이지 않음).
  */
 async function createHarness(options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'cxpr-cache-'))
@@ -115,6 +124,7 @@ async function createHarness(options = {}) {
     socketPath,
     profileId: options.profileId ?? 'profile-1',
     enabled: options.enabled ?? false,
+    // Orca 타이머 값은 더 이상 TTL 출처가 아니다(fixture 호환용).
     ttlMs: options.ttlMs ?? TTL_5M,
   })
   const runtime = await startFakeRuntime({
@@ -133,6 +143,16 @@ async function createHarness(options = {}) {
 
   const host = createFakeHost()
   const clock = createFakeClock()
+
+  // 스케줄 TTL은 플러그인 config(claudeCacheTtlMs)에서 온다. Orca fixture의 타이머
+  // 값은 무시되므로, 활성화 전에 state-v1에 원하는 TTL을 심는다(형식은 state-store의
+  // validatePersistedState 계약과 동일: envelope schemaVersion 1 + parseConfig config).
+  host.storage.set(STATE_KEY, {
+    schemaVersion: 1,
+    revision: 0,
+    config: { ...DEFAULT_CONFIG, claudeCacheTtlMs: options.pluginTtlMs ?? TTL_5M },
+    profiles: [],
+  })
 
   const pluginDeps = {
     os: { homedir: () => userData.homeDir },
@@ -245,6 +265,28 @@ async function createHarness(options = {}) {
         token: dashboardInfo.token,
       })
       return { ...dashboardInfo, state: state.body, status: state.status }
+    },
+
+    /**
+     * 대시보드 config action(POST /api/action)으로 플러그인 config를 갱신한다.
+     * 성공 시 새 snapshot을 반환한다.
+     * @param {object} patch
+     * @returns {Promise<object>}
+     */
+    async updatePluginConfig(patch) {
+      const dashboard = await h.openDashboard()
+      const res = await requestJson({
+        method: 'POST',
+        port: dashboard.port,
+        path: '/api/action',
+        token: dashboard.token,
+        origin: dashboard.origin,
+        body: { type: 'config', patch, expectedRevision: dashboard.state.revision },
+      })
+      if (res.status !== 200) {
+        throw new Error('config action failed: ' + res.status + ' ' + JSON.stringify(res.body))
+      }
+      return res.body
     },
 
     /** 대시보드 snapshot의 첫 terminal을 찾는다(단일 터미널 하네스, 없으면 null). */
@@ -560,6 +602,107 @@ test('cache-state 6: paused(keepalive off)면 탭 prefix를 제거한다', async
     // 탭 제목에 남은 기호가 없어야 한다.
     const title = h.runtime.getTerminal(HANDLE).customTitle
     assert.ok(title === null || title === TITLE)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 7. 플러그인 config TTL 변경(5분→1시간) → 표시 expiresAt RETIME
+// ---------------------------------------------------------------------------
+
+test('cache-state 7: config TTL을 5분→1시간으로 바꾸면 표시 expiresAt가 새 TTL로 갱신된다', async () => {
+  const h = await createHarness({ enabled: true, pluginTtlMs: TTL_5M })
+  try {
+    await h.start()
+    const doneAt = await h.arm()
+    const basisAt = doneAt - 1000
+
+    const before = await h.waitForTerminal((t) => t.cacheStatus === 'scheduled')
+    assert.equal(before.expiresAt, basisAt + TTL_5M, '처음에는 5분 TTL')
+    assert.equal(before.dueAt, basisAt + DUE_5M)
+
+    // 대시보드 config action으로 플러그인 TTL을 1시간으로 올린다.
+    const updated = await h.updatePluginConfig({ claudeCacheTtlMs: TTL_1H })
+    assert.equal(updated.config.claudeCacheTtlMs, TTL_1H, 'config action이 TTL을 저장한다')
+
+    // 다음 tick에서 살아 있는 같은 epoch의 이력이 새 TTL로 RETIME된다.
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const after = await h.waitForTerminal((t) => t.expiresAt === basisAt + TTL_1H)
+    assert.equal(after.phase, 'ARMED')
+    assert.equal(after.cacheState, 'kept')
+    assert.equal(after.cacheStatus, 'scheduled')
+    assert.equal(after.dueAt, basisAt + DUE_1H, 'dueAt도 1시간 margin으로 재계산')
+    assert.equal(h.runtime.getTerminal(HANDLE).customTitle, KEPT_PREFIX + TITLE)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 8. Orca 타이머 OFF여도 플러그인 config TTL로 정상 표시(⚡)
+// ---------------------------------------------------------------------------
+
+test('cache-state 8: Orca 타이머가 꺼져 있어도 플러그인 config TTL로 kept/⚡를 표시한다', async () => {
+  const h = await createHarness({ enabled: false, pluginTtlMs: TTL_5M })
+  try {
+    await h.start()
+    const doneAt = await h.arm()
+    const basisAt = doneAt - 1000
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const term = await h.waitForTerminal((t) => t.cacheStatus === 'scheduled')
+    assert.equal(term.phase, 'ARMED')
+    assert.equal(term.cacheState, 'kept')
+    assert.equal(term.cacheStatus, 'scheduled')
+    assert.equal(term.indicatorOn, true, 'Orca 타이머 OFF는 표시 게이트가 아니다')
+    assert.equal(term.expiresAt, basisAt + TTL_5M)
+    await h.waitForTitle(KEPT_PREFIX)
+    assert.equal(h.runtime.getTerminal(HANDLE).customTitle, KEPT_PREFIX + TITLE)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 9. 과거 APP_TIMER_OFF 이력 호환 복원
+// ---------------------------------------------------------------------------
+
+test('cache-state 9: 과거 APP_TIMER_OFF 이력도 로드·표시가 깨지지 않는다', async () => {
+  const h = await createHarness({ enabled: true, pluginTtlMs: TTL_5M })
+  try {
+    await h.start()
+    h.runtime.setDraft(HANDLE, '사용자 초안 텍스트')
+    const doneAt = await h.arm()
+    const basisAt = doneAt - 1000
+    const expiresAt = basisAt + TTL_5M
+
+    await h.advanceTo(basisAt + DUE_5M + TICK_MS * 2)
+    await h.settleSend()
+    await h.advanceTo(expiresAt + TICK_MS)
+    await h.waitForTerminal((t) => t.cacheStatus === 'expired')
+
+    // 저장된 만료 이력의 lastBlockReason을 레거시 APP_TIMER_OFF로 바꾼 뒤 재시작한다.
+    const value = h.host.storage.get('epochs-v1')
+    assert.ok(value && value.entries, 'epochs-v1 저장값이 있어야 한다')
+    for (const record of Object.values(value.entries)) {
+      if (record && record.worktreeId === WORKTREE) {
+        record.lastBlockReason = 'APP_TIMER_OFF'
+      }
+    }
+    h.host.storage.set('epochs-v1', value)
+
+    h.runtime.getTerminal(HANDLE).incarnationId = 'inc-app-timer-off'
+    await h.reload()
+
+    const restored = await h.waitForTerminal((t) => t.cacheStatus === 'expired')
+    assert.equal(restored.phase, 'EXPIRED')
+    assert.equal(restored.cacheState, 'none')
+    assert.equal(restored.expireCause, 'APP_TIMER_OFF', '과거 APP_TIMER_OFF를 만료 원인으로 유지')
+    assert.equal(restored.expiredAt, expiresAt)
+    assert.equal(restored.expiresAt, expiresAt)
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    await h.waitForTitle(NONE_PREFIX)
   } finally {
     await h.cleanup()
   }
