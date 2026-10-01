@@ -317,7 +317,7 @@ test('togglePause calls controller.togglePaused and notifies when resumed', asyn
   assert.equal(notifyCalls[0].title, 'Cache Keepalive')
   assert.equal(
     notifyCalls[0].body,
-    '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+    '모든 keepalive를 켰습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
   )
 })
 
@@ -353,7 +353,7 @@ test('togglePause toggles in both directions on consecutive calls', async () => 
     notifyCalls.map((call) => call.body),
     [
       '모든 keepalive를 껐습니다(일시정지).',
-      '모든 keepalive를 켰습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+      '모든 keepalive를 켰습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
     ],
   )
 })
@@ -472,10 +472,23 @@ test('pause and resume call setPaused idempotently with fixed messages', async (
     [
       '모든 keepalive를 일시정지했습니다.',
       '모든 keepalive를 일시정지했습니다.',
-      'keepalive를 재개했습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
-      'keepalive를 재개했습니다. (Orca 프롬프트 캐시 타이머 설정과 상한은 그대로 적용됩니다)',
+      'keepalive를 재개했습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
+      'keepalive를 재개했습니다. (캐시 TTL 설정과 연속 상한은 그대로 적용됩니다)',
     ],
   )
+})
+
+test('keepalive notifications no longer mention the Orca prompt cache timer', async () => {
+  const { notifyCalls, handlerFor } = setup()
+  const removed = 'Orca 프롬프트 캐시 타이머'
+
+  await handlerFor(COMMAND_IDS.togglePause)()
+  await handlerFor(COMMAND_IDS.resume)()
+
+  assert.equal(notifyCalls.length, 2)
+  for (const call of notifyCalls) {
+    assert.ok(!call.body.includes(removed), `알림 문구에 "${removed}"가 없다: ${call.body}`)
+  }
 })
 
 test('status handler notifies the summary text', async () => {

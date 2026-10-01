@@ -29,7 +29,7 @@ import { createStateStore } from './src/state-store.mjs'
 import { resolveBinding } from './src/runtime-location.mjs'
 import { createRpcClient } from './src/rpc-client.mjs'
 import { createObserver } from './src/terminal-observer.mjs'
-import { readTimerSettings } from './src/orca-settings.mjs'
+import { readActiveProfile } from './src/orca-settings.mjs'
 import { sendKeepalive } from './src/guarded-send.mjs'
 import { initialTargetState, reduceTarget, decide } from './src/scheduler.mjs'
 import { createDiagnostics } from './src/diagnostics.mjs'
@@ -96,7 +96,7 @@ export function createPlugin(orca, deps = {}) {
     resolveBinding: resolveBindingImpl = resolveBinding,
     createRpcClient: makeRpcClient = createRpcClient,
     createObserver: makeObserver = createObserver,
-    readTimerSettings: readSettings = readTimerSettings,
+    readActiveProfile: readSettings = readActiveProfile,
     sendKeepalive: sendKeepaliveImpl = sendKeepalive,
     initialTargetState: initialTargetStateImpl = initialTargetState,
     reduceTarget: reduceTargetImpl = reduceTarget,

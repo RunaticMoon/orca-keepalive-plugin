@@ -220,6 +220,37 @@ test('message: UTF-8 512 bytes 허용, 513 bytes 거절', () => {
 });
 
 // ---------------------------------------------------------------------------
+// claudeCacheTtlMs
+// ---------------------------------------------------------------------------
+
+test('claudeCacheTtlMs: 기본값은 1시간(3600000)', () => {
+  assert.equal(DEFAULT_CONFIG.claudeCacheTtlMs, 3600000);
+  assert.equal(parseConfig({}).claudeCacheTtlMs, 3600000);
+  assert.equal(parseConfig({ schemaVersion: 2 }).claudeCacheTtlMs, 3600000);
+});
+
+test('claudeCacheTtlMs: 300000/3600000만 허용', () => {
+  assert.equal(parseConfig({ claudeCacheTtlMs: 300000 }).claudeCacheTtlMs, 300000);
+  assert.equal(parseConfig({ claudeCacheTtlMs: 3600000 }).claudeCacheTtlMs, 3600000);
+});
+
+test('claudeCacheTtlMs: 비정수/비숫자는 invalid_type', () => {
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: '300000' }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: null }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: true }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: 1.5 }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: Number.NaN }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: Infinity }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: undefined }), 'invalid_type', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: {} }), 'invalid_type', 'claudeCacheTtlMs');
+});
+
+test('claudeCacheTtlMs: 그 밖의 정수는 out_of_range', () => {
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: 600000 }), 'out_of_range', 'claudeCacheTtlMs');
+  assertValidation(() => parseConfig({ claudeCacheTtlMs: 0 }), 'out_of_range', 'claudeCacheTtlMs');
+});
+
+// ---------------------------------------------------------------------------
 // parseConfigPatch
 // ---------------------------------------------------------------------------
 
@@ -255,6 +286,22 @@ test('patch: 필드가 잘못되면 거절', () => {
   assertValidation(() => parseConfigPatch({ paused: 'yes' }, DEFAULT_CONFIG), 'invalid_type', 'paused');
 });
 
+test('patch: claudeCacheTtlMs 병합/검증', () => {
+  const merged = parseConfigPatch({ claudeCacheTtlMs: 300000 }, DEFAULT_CONFIG);
+  assert.equal(merged.claudeCacheTtlMs, 300000);
+  assert.equal(DEFAULT_CONFIG.claudeCacheTtlMs, 3600000, 'patch는 원본을 변경하지 않는다');
+  assertValidation(
+    () => parseConfigPatch({ claudeCacheTtlMs: '300000' }, DEFAULT_CONFIG),
+    'invalid_type',
+    'claudeCacheTtlMs',
+  );
+  assertValidation(
+    () => parseConfigPatch({ claudeCacheTtlMs: 600000 }, DEFAULT_CONFIG),
+    'out_of_range',
+    'claudeCacheTtlMs',
+  );
+});
+
 test('patch: prototype pollution key 거절', () => {
   assertValidation(
     () => parseConfigPatch(JSON.parse('{"__proto__":{"x":1}}'), DEFAULT_CONFIG),
@@ -286,6 +333,13 @@ test('마이그레이션: 레거시 키가 없으면 새 기본값', () => {
   const migrated = parseConfig({ schemaVersion: 1 });
   assert.equal(migrated.maxConsecutiveKeepalives5m, 8);
   assert.equal(migrated.maxConsecutiveKeepalives1h, 3);
+});
+
+test('마이그레이션: v1 결과에 claudeCacheTtlMs 기본값이 포함된다', () => {
+  assert.equal(parseConfig({ schemaVersion: 1 }).claudeCacheTtlMs, 3600000);
+  assert.equal(parseConfig({ schemaVersion: 1, claudeCacheTtlMs: 300000 }).claudeCacheTtlMs, 300000);
+  // v1 current를 patch해도 기본값이 채워진다.
+  assert.equal(parseConfigPatch({ paused: true }, { schemaVersion: 1 }).claudeCacheTtlMs, 3600000);
 });
 
 test('마이그레이션: tabTitleIndicator false도 true로 강제한다', () => {

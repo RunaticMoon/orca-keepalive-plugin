@@ -117,7 +117,8 @@ input:disabled {
 }
 
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+.config-form select {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;

@@ -35,7 +35,7 @@ node --test test/integration/keepalive.test.mjs
 - `config.test.mjs` — 설정 기본값·검증·경계값
 - `runtime-location.test.mjs` — 런타임 metadata 경로/binding
 - `rpc-client.test.mjs` — 줄단위 RPC transport/envelope/오류
-- `orca-settings.test.mjs` — 활성 프로필 타이머 설정 읽기
+- `orca-settings.test.mjs` — 활성 프로필 index 읽기(전환 감지·실패 처리)
 - `state-store.test.mjs` — 영속 상태 journal/budget
 - `scheduler.test.mjs` — epoch 상태 머신
 - `cache-history.test.mjs` — 표시 전용 캐시 관측 이력 순수 reducer
@@ -54,10 +54,10 @@ node --test test/integration/keepalive.test.mjs
 `main.mjs`의 `createPlugin`** 을 활성화해 실제 wire와 host 계약을 재현합니다. 실제
 shell/claude/Orca 프로세스는 실행하지 않습니다.
 
-**시나리오 13개:**
+**시나리오 (integration):**
 
-1. `scenario 1` — timer off는 전송 0, on 후 기존 idle도 0, 새 turn의 due에서 paste 1 + Enter 1
-2. `scenario 2` — TTL 1시간은 `done + 3480s` 부근에서 전송
+1. `scenario 1` — Orca 타이머가 꺼져 있어도 플러그인 TTL 기준 fresh epoch due에서 paste 1 + Enter 1
+2. `scenario 2` — 저장 config에 새 키가 없으면 기본 1시간 TTL로 dueAt을 계산
 3. `scenario 3` — 자체 순환 3회 후 4번째 0, 비자체 turn이면 budget reset 후 재전송
 4. `scenario 4a` — 입력창에 draft가 있으면 전송 0
 5. `scenario 4b` — permission 상태면 전송 0
@@ -69,6 +69,16 @@ shell/claude/Orca 프로세스는 실행하지 않습니다.
 11. `scenario 9` — wall clock이 1시간 점프(절전)하면 burst 전송 0
 12. `scenario 10` — pause면 전송 0, resume 뒤 다음 turn부터 재개
 13. `scenario 11` — 5분 이상 가상 시간 동안 `host.call(storage.get)` heartbeat 존재
+14. `scenario 12` — 관측 전 탭은 💤, fresh working→done 뒤 ⚡, off면 원래대로 복구
+15. `scenario 13` — 💤 적용 뒤 런타임 제목이 달라져도 off면 customTitle 해제
+16. `scenario 14` — deactivate→재activate 뒤 저장된 예약을 ARMED로 복원(`epoch_restored`)
+17. `scenario 15` — 명시 5분 config로 dueAt을 계산하고 Orca fixture TTL 변경에 영향받지 않음
+18. `scenario 16` — config action으로 `claudeCacheTtlMs`를 바꾸면 ARMED dueAt 재계산
+19. `scenario 17` — 활성 프로필 index가 손상되면 예약돼도 전송 0(`SETTINGS_UNKNOWN`)
+
+`test/integration/cache-state.test.mjs`는 표시 상태(kept/none/review, ⚡/💤/⚠️)와 만료
+이력·탭 prefix를 9개 시나리오로 검증합니다(재시작 유지, 24시간 prune, config TTL 변경
+시 표시 갱신, 과거 `APP_TIMER_OFF` 이력 호환 등).
 
 각 테스트는 tmpdir/fake clock/fake socket을 쓰고 실제 사용자 터미널에 접근하지 않습니다.
 
@@ -91,7 +101,7 @@ node scripts/demo.mjs --speed 60 --exit-after 60
 
 확인 체크리스트:
 
-- [ ] 대시보드가 열리고 앱 타이머/연결/일시정지 상태가 보인다.
+- [ ] 대시보드가 열리고 캐시 TTL/프로필 경고(프로필 미확인 시)/연결/일시정지 상태가 보인다.
 - [ ] 워크트리 토글이 켜짐/꺼짐/(기본)을 구분해 표시된다.
 - [ ] 터미널 on/off/inherit가 동작하고 `유지 설정 켜짐/꺼짐`과 사유가 함께 표시된다.
 - [ ] 캐시 상태 문구(`캐시 유지 중 · …`, `예약 없음 · …` 등)가 phase가 아니라 캐시 상태로 보이고, 만료 예정 시각과 만료 사유 안내가 함께 표시된다.
@@ -114,8 +124,8 @@ node scripts/demo.mjs --speed 60 --exit-after 60
 
 1. [실기] Orca 명령 팔레트(⌘J / Ctrl+Shift+J)에서 **Cache Keepalive: Show Status**를
    실행한다.
-2. [ ] 첫 줄이 `켜짐` 또는 `꺼짐(일시정지)`으로 시작하고, 타이머(예: `타이머 켜짐(5분)`)·
-   연결 상태·`워크트리 N개`를 포함한다.
+2. [ ] 첫 줄이 `켜짐` 또는 `꺼짐(일시정지)`으로 시작하고, 캐시 TTL(예: `캐시 TTL 1시간`)·
+   연결 상태·`워크트리 N개`를 포함한다. 프로필을 읽지 못하면 `Orca 프로필 확인 불가`가 붙는다.
 3. [ ] 터미널이 있는 워크트리에서 명령을 실행했다면 그 워크트리 줄이 맨 앞에 오고
    `▶`가 붙는다. 워크트리를 특정할 수 없으면 `▶`가 아예 없다.
 4. [ ] 워크트리 줄에 설정 상태(`켜짐`/`꺼짐` + `(기본값)`/`(직접 설정)`)과 별도로 캐시
@@ -125,7 +135,7 @@ node scripts/demo.mjs --speed 60 --exit-after 60
    `켜짐(일시정지 중)`으로 표시된다.
 6. [ ] 예약된 터미널이 있으면 해당 워크트리 줄에 `다음 전송 … 후`가 붙는다. 꺼진
    워크트리·일시정지 중에는 다음 전송이 표시되지 않는다.
-7. [ ] 워크트리를 많이 만든 데모에서 본문이 900자 이하이고 마지막 줄이
+7. [ ] 워크트리를 많이 만든 데모에서 본문이 480자 이하이고 마지막 줄이
    `… 외 N개`로 끝난다. 알림에 원시 worktreeId·경로·토큰이 없다.
 
 **B. 변경 알림 (대시보드·터미널 CLI)**
@@ -160,9 +170,9 @@ node scripts/demo.mjs --speed 60 --exit-after 60
 5. [ ] 실제 만료 10초 전 구간에서는 기호가 `💤 `로 내려가고, 대시보드는
    `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 HH:MM`을 보여준다. 그 전에는 `⚡ `다.
 6. [ ] 다음 조건 중 하나라도 깨지면 기호가 해제되어 Orca 자동 이름으로 돌아온다:
-   전역 일시정지, 워크트리 끄기, 터미널 끄기, Orca 프롬프트 캐시 타이머 끄기,
-   런타임 연결 끊김, 연속 전송 상한 도달, `respectCwarmDisabled`가 켜진 상태에서
-   `~/.claude/cwarm.disabled` 존재.
+   전역 일시정지, 워크트리 끄기, 터미널 끄기, Orca 활성 프로필 확인 불가
+   (0.2.0부터; Orca 앱 타이머와 무관), 런타임 연결 끊김, 연속 전송 상한 도달,
+   `respectCwarmDisabled`가 켜진 상태에서 `~/.claude/cwarm.disabled` 존재.
 7. [ ] 플러그인을 재시작(disable/enable)한 뒤에도 직전 만료 이력과 그 원인이 유지된다.
    새 턴을 완료하면 이력이 지워지고 `⚡ `로 복귀한다.
 8. [ ] 같은 탭의 split pane에서 한 pane은 유지 중, 다른 pane은 확인 필요일 때 탭은
@@ -202,15 +212,19 @@ DESIGN.md §10 기반. 실제 Orca 데스크톱과 disposable Claude 세션에�
 1. manifest/package 정합성을 확인하고 Orca **설정 > Plugins > Development**에 저장소
    절대 경로를 추가한 뒤 권한을 승인하고 Dashboard를 연다. 앱 시작만으로 worker가
    자동 기동하지 않는 점을 확인한다.
-2. 실제 worker의 `process.versions`, `node:sqlite` feature probe, metadata의
-   `pid == parent pid`를 확인한다. 기본 경로와 custom userData override를 각각 smoke.
-   SQLite 미지원이면 명확한 disabled 진단이 나오고 전송이 없어야 한다.
+2. 실제 worker의 `process.versions`와 metadata의 `pid == parent pid`를 확인한다. 기본
+   경로와 custom userData override를 각각 smoke. 활성 프로필 index(`orca-profile-index.json`)를
+   읽지 못하면 `SETTINGS_UNKNOWN`으로 전송이 중단되어야 한다(0.2.0부터 프로필 SQLite
+   `profile-state.db`·`orca-data.json`은 읽지 않으므로 `node:sqlite` 미지원 여부와 무관).
 3. 앱 **Settings > Agents > Prompt Cache Timer**를 **끈** 상태에서 턴을 완료시키고
-   전체 TTL 이상 기다려 자동 전송 **0건**을 확인한다. 그 뒤 타이머를 켜고 fresh
-   turn을 완료시켜, renderer 표시와 대시보드의 예상 만료 시각 차이를 기록한다(정확 일치는
-   합격 조건이 아님). 만료 뒤 대시보드에 `캐시 만료됨 · HH:MM · <마지막 차단 사유>`가
-   보이고, 그 사유가 실제 원인 확정이 아니라 마지막으로 기록된 차단 사유라는 안내가 함께
-   표시되는지 확인한다.
+   전체 TTL 이상 기다려도 플러그인 설정 TTL 기준으로 전송이 **일어나는지** 확인한다
+   (0.2.0부터 앱 타이머 off는 중지가 아님). 중지는 플러그인 전역 pause / 워크트리·터미널
+   off / `~/.claude/cwarm.disabled`로 확인한다. 대시보드 설정에서 **Claude Code 캐시 TTL**을
+   1시간↔5분으로 바꾸고 due/만료/상한이 실제 TTL에 맞게 재계산되는지, 저장 config에 새 키가
+   없을 때 기본 1시간으로 동작하는지 확인한다. fresh turn을 완료시켜 renderer 표시와
+   대시보드의 예상 만료 시각 차이를 기록한다(정확 일치는 합격 조건이 아님). 만료 뒤
+   대시보드에 `캐시 만료됨 · HH:MM · <마지막 차단 사유>`가 보이고, 그 사유가 실제 원인
+   확정이 아니라 마지막으로 기록된 차단 사유라는 안내가 함께 표시되는지 확인한다.
 4. W1/W2 로컬 워크트리와 W1의 split 터미널 2개를 만든다. W1 off/W2 on, terminal
    단독 off가 각각 동작하는지 확인한다. W2가 비활성 워크트리여도 승인된 대상만
    keepalive된다. dashboard/browser 열기가 의도한 Orca desktop에 나타나야 한다.
@@ -226,8 +240,9 @@ DESIGN.md §10 기반. 실제 Orca 데스크톱과 disposable Claude 세션에�
    사이 레이스가 원자적으로 해결됐다고 주장하지 않는다.
 7. 동일 PTY를 mobile에서 조작해 desktop input lock 상태에서 전송이 거절되는지
    확인한다. RPC client가 viewport/floor를 탈취하지 않아야 한다.
-8. due 근처에 전역 pause, terminal off, 앱 timer off를 각각 시험한다. plugin pause는
-   후속 write를 막고, 앱 off는 디스크 저장 지연을 측정해 기록한다.
+8. due 근처에 전역 pause, terminal off, 플러그인 TTL 5분↔1시간 변경을 각각 시험한다.
+   plugin pause는 후속 write를 막고, TTL 변경은 ARMED 예약의 due/만료를 새 기준으로
+   재계산한다(짧아져 마감이 지나면 만료, catch-up 없음).
 9. Orca restart, worker 재기동, terminal 종료·재생성, profile switch, sleep/wake를
    확인한다. 과거 due의 catch-up/중복 Enter가 없어야 하고, 미완료 journal은 review로
    복원되어야 한다. 재시작 전의 만료 이력(시각·마지막 차단 사유)과 탭 기호가 재시작

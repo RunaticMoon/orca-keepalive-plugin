@@ -233,7 +233,7 @@ function refusedReasonToCode(refusedReason) {
  * @param {string} options.clientId
  * @param {{ call: (method: string, params: unknown, options?: {signal?: AbortSignal}) => Promise<unknown> }} options.rpc
  * @param {(target: SendTarget, options?: {signal?: AbortSignal}) => Promise<SendObservation>} options.inspect
- * @param {() => Promise<{allowed: boolean, reason: string|null}>} options.assertAllowed 앱 타이머/정책/pause/세대를 합성한 최신 허용 판정.
+ * @param {() => Promise<{allowed: boolean, reason: string|null}>} options.assertAllowed 프로필 설정/정책/pause/세대를 합성한 최신 허용 판정.
  * @param {{ reserveAttempt: Function, recordAttempt: Function, refuseAttempt: Function, markReview: Function }} options.journal
  * @param {SendClock} options.clock
  * @param {AbortSignal} [options.signal]

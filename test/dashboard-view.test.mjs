@@ -37,19 +37,20 @@ function makeSnapshot(overrides = {}) {
   const base = {
     revision: 7,
     serverNow: SERVER_NOW,
-    appTimer: { known: true, enabled: true, ttlMs: 300000, source: 'sqlite', readAt: SERVER_NOW - 1000 },
+    profileSettings: { known: true, source: 'index', readAt: SERVER_NOW - 1000, reason: null },
     connection: { state: 'connected' },
     config: {
       paused: false,
       defaultWorktreeEnabled: true,
       message: 'keepalive',
+      claudeCacheTtlMs: 3600000,
       margin5mMs: 30000,
       margin1hMs: 60000,
       quietOutputMs: 5000,
       observedInputQuietMs: 5000,
       maxConsecutiveKeepalives5m: 8,
       maxConsecutiveKeepalives1h: 3,
-      maxConsecutiveKeepalivesActive: 8,
+      maxConsecutiveKeepalivesActive: 3,
       respectCwarmDisabled: true,
       logLevel: 'info',
       runtimeUserDataPath: null,
@@ -243,16 +244,16 @@ test('toViewModel: cache fields pass through safely and missing fields become no
 /* toViewModel                                                         */
 /* ------------------------------------------------------------------ */
 
-test('toViewModel: base snapshot flattens worktrees, terminals and timers', () => {
+test('toViewModel: base snapshot flattens worktrees, terminals and cache TTL', () => {
   const vm = toViewModel(makeSnapshot(), 0);
   assert.equal(vm.revision, 7);
   assert.equal(vm.paused, false);
   assert.equal(vm.pauseLabel, '일시정지');
   assert.equal(vm.connection.connected, true);
-  assert.equal(vm.appTimer.known, true);
-  assert.equal(vm.appTimer.ttlMs, 300000);
-  assert.match(vm.appTimer.text, /켜짐/);
-  assert.match(vm.appTimer.text, /5분/);
+  assert.equal(vm.profileSettings.known, true);
+  assert.equal(vm.profileSettings.warning, '');
+  assert.equal(vm.cacheTtl.ttlMs, 3600000);
+  assert.equal(vm.cacheTtl.text, '1시간');
   assert.equal(vm.worktrees.length, 1);
   assert.equal(vm.worktrees[0].label, 'main');
   assert.equal(vm.worktrees[0].branch, '');
@@ -266,22 +267,35 @@ test('toViewModel: base snapshot flattens worktrees, terminals and timers', () =
   assert.equal(t1.dueText, '3:20');
   assert.equal(t1.expired, false);
   assert.equal(t1.reasonText, reasonText('BUSY'));
-  assert.equal(vm.maxConsecutiveText, '8');
+  assert.equal(vm.maxConsecutiveText, '3');
+});
+
+test('toViewModel: plugin cache TTL is displayed independently of profile state', () => {
+  const snap = makeSnapshot({ profileSettings: { known: false, source: null, readAt: null, reason: 'SETTINGS_UNKNOWN' } });
+  assert.equal(toViewModel(snap).cacheTtl.text, '1시간');
+  assert.match(toViewModel(snap).profileSettings.warning, /Orca 프로필을 읽을 수 없어 전송이 중지됨/);
+  snap.config.claudeCacheTtlMs = 300000;
+  assert.equal(toViewModel(snap).cacheTtl.text, '5분');
+  snap.config.claudeCacheTtlMs = 123456;
+  assert.equal(toViewModel(snap).cacheTtl.text, '알 수 없음');
 });
 
 test('toViewModel: 현재 TTL의 상한을 표시하고 active 값이 우선한다', () => {
   const snap = makeSnapshot();
   delete snap.config.maxConsecutiveKeepalivesActive;
+  assert.equal(toViewModel(snap).maxConsecutiveText, '3');
+
+  snap.config.claudeCacheTtlMs = 300000;
   assert.equal(toViewModel(snap).maxConsecutiveText, '8');
 
-  snap.appTimer.ttlMs = 3600000;
+  snap.config.claudeCacheTtlMs = 3600000;
   assert.equal(toViewModel(snap).maxConsecutiveText, '3');
 
   snap.config.maxConsecutiveKeepalivesActive = 0;
   assert.equal(toViewModel(snap).maxConsecutiveText, '무제한');
 
   delete snap.config.maxConsecutiveKeepalivesActive;
-  snap.appTimer.ttlMs = null;
+  snap.config.claudeCacheTtlMs = null;
   assert.equal(toViewModel(snap).maxConsecutiveText, '3');
   snap.config.maxConsecutiveKeepalives1h = 0;
   assert.equal(toViewModel(snap).maxConsecutiveText, '8', '0은 무제한이므로 유한한 상한을 선택');
@@ -444,14 +458,26 @@ test('toViewModel: unavailable connection is not connected', () => {
   assert.equal(vm.connection.reasonText, reasonText('RUNTIME_UNAVAILABLE'));
 });
 
-test('toViewModel: unknown app timer exposes the reason', () => {
+test('toViewModel: unknown profile displays a separate warning', () => {
   const snap = makeSnapshot({
-    appTimer: { known: false, reason: 'SETTINGS_UNKNOWN', readAt: SERVER_NOW },
+    profileSettings: { known: false, reason: 'SETTINGS_UNKNOWN', readAt: SERVER_NOW },
   });
   const vm = toViewModel(snap, 0);
-  assert.equal(vm.appTimer.known, false);
-  assert.match(vm.appTimer.text, /알 수 없음/);
-  assert.match(vm.appTimer.text, /설정을 읽지 못했습니다/);
+  assert.equal(vm.profileSettings.known, false);
+  assert.equal(vm.cacheTtl.text, '1시간');
+  assert.match(vm.profileSettings.warning, /전송이 중지됨/);
+});
+
+test('historical timer block explains past Orca behavior without enable instructions', () => {
+  const snap = makeSnapshot();
+  snap.worktrees[0].terminals[0].reason = 'APP_TIMER_OFF';
+  snap.worktrees[0].terminals[0].cacheStatus = 'expired';
+  snap.worktrees[0].terminals[0].expireCause = 'APP_TIMER_OFF';
+  const terminal = toViewModel(snap).worktrees[0].terminals[0];
+  assert.match(terminal.reasonText, /과거 Orca 타이머 설정/);
+  assert.match(cacheStatusDisplay(terminal, SERVER_NOW).text, /과거 Orca 타이머 설정/);
+  assert.doesNotMatch(terminal.reasonText, /켜|활성화/);
+  assert.equal(DIAGNOSTIC_EVENT_TEXT.settings_changed, 'Orca 프로필 확인 상태가 변경됨');
 });
 
 test('toViewModel: diagnostics keep only the most recent 20 entries', () => {
@@ -721,6 +747,17 @@ test('config form: TTL별 상한 입력과 도움말이 연결되고 레거시 �
   assert.doesNotMatch(indexHtml, /\bname="maxConsecutiveKeepalives"/);
 });
 
+test('config form: cache TTL select has a visible label and linked guidance', () => {
+  const select = indexHtml.match(/<select\b[^>]*\bid="cfg-cache-ttl"[^>]*>/)?.[0];
+  assert.ok(select);
+  assert.match(select, /\bname="claudeCacheTtlMs"/);
+  assert.match(select, /\baria-describedby="cfg-cache-ttl-description"/);
+  assert.match(indexHtml, /<label for="cfg-cache-ttl">Claude Code 캐시 TTL<\/label>/);
+  assert.match(indexHtml, /<option value="3600000">1시간 \(기본\)<\/option>/);
+  assert.match(indexHtml, /<option value="300000">5분<\/option>/);
+  assert.match(indexHtml, /id="cfg-cache-ttl-description"[^>]*>Claude Code 구독은 보통 1시간/);
+});
+
 test('config form: missing, true, and false snapshots render; Save sends changed checkbox value', async () => {
   const globals = Object.fromEntries(
     ['document', 'window', 'sessionStorage', 'fetch'].map((key) => [key, globalThis[key]]),
@@ -729,6 +766,7 @@ test('config form: missing, true, and false snapshots render; Save sends changed
   const intervals = [];
   const actions = [];
   let state = makeSnapshot({ worktrees: [], diagnostics: [] });
+  let actionStatus = 200;
 
   function makeNode() {
     return {
@@ -762,6 +800,12 @@ test('config form: missing, true, and false snapshots render; Save sends changed
       if (url === '/api/action') {
         const action = JSON.parse(options.body);
         actions.push(action);
+        if (actionStatus === 409) {
+          return { ok: false, status: 409, json: async () => ({ error: { code: 'REVISION_CONFLICT' } }) };
+        }
+        if (actionStatus === 400) {
+          return { ok: false, status: 400, json: async () => ({ error: { code: 'out_of_range' } }) };
+        }
         state = { ...state, config: { ...state.config, ...action.patch } };
       }
       return { ok: true, status: 200, json: async () => state };
@@ -774,10 +818,22 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     const checkbox = nodes.get('cfg-tab-title-indicator');
     const limit5m = nodes.get('cfg-max-consecutive-5m');
     const limit1h = nodes.get('cfg-max-consecutive-1h');
+    const cacheTtl = nodes.get('cfg-cache-ttl');
     const form = nodes.get('config-form');
     assert.equal(checkbox.checked, false, 'missing field defaults to off');
     assert.equal(limit5m.value, '8');
     assert.equal(limit1h.value, '3');
+    assert.equal(cacheTtl.value, '3600000');
+    assert.equal(nodes.get('cache-ttl').textContent, '1시간');
+
+    state = { ...state, profileSettings: { known: false, source: null, readAt: null, reason: 'SETTINGS_UNKNOWN' } };
+    intervals[0]();
+    await settle();
+    assert.match(nodes.get('profile-warning').textContent, /Orca 프로필을 읽을 수 없어 전송이 중지됨/);
+    state = { ...state, profileSettings: { known: true, source: 'index', readAt: SERVER_NOW, reason: null } };
+    intervals[0]();
+    await settle();
+    assert.equal(nodes.get('profile-warning').textContent, '');
 
     state = { ...state, config: { ...state.config, tabTitleIndicator: true } };
     intervals[0]();
@@ -788,6 +844,12 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     intervals[0]();
     await settle();
     assert.equal(checkbox.checked, false);
+
+    cacheTtl.value = '300000';
+    form.listeners.get('change')();
+    intervals[0]();
+    await settle();
+    assert.equal(cacheTtl.value, '300000', 'polling must preserve a dirty selection');
 
     checkbox.checked = true;
     limit5m.value = '1001';
@@ -806,7 +868,36 @@ test('config form: missing, true, and false snapshots render; Save sends changed
     assert.equal(actions[0].patch.tabTitleIndicator, true);
     assert.equal(actions[0].patch.maxConsecutiveKeepalives5m, 6);
     assert.equal(actions[0].patch.maxConsecutiveKeepalives1h, 2);
+    assert.equal(actions[0].patch.claudeCacheTtlMs, 300000);
+    assert.equal(nodes.get('cache-ttl').textContent, '5분');
     assert.equal(Object.hasOwn(actions[0].patch, 'maxConsecutiveKeepalives'), false);
+
+    cacheTtl.value = '3600000';
+    form.listeners.get('change')();
+    form.listeners.get('submit')({ preventDefault() {} });
+    await settle();
+    assert.equal(actions[1].patch.claudeCacheTtlMs, 3600000);
+
+    cacheTtl.value = 'invalid';
+    form.listeners.get('change')();
+    form.listeners.get('submit')({ preventDefault() {} });
+    assert.equal(actions.length, 2, 'invalid TTL must not be sent');
+    assert.match(nodes.get('error-live').textContent, /캐시 TTL은 1시간 또는 5분/);
+
+    cacheTtl.value = '3e5';
+    form.listeners.get('submit')({ preventDefault() {} });
+    assert.equal(actions.length, 2, 'only declared option values are accepted');
+
+    cacheTtl.value = '300000';
+    actionStatus = 400;
+    form.listeners.get('submit')({ preventDefault() {} });
+    await settle();
+    assert.match(nodes.get('error-live').textContent, /요청 실패: out_of_range/);
+
+    actionStatus = 409;
+    form.listeners.get('submit')({ preventDefault() {} });
+    await settle();
+    assert.match(nodes.get('notice').textContent, /다른 곳에서 변경됨/);
   } finally {
     for (const [key, value] of Object.entries(globals)) {
       if (value === undefined) delete globalThis[key];

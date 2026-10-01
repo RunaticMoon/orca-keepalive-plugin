@@ -23,8 +23,8 @@
 
       <div class="status-grid">
         <div class="status-item">
-          <span class="status-label">앱 타이머</span>
-          <span id="app-timer" class="status-value">—</span>
+          <span class="status-label">캐시 TTL</span>
+          <span id="cache-ttl" class="status-value">—</span>
         </div>
         <div class="status-item">
           <span class="status-label">런타임 연결</span>
@@ -46,6 +46,7 @@
     <p id="disconnect-banner" class="banner banner-warn hidden" role="alert">
       연결 끊김 — 서버에 다시 연결하는 중입니다.
     </p>
+    <p id="profile-warning" class="banner banner-warn hidden" role="alert"></p>
     <p id="notice" class="notice hidden" role="status"></p>
     <p id="error-live" class="error" role="alert" aria-live="assertive"></p>
 
@@ -62,6 +63,15 @@
           <div class="field">
             <label for="cfg-message">keepalive 메시지</label>
             <input id="cfg-message" name="message" type="text" autocomplete="off" maxlength="512" />
+          </div>
+
+          <div class="field">
+            <label for="cfg-cache-ttl">Claude Code 캐시 TTL</label>
+            <select id="cfg-cache-ttl" name="claudeCacheTtlMs" aria-describedby="cfg-cache-ttl-description">
+              <option value="3600000">1시간 (기본)</option>
+              <option value="300000">5분</option>
+            </select>
+            <p id="cfg-cache-ttl-description" class="field-description">Claude Code 구독은 보통 1시간, API 키는 기본 5분입니다. 실제 캐시 TTL과 맞게 고르세요.</p>
           </div>
 
           <div class="field">

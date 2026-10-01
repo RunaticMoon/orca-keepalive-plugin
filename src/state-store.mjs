@@ -1045,6 +1045,10 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
 
   /**
    * 순수 동기 정책 판정. §5.3/§6 우선순위를 따른다.
+   *
+   * 연속 상한 TTL은 `options.ttlMs`가 명시되면 그 값을, 생략(undefined/null)하면
+   * 저장된 `config.claudeCacheTtlMs`를 쓴다. coordinator가 같은 계산 snapshot의
+   * TTL을 넘겨주는 경우를 위한 override다.
    * @param {object} scope
    * @param {{ttlMs?: number|null}} [options] 연속 상한을 TTL별로 고르기 위한 현재 TTL.
    * @returns {{allowed: boolean, reason: string|null}}
@@ -1075,7 +1079,8 @@ export function createStateStore({ hostCall, now = Date.now, randomId = crypto.r
     if (budget !== null && budget.needsReview === true) {
       return { allowed: false, reason: 'PARTIAL_OR_UNKNOWN_SEND' };
     }
-    const max = capFor(options?.ttlMs ?? null, state.config);
+    const ttlMs = options?.ttlMs ?? state.config.claudeCacheTtlMs;
+    const max = capFor(ttlMs, state.config);
     const charged = budget === null ? 0 : budget.charged;
     if (max !== 0 && charged >= max) {
       return { allowed: false, reason: 'LIMIT_REACHED' };

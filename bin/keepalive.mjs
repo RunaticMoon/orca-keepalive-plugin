@@ -305,17 +305,40 @@ function phaseText(phase) {
 }
 
 /**
- * appTimer를 한 줄 문구로 만든다.
- * @param {unknown} appTimer
+ * 캐시 TTL(ms)을 한 줄 문구로 만든다.
+ * @param {unknown} ttlMs
  * @returns {string}
  */
-export function appTimerText(appTimer) {
-  const timer = appTimer && typeof appTimer === 'object' ? appTimer : {};
-  if (timer.known !== true) return '알 수 없음';
-  if (timer.enabled !== true) return '꺼짐';
-  const ttl =
-    TTL_TEXT[timer.ttlMs] ?? (Number.isFinite(timer.ttlMs) ? `${timer.ttlMs}ms` : null);
-  return ttl ? `켜짐 (${ttl})` : '켜짐';
+export function cacheTtlText(ttlMs) {
+  return TTL_TEXT[ttlMs] ?? '알 수 없음';
+}
+
+/**
+ * config에서 현재 TTL 기준 유효 연속 상한을 고른다. dashboard-model이 계산한
+ * maxConsecutiveKeepalivesActive가 있으면 그대로 쓰고, 없으면 claudeCacheTtlMs로
+ * 5m/1h 상한을 고른다. TTL을 알 수 없으면 두 상한 중 작은(보수적인) 값을 쓴다.
+ * @param {Record<string, unknown>} config
+ * @returns {number|null}
+ */
+function resolveActiveCap(config) {
+  if (Number.isFinite(config.maxConsecutiveKeepalivesActive)) {
+    return config.maxConsecutiveKeepalivesActive;
+  }
+  const five = Number.isFinite(config.maxConsecutiveKeepalives5m)
+    ? config.maxConsecutiveKeepalives5m
+    : null;
+  const hour = Number.isFinite(config.maxConsecutiveKeepalives1h)
+    ? config.maxConsecutiveKeepalives1h
+    : null;
+  if (config.claudeCacheTtlMs === 300000) return five;
+  if (config.claudeCacheTtlMs === 3600000) return hour;
+  // TTL 미상: 두 상한 중 작은 값. 0(무제한)은 Infinity로 보고, 둘 다 없으면 null.
+  if (five === null && hour === null) return null;
+  const min = Math.min(
+    five === null || five === 0 ? Infinity : five,
+    hour === null || hour === 0 ? Infinity : hour,
+  );
+  return min === Infinity ? 0 : min;
 }
 
 /**
@@ -374,16 +397,15 @@ export function renderStatus(snapshot, options = {}) {
   const connection = snap.connection && typeof snap.connection === 'object' ? snap.connection : {};
   const currentHash =
     typeof options.currentWorktreeHash === 'string' ? options.currentWorktreeHash : null;
-  // 현재 TTL 기준 유효 상한(dashboard-model이 계산). 없으면 5m 값으로 폴백한다.
-  const maxConsecutive = Number.isFinite(config.maxConsecutiveKeepalivesActive)
-    ? config.maxConsecutiveKeepalivesActive
-    : Number.isFinite(config.maxConsecutiveKeepalives5m)
-      ? config.maxConsecutiveKeepalives5m
-      : null;
+  // 현재 TTL 기준 유효 상한(dashboard-model이 계산). 없으면 TTL로 폴백한다.
+  const maxConsecutive = resolveActiveCap(config);
 
   const lines = [];
   lines.push(`Cache Keepalive: ${config.paused === true ? '꺼짐 (일시정지)' : '켜짐'}`);
-  lines.push(`Orca 프롬프트 캐시 타이머: ${appTimerText(snap.appTimer)}`);
+  lines.push(`캐시 TTL: ${cacheTtlText(config.claudeCacheTtlMs)}`);
+  if (!(snap.profileSettings && snap.profileSettings.known === true)) {
+    lines.push('Orca 프로필: 확인 불가 (전송 중지)');
+  }
   lines.push(
     `런타임 연결: ${typeof connection.state === 'string' ? connection.state : '알 수 없음'}`,
   );
@@ -422,7 +444,8 @@ export function summarizeSnapshot(snapshot, options = {}) {
   const serverNow = Number.isFinite(snap.serverNow) ? snap.serverNow : Date.now();
   const config = snap.config && typeof snap.config === 'object' ? snap.config : {};
   const connection = snap.connection && typeof snap.connection === 'object' ? snap.connection : {};
-  const timer = snap.appTimer && typeof snap.appTimer === 'object' ? snap.appTimer : {};
+  const profileSettings =
+    snap.profileSettings && typeof snap.profileSettings === 'object' ? snap.profileSettings : {};
   const currentHash =
     typeof options.currentWorktreeHash === 'string' ? options.currentWorktreeHash : null;
   const maxConsecutive5m = Number.isFinite(config.maxConsecutiveKeepalives5m)
@@ -431,9 +454,7 @@ export function summarizeSnapshot(snapshot, options = {}) {
   const maxConsecutive1h = Number.isFinite(config.maxConsecutiveKeepalives1h)
     ? config.maxConsecutiveKeepalives1h
     : null;
-  const maxConsecutiveActive = Number.isFinite(config.maxConsecutiveKeepalivesActive)
-    ? config.maxConsecutiveKeepalivesActive
-    : maxConsecutive5m;
+  const maxConsecutiveActive = resolveActiveCap(config);
 
   const worktrees = (Array.isArray(snap.worktrees) ? snap.worktrees : []).map((worktree) => {
     const wt = worktree && typeof worktree === 'object' ? worktree : {};
@@ -467,14 +488,15 @@ export function summarizeSnapshot(snapshot, options = {}) {
     revision: Number.isSafeInteger(snap.revision) ? snap.revision : 0,
     paused: config.paused === true,
     defaultWorktreeEnabled: config.defaultWorktreeEnabled === true,
+    claudeCacheTtlMs: Number.isFinite(config.claudeCacheTtlMs) ? config.claudeCacheTtlMs : null,
     maxConsecutiveKeepalives5m: maxConsecutive5m,
     maxConsecutiveKeepalives1h: maxConsecutive1h,
     maxConsecutiveKeepalivesActive: maxConsecutiveActive,
-    appTimer: {
-      known: timer.known === true,
-      enabled: timer.enabled === true,
-      ttlMs: Number.isFinite(timer.ttlMs) ? timer.ttlMs : null,
-      source: typeof timer.source === 'string' ? timer.source : null,
+    profileSettings: {
+      known: profileSettings.known === true,
+      source: typeof profileSettings.source === 'string' ? profileSettings.source : null,
+      readAt: Number.isFinite(profileSettings.readAt) ? profileSettings.readAt : null,
+      reason: typeof profileSettings.reason === 'string' ? profileSettings.reason : null,
     },
     connection: {
       state: typeof connection.state === 'string' ? connection.state : 'unavailable',

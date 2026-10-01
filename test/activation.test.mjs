@@ -122,7 +122,7 @@ function createFakeCoordinator() {
         userDataKey: null,
         profileId: null,
         connection: { state: 'starting', reason: null },
-        appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null },
+        profileSettings: { known: false, source: null, readAt: null, reason: null },
         worktrees: [],
       }
     },
@@ -840,7 +840,7 @@ test('orca-plugin.json은 스키마 필수 필드와 참조 일관성을 만족�
   assert.equal(manifest.id, 'cache-keepalive')
   assert.equal(manifest.publisher, 'runaticmoon')
   assert.equal(manifest.name, 'Cache Keepalive')
-  assert.equal(manifest.version, '0.1.10')
+  assert.equal(manifest.version, '0.2.0')
   assert.equal(manifest.pluginApi, 1)
   assert.equal(manifest.main, 'main.mjs')
   assert.deepEqual(manifest.engines, { orca: '>=1.4.214' })

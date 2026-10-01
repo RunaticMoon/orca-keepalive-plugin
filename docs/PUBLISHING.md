@@ -21,7 +21,7 @@ install time. A release is a git tag whose commit contains `orca-plugin.json`,
 | Plugin id | `"cache-keepalive"` (does not use the reserved `orca-` prefix). | Changing identity after install creates a different plugin. |
 | License | **Decided**: MIT (`LICENSE`, `package.json` `license`). | This repository implements its own code and does not copy `claude-cache-keepalive` code. |
 | Git remote URL | **Decided**: `https://github.com/RunaticMoon/orca-keepalive-plugin` (public). | Users install from this URL. |
-| Version tag | Manifest `version` is `0.1.10`. Tags are optional (e.g. `v0.1.0`). | If you tag, the tag must match the manifest version. |
+| Version tag | Manifest `version` is `0.2.0`. Tags are optional (e.g. `v0.2.0`). | If you tag, the tag must match the manifest version. |
 
 The manifest currently declares:
 
@@ -30,7 +30,7 @@ The manifest currently declares:
   "manifestVersion": 1,
   "id": "cache-keepalive",
   "publisher": "runaticmoon",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "engines": { "orca": ">=1.4.214" },
   "pluginApi": 1
 }

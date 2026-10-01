@@ -15,6 +15,7 @@
  * @property {boolean} paused 전역 일시정지(플러그인 자체).
  * @property {boolean} defaultWorktreeEnabled worktree override가 없을 때의 기본값.
  * @property {string} message keepalive로 보낼 단일 행 메시지(trim된 값).
+ * @property {300000|3600000} claudeCacheTtlMs 플러그인 자체 Claude Code 캐시 TTL(ms). 5분 또는 1시간.
  * @property {number} margin5mMs 5분 TTL용 여유(정수 ms).
  * @property {number} margin1hMs 1시간 TTL용 여유(정수 ms).
  * @property {number} quietOutputMs 출력이 조용해야 하는 최소 시간(정수 ms).
@@ -41,16 +42,9 @@
 
 /**
  * 앱 timer 설정 읽기 결과. §4.4, §6.
- * known=false이면 enabled/ttlMs 등은 판단 불가다.
- * @typedef {Object} SettingsSnapshot
- * @property {boolean} known
- * @property {string} [profileId]
- * @property {boolean} [enabled]
- * @property {number} [ttlMs]
- * @property {number} [revision]
- * @property {'sqlite'|'json'} [source]
- * @property {string} [reason] known=false일 때의 reason 코드.
- * @property {number} readAt 읽은 시각(ms).
+ * known=true이면 index에서 profileId를 읽고 source='index'다.
+ * known=false이면 이유(reason)와 readAt만 있다.
+ * @typedef {{known:true, profileId:string, source:'index', readAt:number} | {known:false, reason:string, readAt:number}} SettingsSnapshot
  */
 
 /**
@@ -261,9 +255,9 @@
  * @typedef {Object} DashboardSnapshot
  * @property {number} revision
  * @property {number} serverNow
- * @property {{known:boolean, enabled?:boolean, ttlMs?:number, source?:string, readAt?:number, reason?:string}} appTimer
+ * @property {{known:boolean, source:'index'|null, readAt:number|null, reason:string|null}} profileSettings 플러그인 프로필 설정 읽기 결과. config와 별개다.
  * @property {{state:string, reason?:string}} connection
- * @property {Config} config
+ * @property {Config} config 플러그인 자체 설정(claudeCacheTtlMs 포함).
  * @property {DashboardWorktree[]} worktrees
  * @property {DashboardDiagnostic[]} diagnostics
  */
@@ -350,9 +344,11 @@ function deepFreeze(value) {
 
 /**
  * 중요 reason 코드. §8. 모든 값은 자기 key와 같다.
+ * APP_TIMER_OFF는 과거 저장 이력 호환용으로 유지한다(새로 생성하지 않음).
  * @type {Readonly<Record<string, string>>}
  */
 export const REASON_CODES = deepFreeze({
+  // 과거 이력 호환용, 새로 생성하지 않음.
   APP_TIMER_OFF: 'APP_TIMER_OFF',
   SETTINGS_UNKNOWN: 'SETTINGS_UNKNOWN',
   RUNTIME_UNAVAILABLE: 'RUNTIME_UNAVAILABLE',
@@ -590,6 +586,7 @@ export const EPOCH_MEMORY_VERSION = 2;
  * 만료 이력에 저장할 수 있는 차단 reason allowlist(§2-7 "만료 원인 문구" 표).
  * REASON_CODES에 실제로 존재하는 값만 담는다. EXPIRED(만료 자체), NO_FRESH_TURN(관측
  * 부재), PARTIAL_OR_UNKNOWN_SEND(확인 필요 표시)는 만료 원인이 아니므로 제외한다.
+ * APP_TIMER_OFF는 과거 저장 이력 호환용으로 유지한다(새로 생성하지 않음).
  * @type {ReadonlyArray<string>}
  */
 export const EXPIRE_CAUSE_REASONS = deepFreeze([

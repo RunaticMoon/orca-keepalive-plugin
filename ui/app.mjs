@@ -37,9 +37,9 @@
  */
 export const REASON_TEXT = Object.freeze({
   APP_TIMER_OFF:
-    'Orca 설정 > 에이전트 > 프롬프트 캐시 타이머가 꺼져 있습니다.',
+    '과거 Orca 타이머 설정으로 전송이 차단되었습니다.',
   SETTINGS_UNKNOWN:
-    '앱 타이머 설정을 읽지 못했습니다. Orca 실행 상태와 버전을 확인하세요.',
+    'Orca 활성 프로필을 확인할 수 없습니다. Orca 실행 상태를 확인하세요.',
   RUNTIME_UNAVAILABLE:
     'Orca 런타임에 연결할 수 없습니다. Orca가 실행 중인지 확인하세요.',
   WRONG_RUNTIME:
@@ -99,8 +99,8 @@ export const EXPIRE_CAUSE_TEXT = Object.freeze({
   SCREEN_UNKNOWN: '화면을 확인하지 못해 전송하지 못함',
   GLOBAL_PAUSED: '전체 일시정지로 전송하지 못함',
   SCOPE_DISABLED: '대상 설정이 꺼져 전송하지 못함',
-  APP_TIMER_OFF: '캐시 타이머가 꺼져 전송하지 못함',
-  SETTINGS_UNKNOWN: '타이머 설정을 확인하지 못해 전송하지 못함',
+  APP_TIMER_OFF: '과거 Orca 타이머 설정으로 전송하지 못함',
+  SETTINGS_UNKNOWN: 'Orca 활성 프로필을 확인하지 못해 전송하지 못함',
   CWARM_DISABLED: 'cwarm 중지 설정으로 전송하지 못함',
   LIMIT_REACHED: '연속 전송 상한에 도달해 전송하지 못함',
   STORAGE_FAILED: '상태 저장 실패로 전송하지 못함',
@@ -175,8 +175,8 @@ export const DIAGNOSTIC_EVENT_TEXT = Object.freeze({
   bootstrap_started: '플러그인 시작',
   runtime_connected: 'Orca 런타임에 연결됨',
   runtime_unavailable: 'Orca 런타임에 연결할 수 없음',
-  settings_unknown: '앱 타이머 설정을 확인하지 못함',
-  settings_changed: '앱 타이머 설정이 변경됨',
+  settings_unknown: 'Orca 활성 프로필을 확인하지 못함',
+  settings_changed: 'Orca 프로필 확인 상태가 변경됨',
   target_unsupported: '이 터미널에서는 keepalive를 지원하지 않음',
   epoch_armed: '캐시 만료 전 keepalive 예약',
   epoch_expired: '캐시 예약이 만료됨',
@@ -265,19 +265,6 @@ function formatClock(ms) {
 }
 
 /**
- * Human text for the app timer settings read (§6 SettingsSnapshot).
- * @param {{known: boolean, enabled: boolean, ttlMs: number|null, reason: string|null}} timer
- * @returns {string}
- */
-function appTimerText(timer) {
-  if (!timer.known) {
-    return timer.reason ? `알 수 없음 — ${reasonText(timer.reason)}` : '알 수 없음';
-  }
-  const ttl = timer.ttlMs === null ? '알 수 없음' : (TTL_TEXT[timer.ttlMs] ?? `${timer.ttlMs}ms`);
-  return `${timer.enabled ? '켜짐' : '꺼짐'} · TTL ${ttl}`;
-}
-
-/**
  * @param {string} state
  * @returns {string}
  */
@@ -333,15 +320,14 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
   // 상속(null) 워크트리의 실제 적용 기본값. 알 수 없으면 켜짐으로 단정하지 않는다.
   const defaultWorktreeEnabled = rawConfig.defaultWorktreeEnabled === true;
 
-  const rawTimer = snap.appTimer && typeof snap.appTimer === 'object' ? snap.appTimer : {};
-  const timer = {
-    known: rawTimer.known === true,
-    enabled: rawTimer.enabled === true,
-    ttlMs: finiteOrNull(rawTimer.ttlMs),
-    source: typeof rawTimer.source === 'string' ? rawTimer.source : null,
-    readAt: finiteOrNull(rawTimer.readAt),
-    reason: typeof rawTimer.reason === 'string' ? rawTimer.reason : null,
+  const rawProfileSettings = snap.profileSettings && typeof snap.profileSettings === 'object' ? snap.profileSettings : {};
+  const profileSettings = {
+    known: rawProfileSettings.known === true,
+    source: rawProfileSettings.source === 'index' ? 'index' : null,
+    readAt: finiteOrNull(rawProfileSettings.readAt),
+    reason: typeof rawProfileSettings.reason === 'string' ? rawProfileSettings.reason : null,
   };
+  const cacheTtlMs = finiteOrNull(rawConfig.claudeCacheTtlMs);
 
   const rawConnection =
     snap.connection && typeof snap.connection === 'object' ? snap.connection : {};
@@ -475,7 +461,7 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
     ? Math.min(...finiteLimits)
     : configuredLimits.length > 0 ? 0 : null;
   const maxConsecutive = finiteOrNull(rawConfig.maxConsecutiveKeepalivesActive)
-    ?? (timer.ttlMs === 300000 ? maxConsecutive5m : timer.ttlMs === 3600000 ? maxConsecutive1h : null)
+    ?? (cacheTtlMs === 300000 ? maxConsecutive5m : cacheTtlMs === 3600000 ? maxConsecutive1h : null)
     ?? fallbackLimit;
   return {
     revision: finiteOrNull(snap.revision),
@@ -486,9 +472,10 @@ export function toViewModel(snapshot, clientElapsedMs = 0) {
     maxConsecutiveKeepalivesActive: maxConsecutive,
     maxConsecutiveText:
       maxConsecutive === null ? PLACEHOLDER : maxConsecutive === 0 ? '무제한' : String(maxConsecutive),
-    appTimer: {
-      ...timer,
-      text: appTimerText(timer),
+    cacheTtl: { ttlMs: cacheTtlMs, text: TTL_TEXT[cacheTtlMs] ?? '알 수 없음' },
+    profileSettings: {
+      ...profileSettings,
+      warning: profileSettings.known ? '' : 'Orca 프로필을 읽을 수 없어 전송이 중지됨',
     },
     connection: {
       state: connectionState,
@@ -594,7 +581,8 @@ function boot() {
 
   const nodes = {
     tokenMissing: byId('token-missing'),
-    appTimer: byId('app-timer'),
+    cacheTtl: byId('cache-ttl'),
+    profileWarning: byId('profile-warning'),
     connection: byId('connection-state'),
     pauseState: byId('pause-state'),
     pauseToggle: byId('pause-toggle'),
@@ -607,6 +595,7 @@ function boot() {
     save: byId('config-save'),
     cfg: {
       message: byId('cfg-message'),
+      cacheTtl: byId('cfg-cache-ttl'),
       margin5m: byId('cfg-margin5m'),
       margin1h: byId('cfg-margin1h'),
       quietOutput: byId('cfg-quiet-output'),
@@ -814,8 +803,14 @@ function boot() {
 
   /** @param {ReturnType<typeof toViewModel>} vm */
   function renderHeader(vm) {
-    if (nodes.appTimer) {
-      nodes.appTimer.textContent = vm.appTimer.text;
+    if (nodes.cacheTtl) {
+      nodes.cacheTtl.textContent = vm.cacheTtl.text;
+    }
+    if (nodes.profileWarning) {
+      if (nodes.profileWarning.textContent !== vm.profileSettings.warning) {
+        nodes.profileWarning.textContent = vm.profileSettings.warning;
+      }
+      nodes.profileWarning.classList.toggle('hidden', !vm.profileSettings.warning);
     }
     if (nodes.connection) {
       nodes.connection.textContent = vm.connection.reasonText
@@ -1081,6 +1076,7 @@ function boot() {
       if (node) node.checked = value === true;
     };
     setValue(nodes.cfg.message, config.message ?? '');
+    setValue(nodes.cfg.cacheTtl, config.claudeCacheTtlMs ?? 3600000);
     setValue(nodes.cfg.margin5m, msToSeconds(config.margin5mMs));
     setValue(nodes.cfg.margin1h, msToSeconds(config.margin1hMs));
     setValue(nodes.cfg.quietOutput, config.quietOutputMs ?? '');
@@ -1109,6 +1105,11 @@ function boot() {
     if (message.length === 0) {
       return new Error('keepalive 메시지를 입력하세요.');
     }
+    const ttlValue = nodes.cfg.cacheTtl?.value;
+    if (ttlValue !== '300000' && ttlValue !== '3600000') {
+      return new Error('Claude Code 캐시 TTL은 1시간 또는 5분을 선택하세요.');
+    }
+    const claudeCacheTtlMs = Number(ttlValue);
     const seconds = (node, label) => {
       const raw = node && node.value !== '' ? Number(node.value) : NaN;
       if (!Number.isFinite(raw) || raw < 0) {
@@ -1140,6 +1141,7 @@ function boot() {
     const runtimeRaw = nodes.cfg.runtimePath ? nodes.cfg.runtimePath.value.trim() : '';
     return {
       message,
+      claudeCacheTtlMs,
       margin5mMs,
       margin1hMs,
       quietOutputMs,

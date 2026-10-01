@@ -13,7 +13,7 @@ This is a **community, experimental** plugin. It is not an official Stably plugi
 - Publisher slug: `runaticmoon` (plugin identity `runaticmoon.cache-keepalive`)
 - License: MIT (see [LICENSE](LICENSE))
 - Repository: https://github.com/RunaticMoon/orca-keepalive-plugin
-- Version: `0.1.10`
+- Version: `0.2.0`
 - Minimum Orca engine declared: `>=1.4.214`
 - Plugin API: `pluginApi 1` (`contributes` is strict)
 - Runtime: Node >=22.5 (development has been done on Node 24); no build step, no npm dependencies
@@ -22,10 +22,14 @@ This is a **community, experimental** plugin. It is not an official Stably plugi
 
 ## What it does
 
-The Orca setting **Settings > Agents > Prompt Cache Timer** only controls a timer
-inside Orca's renderer. This plugin does not start that timer and cannot read its
-exact start time. Instead it watches agent status events, and after it observes a
-turn complete it schedules one keepalive message per cache epoch.
+As of 0.2.0 the plugin does **not** use the Orca setting **Settings > Agents >
+Prompt Cache Timer** and never reads Orca's timer state. Instead it uses its own
+**Claude Code cache TTL** setting (`claudeCacheTtlMs`, `1 hour` or `5 minutes`,
+default **1 hour**; see [Upgrading to 0.2.0](#upgrading-to-020)), watches agent
+status events, and after it observes a turn complete it schedules one keepalive
+message per cache epoch. The only Orca file it reads is the active-profile index
+(`orca-profile-index.json`), to detect a profile switch (see risks below). It does
+not start Orca's timer and cannot read its exact start time.
 
 When all send conditions are met it sends two RPC requests to Orca's local runtime
 socket:
@@ -37,7 +41,8 @@ socket:
 
 A keepalive is only considered when **all** of these are true at inspection time:
 
-- Orca's own prompt cache timer is **on** (read from the active profile; see risks below).
+- The active Orca profile can be read from `orca-profile-index.json` (see risks
+  below). The plugin does not use Orca's app timer and sends even when it is off.
 - The terminal's agent identity is `claude` (`agentIdentity === 'claude'`).
 - The execution host is local (`executionHostId === 'local'`).
 - The terminal is connected to a live PTY.
@@ -54,23 +59,23 @@ A keepalive is only considered when **all** of these are true at inspection time
   input quiet window (`observedInputQuietMs`, default 30000 ms).
 - No global pause, the worktree/terminal scope is enabled, `~/.claude/cwarm.disabled`
   is absent (when `respectCwarmDisabled` is on), and the consecutive keepalive cap
-  for the TTL currently reported by Orca's timer has not been reached (see
+  for the plugin's configured cache TTL has not been reached (see
   [Consecutive cap and reset](#consecutive-cap-and-reset)).
 
 If any signal is unknown, the plugin refuses to send rather than guessing.
 
 ### Send timing
 
-Timing is based on the **cache basis time** (`basisAt`) and the TTL reported by
-Orca's timer setting. Anthropic starts the prompt-cache TTL when the request that
-reads or writes the cache begins, and the response generation time is spent inside
-that TTL. Claude Code sends one API request per tool call, so the plugin uses the
-turn's last observed `state: 'working'` event (`basisAt`, ≈ the start of the last
-API request). If there is no such observation, or it is more than 3 minutes earlier
-than the completion event, the observed completion time (`doneAt`) is used instead.
-Only two TTL values are accepted: 5 minutes and 1 hour.
+Timing is based on the **cache basis time** (`basisAt`) and the TTL configured in
+the plugin (`claudeCacheTtlMs`, not Orca's timer). Anthropic starts the prompt-cache
+TTL when the request that reads or writes the cache begins, and the response
+generation time is spent inside that TTL. Claude Code sends one API request per tool
+call, so the plugin uses the turn's last observed `state: 'working'` event (`basisAt`,
+≈ the start of the last API request). If there is no such observation, or it is more
+than 3 minutes earlier than the completion event, the observed completion time
+(`doneAt`) is used instead. Only two TTL values are accepted: 5 minutes and 1 hour.
 
-| App TTL | Default margin | Target send time |
+| Plugin cache TTL | Default margin | Target send time |
 |---|---|---|
 | `300000` ms (5 min) | `margin5mMs` = 60 s | `basisAt + TTL - 60 s` (≈ 4 minutes after the last request start) |
 | `3600000` ms (1 h) | `margin1hMs` = 120 s | `basisAt + TTL - 120 s` (≈ 58 minutes after the last request start) |
@@ -81,6 +86,12 @@ Only two TTL values are accepted: 5 minutes and 1 hour.
 - **Catch-up is never done.** Once the expected expiry passes (with a minimum of
   10 s remaining), the epoch is dropped; there is no "late" burst after sleep or a
   clock jump.
+
+Choose the TTL that matches your real Claude Code cache TTL: a Claude Code
+subscription is normally **1 hour**, while an API key defaults to **5 minutes**, and
+`ENABLE_PROMPT_CACHING_1H` / `FORCE_PROMPT_CACHING_5M` can change it. If it does not
+match, the plugin may send too early or too late. This is only an estimate, not a
+reading of Anthropic's cache.
 
 ### Surviving a plugin reload
 
@@ -143,11 +154,12 @@ preserved.
   `0` means unlimited. At a 5-minute TTL, 8 keepalives are about 4 minutes apart, so
   the cache stays warm for roughly 37 minutes after the last real turn; at a 1-hour
   TTL, 3 keepalives are about 58 minutes apart, so roughly 3 hours.
-- Which cap applies is decided by the TTL currently reported by Orca's timer
-  (`promptCacheTtlMs`, see [Send timing](#send-timing)). When the TTL cannot be read,
-  the **smaller** of the two caps is applied. The dashboard form edits the two values
-  separately (**연속 keepalive 상한 (5분 TTL)** and **(1시간 TTL)**), and the per-terminal
-  row `연속 x/상한 y` shows the cap for the current TTL.
+- Which cap applies is decided by the plugin's configured cache TTL
+  (`claudeCacheTtlMs`, see [Send timing](#send-timing)). When the TTL is not one of
+  the two known values, the **smaller** of the two caps is applied. The dashboard form
+  edits the two values separately (**연속 keepalive 상한 (5분 TTL)** and
+  **(1시간 TTL)**), and the per-terminal row `연속 x/상한 y` shows the cap for the
+  current TTL.
 - The cap counts keepalives that were themselves submitted by the plugin. When a
   fresh `working` turn appears that is **not** explained by the plugin's own recent
   attempt, the budget for that target is automatically reset to 0. In practice: if
@@ -157,10 +169,10 @@ preserved.
   restart, unfinished attempts are surfaced as "needs review" instead of being
   retried.
 - The counter is **shared across TTLs**: it is one number per terminal, not one per
-  TTL. If you send several keepalives at a 5-minute TTL and then switch Orca's timer
-  to a 1-hour TTL, the count may already be at or above the 1-hour cap (default **3**),
-  so the plugin stops sending on that terminal until the next real work turn resets
-  the counter.
+  TTL. If you send several keepalives at a 5-minute TTL and then switch the plugin's
+  cache TTL to 1 hour, the count may already be at or above the 1-hour cap (default
+  **3**), so the plugin stops sending on that terminal until the next real work turn
+  resets the counter.
 
 ### `cwarm.disabled`
 
@@ -168,6 +180,36 @@ When `respectCwarmDisabled` is on (default), the presence of
 `~/.claude/cwarm.disabled` blocks all sends. This is compatible with the concept of
 the reference tool [claude-cache-keepalive](https://github.com/fifthadj/claude-cache-keepalive);
 the file is only read, never written.
+
+---
+
+## Upgrading to 0.2.0
+
+Version 0.2.0 changes what drives the plugin:
+
+- **The Orca app timer is no longer used.** Timing, the consecutive cap, and the
+  "should I send" gate now use the plugin's own `claudeCacheTtlMs` (default **1 hour**),
+  not **Settings > Agents > Prompt Cache Timer** (`promptCacheTimerEnabled` /
+  `promptCacheTtlMs`). Sends happen even when the Orca timer is off. The only Orca file
+  read is the active-profile index (`orca-profile-index.json`); the plugin no longer
+  reads the profile SQLite database (`profile-state.db`) or `orca-data.json`.
+- **A stored config without the new key defaults to 1 hour.** If you previously used a
+  5-minute app timer (for example with an API key), open the dashboard and set
+  **Claude Code 캐시 TTL** to **5분**. With a 1-hour TTL the target send time is about
+  58 minutes after the last request start and the default consecutive cap is **3**
+  (`maxConsecutiveKeepalives1h`); with 5 minutes it is about 4 minutes and the default
+  cap is **8**.
+- **To stop sending, use the plugin.** Because the Orca timer is no longer read,
+  turning it off does not stop sends. Use the plugin's **global pause**, a
+  worktree/terminal off, or `~/.claude/cwarm.disabled` (when `respectCwarmDisabled`
+  is on).
+- **API/CLI shape changed.** The dashboard snapshot and `status --json` no longer have
+  `appTimer`; they have `profileSettings` (`{known, source, readAt, reason}`), and the
+  TTL is `config.claudeCacheTtlMs` (top-level `claudeCacheTtlMs` in the CLI JSON).
+  Text output shows `캐시 TTL: 1시간` and, when the profile is unreadable,
+  `Orca 프로필: 확인 불가 (전송 중지)`.
+- **Downgrading.** An older plugin version may reject a stored config that contains the
+  new `claudeCacheTtlMs` key; back up your settings before downgrading.
 
 ---
 
@@ -282,9 +324,9 @@ to exactly one worktree; otherwise they tell you to use the dashboard. Plugins d
 not intercept the app's own Cmd/Ctrl-J command UI.
 
 **Cache Keepalive: Show Status** posts a multi-line notification. The first line is
-the global state: `켜짐` or `꺼짐(일시정지)`, the Orca prompt-cache timer state
-(`타이머 켜짐(5분)` / `타이머 켜짐(1시간)` / `Orca 프롬프트 캐시 타이머 꺼짐` /
-`앱 타이머 설정 알 수 없음`), the runtime connection state, and `워크트리 N개`.
+the global state: `켜짐` or `꺼짐(일시정지)`, the configured cache TTL
+(`캐시 TTL 1시간` / `캐시 TTL 5분`), the runtime connection state, and `워크트리 N개`.
+When the active profile cannot be read it also appends `Orca 프로필 확인 불가`.
 Each following line is one worktree:
 
 - `▶ ` marks the worktree of the terminal that invoked the command, when the
@@ -299,7 +341,7 @@ Each following line is one worktree:
   `켜짐(일시정지 중)` instead of `켜짐`.
 - `다음 전송 … 후` shows the next scheduled send for that worktree as a relative
   time (for example `다음 전송 3분 12초 후`). It is omitted when nothing applies.
-- If the text would exceed 900 characters, trailing worktrees are dropped and the
+- If the text would exceed 480 characters, trailing worktrees are dropped and the
   message ends with `… 외 N개`.
 
 The notification shows the worktree display name and terminal title from the
@@ -317,9 +359,11 @@ you set yourself is shown as-is).
 | Settings switch | **Settings > Plugins > Cache Keepalive** | Turn the whole plugin (worker) on/off. |
 
 The only place that changes plugin-wide state is one of the in-plugin controls
-(palette, dashboard, CLI). The Settings switch disables the plugin itself, and
-the Orca app timer under **Settings > Agents > Prompt Cache Timer** is a separate
-Orca setting the plugin only reads.
+(palette, dashboard, CLI). The Settings switch disables the plugin itself.
+As of 0.2.0 the plugin no longer reads the Orca app timer under
+**Settings > Agents > Prompt Cache Timer**, so turning that timer off does not stop
+sends; use the plugin's **global pause** (or a worktree/terminal off, or
+`~/.claude/cwarm.disabled`) to stop.
 
 ### Sidebar panel
 
@@ -444,10 +488,11 @@ observed work and the configured TTL, not a reading of Anthropic's cache. The re
 shown with an expiry is the **last recorded send block reason**, not a confirmed cause
 of expiry — see the DRAFT_PRESENT example under [Limits and risks](#limits-and-risks).
 
-The top of the page shows the app timer state, runtime connection state and global
-pause state. The first screen also notes: *"메시지는 사용량을 소비하고 대화 기록에
-남습니다. 입력 감지는 제한적입니다."* (messages consume usage and remain in the
-conversation; input detection is limited).
+The top of the page shows the configured cache TTL, runtime connection state and
+global pause state, and a warning banner when the active Orca profile cannot be read.
+The first screen also notes: *"메시지는 사용량을 소비하고 대화 기록에 남습니다. 입력 감지는
+제한적입니다."* (messages consume usage and remain in the conversation; input detection
+is limited).
 
 ### Settings fields
 
@@ -461,6 +506,7 @@ These are the `DEFAULT_CONFIG` fields. The dashboard form edits a subset of them
 | `paused` | `false` | Plugin-global pause. Controlled by the pause button, not a text field. |
 | `defaultWorktreeEnabled` | `true` | Default state for worktrees without an explicit override. Editable in the form. |
 | `message` | `Cache keepalive. Reply only OK; do not use tools or continue previous work.` | Single-line message, 1–512 UTF-8 bytes, no control characters/newlines. Editable in the form. |
+| `claudeCacheTtlMs` | `3600000` | Claude Code prompt-cache TTL used for send timing and the consecutive cap: `3600000` (1 hour) or `300000` (5 minutes). Editable in the form as **Claude Code 캐시 TTL**. Any other value is rejected (`invalid_type` / `out_of_range`). |
 | `margin5mMs` | `60000` | Margin before expiry for a 5-minute TTL (30000–120000 ms). Form edits it in **seconds**. |
 | `margin1hMs` | `120000` | Margin before expiry for a 1-hour TTL (60000–600000 ms). Form edits it in **seconds**. |
 | `quietOutputMs` | `2500` | Required output-quiet time before sending (2500–60000 ms). Editable in the form. |
@@ -539,8 +585,8 @@ review the tab shows ⚠️, and if any pane is keeping a cache the tab shows �
 💤. The per-pane details stay in the dashboard.
 
 A symbol is only decided while keepalive applies. The plugin stops showing it (and
-returns the tab to Orca's automatic name) when the plugin is globally paused, the Orca
-prompt-cache timer is off or unreadable, the runtime is disconnected, the worktree or
+returns the tab to Orca's automatic name) when the plugin is globally paused, the
+active Orca profile is unreadable, the runtime is disconnected, the worktree or
 terminal policy is off, the consecutive-keepalive cap is reached, or — when
 `respectCwarmDisabled` is on — `~/.claude/cwarm.disabled` exists. Within an on tab the
 per-pane cache state is what selects ⚡ vs 💤.
@@ -612,10 +658,11 @@ Read this section before enabling the plugin.
 
 - **It depends on Orca internals, not a public plugin API.** To do its job the plugin
   reads Orca's internal runtime RPC socket metadata (`orca-runtime.json`) and the
-  active profile's SQLite state (`profile-state.db`), **read-only**. These are not
-  part of the public plugin API and may change in any Orca update. The declared
-  `engines: ">=1.4.214"` is only a minimum gate; it does not guarantee that future
-  internal shapes keep working. If a required shape is missing, the plugin stops
+  active-profile index (`orca-profile-index.json`), **read-only**. These are not part
+  of the public plugin API and may change in any Orca update. As of 0.2.0 it no longer
+  reads the profile SQLite database (`profile-state.db`) or `orca-data.json`. The
+  declared `engines: ">=1.4.214"` is only a minimum gate; it does not guarantee that
+  future internal shapes keep working. If a required shape is missing, the plugin stops
   sending instead of falling back.
 - **Every keepalive is a real user message.** It consumes model tokens/usage and
   stays in the conversation transcript. There is no "free" keepalive.
@@ -645,10 +692,10 @@ Read this section before enabling the plugin.
 - **No real Orca E2E has been run here.** The automated suite runs against a fake
   Orca runtime; it does not prove the plugin works against a real Orca desktop. See
   [docs/TESTING.md](docs/TESTING.md) for the status and a manual checklist.
-- **App-setting changes are not instantaneous.** Orca debounces settings writes
-  (about 1–5 s plus queueing), so turning the app timer off may not be observed by the
-  plugin immediately. Use the plugin's **global pause** for immediate stop. Bytes that
-  already reached Orca cannot be recalled.
+- **Stopping is immediate through the plugin, not the Orca timer.** As of 0.2.0 the
+  plugin does not read the Orca app timer, so turning that timer off does not stop
+  sends. Use the plugin's **global pause** (or a worktree/terminal off, or
+  `~/.claude/cwarm.disabled`). Bytes that already reached Orca cannot be recalled.
 - **The dashboard token is stored in a plain file in your home directory.** For
   the terminal CLI to work, the worker writes the bearer token to
   `~/.orca-cache-keepalive/control.json` with mode `0600` (directory `0700`).
@@ -689,4 +736,3 @@ docs/PUBLISHING.md   how to release and install from Git
 ```
 
 No `dependencies`/`devDependencies`; the test runner is `node --test` (Node >=22.5).
-

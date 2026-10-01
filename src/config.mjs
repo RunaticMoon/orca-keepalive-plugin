@@ -66,6 +66,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   paused: false,
   defaultWorktreeEnabled: true,
   message: 'Cache keepalive. Reply only OK; do not use tools or continue previous work.',
+  claudeCacheTtlMs: 3600000,
   margin5mMs: 60000,
   margin1hMs: 120000,
   quietOutputMs: 2500,
@@ -87,6 +88,7 @@ const FIELD_ORDER = [
   'paused',
   'defaultWorktreeEnabled',
   'message',
+  'claudeCacheTtlMs',
   'margin5mMs',
   'margin1hMs',
   'quietOutputMs',
@@ -223,6 +225,26 @@ function expectLogLevel(value, field) {
 }
 
 /**
+ * claudeCacheTtlMs는 허용 TTL(ALLOWED_TTLS) 두 값만 받는다. 정수가 아니면
+ * invalid_type, 정수지만 허용 목록 밖이면 out_of_range로 거절한다.
+ * @param {unknown} value
+ * @returns {number}
+ */
+function expectAllowedTtl(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new ValidationError('invalid_type', 'claudeCacheTtlMs', 'claudeCacheTtlMs must be an integer');
+  }
+  if (!ALLOWED_TTLS.includes(value)) {
+    throw new ValidationError(
+      'out_of_range',
+      'claudeCacheTtlMs',
+      `claudeCacheTtlMs must be one of ${ALLOWED_TTLS.join(', ')}`,
+    );
+  }
+  return value;
+}
+
+/**
  * schemaVersion은 1(레거시 입력)과 2를 허용한다. 검증 시점에는 이미 2로
  * 정규화되어 있으므로 2를 반환한다. (§5.2)
  * @param {unknown} value
@@ -245,6 +267,7 @@ const FIELD_VALIDATORS = {
   paused: (value) => expectBoolean(value, 'paused'),
   defaultWorktreeEnabled: (value) => expectBoolean(value, 'defaultWorktreeEnabled'),
   message: (value) => expectMessage(value, 'message'),
+  claudeCacheTtlMs: (value) => expectAllowedTtl(value),
   margin5mMs: (value) => expectInteger(value, 'margin5mMs', 30000, 120000),
   margin1hMs: (value) => expectInteger(value, 'margin1hMs', 60000, 600000),
   quietOutputMs: (value) => expectInteger(value, 'quietOutputMs', 2500, 60000),
