@@ -777,3 +777,119 @@ test('flush는 대기 중 저장을 비운다', async () => {
   await store.flush();
   assert.equal(host.read().profiles.length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// claudeCacheTtlMs 저장/로드 + 정책 TTL 기본값
+// ---------------------------------------------------------------------------
+
+test('load: claudeCacheTtlMs 없는 v2 저장값은 기본 1시간으로 채우되 재저장하지 않는다', async () => {
+  const stored = {
+    schemaVersion: 1,
+    revision: 4,
+    config: { schemaVersion: 2, message: 'no ttl field' },
+    profiles: [],
+  };
+  const host = createFakeHost({ initial: stored });
+  const store = createStateStore({ hostCall: host.hostCall });
+  const snap = await store.load();
+
+  assert.equal(snap.memoryPaused, false);
+  assert.equal(snap.lastSaveError, null);
+  assert.equal(snap.revision, 4);
+  assert.equal(snap.config.claudeCacheTtlMs, 3600000);
+  assert.equal(
+    host.calls.filter((call) => call.method === 'storage.set').length,
+    0,
+    '키 누락 보정으로 재저장하지 않는다',
+  );
+  assert.deepEqual(host.read(), stored, '저장소 원본을 덮어쓰지 않는다');
+});
+
+test('updateConfig: claudeCacheTtlMs를 저장하고 재로드 시 유지한다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await store.updateConfig({ claudeCacheTtlMs: 300000 });
+  assert.equal(store.snapshot().config.claudeCacheTtlMs, 300000);
+  assert.equal(host.read().config.claudeCacheTtlMs, 300000);
+
+  const reloaded = createStateStore({ hostCall: host.hostCall });
+  const snap = await reloaded.load();
+  assert.equal(snap.config.claudeCacheTtlMs, 300000);
+});
+
+test('updateConfig: claudeCacheTtlMs 허용 밖 값/문자열은 거절하고 상태 불변', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  await store.updateConfig({ claudeCacheTtlMs: 300000 });
+
+  await assert.rejects(
+    () => store.updateConfig({ claudeCacheTtlMs: 600000 }),
+    (error) => error.name === 'ValidationError' && error.code === 'out_of_range',
+  );
+  await assert.rejects(
+    () => store.updateConfig({ claudeCacheTtlMs: '300000' }),
+    (error) => error.name === 'ValidationError' && error.code === 'invalid_type',
+  );
+  assert.equal(store.snapshot().config.claudeCacheTtlMs, 300000);
+  assert.equal(host.read().config.claudeCacheTtlMs, 300000);
+});
+
+test('load: 저장본 claudeCacheTtlMs가 허용 밖이면 state_invalid fail-closed', async () => {
+  const invalid = {
+    schemaVersion: 1,
+    revision: 2,
+    config: { schemaVersion: 2, claudeCacheTtlMs: 600000 },
+    profiles: [],
+  };
+  const host = createFakeHost({ initial: invalid });
+  const store = createStateStore({ hostCall: host.hostCall });
+  const snap = await store.load();
+
+  assert.equal(snap.memoryPaused, true);
+  assert.equal(snap.lastSaveError, 'state_invalid');
+  assert.equal(snap.revision, 0);
+  assert.equal(store.isAllowedByPolicy(W()).reason, 'STORAGE_FAILED');
+  assert.deepEqual(host.read(), invalid, '손상 상태를 덮어쓰지 않는다');
+});
+
+test('isAllowedByPolicy: options.ttlMs 없으면 config.claudeCacheTtlMs를 쓴다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+  // 기본 1시간 TTL → 상한 3.
+  for (let i = 0; i < 3; i += 1) {
+    await store.reserveAttempt(T(), i, i);
+  }
+  assert.equal(store.snapshot().config.claudeCacheTtlMs, 3600000);
+  assert.equal(store.isAllowedByPolicy(T()).reason, 'LIMIT_REACHED');
+  // 명시하면 그 값 우선: 5분 TTL 상한 8이라 아직 허용.
+  assert.equal(store.isAllowedByPolicy(T(), { ttlMs: 300000 }).allowed, true);
+
+  // config TTL을 5분으로 바꾸면 options 없이도 상한 8을 쓴다.
+  await store.updateConfig({ claudeCacheTtlMs: 300000 });
+  await store.resetBudget(T());
+  for (let i = 0; i < 3; i += 1) {
+    await store.reserveAttempt(T(), i, i);
+  }
+  assert.equal(store.isAllowedByPolicy(T()).allowed, true, '5분 TTL은 상한 8');
+  // options.ttlMs 명시가 config보다 우선한다.
+  assert.equal(store.isAllowedByPolicy(T(), { ttlMs: 3600000 }).reason, 'LIMIT_REACHED');
+});
+
+test('updateConfig: 저장 실패/리비전 충돌 시 claudeCacheTtlMs 변경이 반영되지 않는다', async () => {
+  const host = createFakeHost();
+  const store = await newStore(host);
+
+  await assert.rejects(
+    () => store.updateConfig({ claudeCacheTtlMs: 300000 }, { expectedRevision: 99 }),
+    (error) => error.code === 'revision_conflict',
+  );
+  assert.equal(store.snapshot().config.claudeCacheTtlMs, 3600000);
+
+  host.setFail(true);
+  await assert.rejects(
+    () => store.updateConfig({ claudeCacheTtlMs: 300000 }),
+    (error) => error.code === 'storage_failed',
+  );
+  assert.equal(store.snapshot().config.claudeCacheTtlMs, 3600000);
+  assert.equal(store.snapshot().lastSaveError, 'storage_failed');
+});
