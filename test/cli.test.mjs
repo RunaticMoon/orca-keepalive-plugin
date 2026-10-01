@@ -34,9 +34,12 @@ function hashOf(id) {
 
 /**
  * Build the mutable server fixture (snapshot + dispatch recorder/applier).
- * @param {{paused?: boolean, conflictOnce?: boolean, conflictAlways?: boolean}} options
+ * @param {{paused?: boolean, conflictOnce?: boolean, conflictAlways?: boolean, ttlMs?: number|null, profileKnown?: boolean, includeActiveCap?: boolean}} options
  */
 function makeFixture(options = {}) {
+  const ttlMs = 'ttlMs' in options ? options.ttlMs : 300000;
+  const profileKnown = options.profileKnown !== false;
+  const includeActiveCap = options.includeActiveCap !== false;
   const state = {
     paused: options.paused === true,
     worktrees: [
@@ -103,15 +106,21 @@ function makeFixture(options = {}) {
     return {
       revision,
       serverNow: SERVER_NOW,
-      appTimer: { known: true, enabled: true, ttlMs: 300000, source: 'json', readAt: SERVER_NOW },
+      profileSettings: {
+        known: profileKnown,
+        source: profileKnown ? 'index' : null,
+        readAt: profileKnown ? SERVER_NOW : null,
+        reason: profileKnown ? null : 'SETTINGS_UNKNOWN',
+      },
       connection: { state: 'connected' },
       config: {
         paused: state.paused,
         defaultWorktreeEnabled: true,
         message: 'keepalive',
+        claudeCacheTtlMs: ttlMs,
         maxConsecutiveKeepalives5m: 3,
         maxConsecutiveKeepalives1h: 20,
-        maxConsecutiveKeepalivesActive: 3,
+        ...(includeActiveCap ? { maxConsecutiveKeepalivesActive: 3 } : {}),
       },
       worktrees: state.worktrees,
       diagnostics: [],
@@ -191,7 +200,7 @@ function runCli(args, extraEnv = {}) {
 
 /**
  * Start a dashboard + control file, run `fn`, then always clean up.
- * @param {{paused?: boolean, conflictOnce?: boolean, conflictAlways?: boolean, worktreeId?: string}} options
+ * @param {{paused?: boolean, conflictOnce?: boolean, conflictAlways?: boolean, ttlMs?: number|null, profileKnown?: boolean, includeActiveCap?: boolean, worktreeId?: string}} options
  * @param {(ctx: {dash: Awaited<ReturnType<typeof startDashboard>>, fixture: ReturnType<typeof makeFixture>, home: string, controlFile: string, env: Record<string,string>}) => Promise<void>} fn
  */
 async function withCli(options, fn) {
@@ -262,7 +271,8 @@ test('status prints a human summary and never the token', async () => {
     const { code, stdout, stderr } = await runCli(['status'], env);
     assert.equal(code, 0);
     assert.match(stdout, /Cache Keepalive: 켜짐/);
-    assert.match(stdout, /Orca 프롬프트 캐시 타이머: 켜짐 \(5분\)/);
+    assert.match(stdout, /캐시 TTL: 5분/);
+    assert.doesNotMatch(stdout, /Orca 프로필: 확인 불가/);
     assert.match(stdout, /런타임 연결: connected/);
     assert.match(stdout, /워크트리 4개/);
     assert.match(stdout, /1\. main  \[켜짐 · 기본값\]  ← 현재 터미널/);
@@ -281,7 +291,14 @@ test('status --json prints a JSON summary without the token', async () => {
     assert.ok(!stdout.includes(dash.token), 'token must not appear in JSON status');
     const summary = JSON.parse(stdout);
     assert.equal(summary.paused, false);
-    assert.equal(summary.appTimer.ttlMs, 300000);
+    assert.equal('appTimer' in summary, false, 'appTimer must not appear in JSON status');
+    assert.equal(summary.claudeCacheTtlMs, 300000);
+    assert.deepEqual(summary.profileSettings, {
+      known: true,
+      source: 'index',
+      readAt: SERVER_NOW,
+      reason: null,
+    });
     assert.equal(summary.connection.state, 'connected');
     assert.equal(summary.worktreeCount, 4);
     assert.equal(summary.worktrees[0].label, 'main');
@@ -291,6 +308,80 @@ test('status --json prints a JSON summary without the token', async () => {
     assert.equal(summary.worktrees[0].terminals[0].dueInMs, 192000);
     assert.equal(summary.maxConsecutiveKeepalives5m, 3);
     assert.equal(summary.maxConsecutiveKeepalives1h, 20);
+    assert.equal(summary.maxConsecutiveKeepalivesActive, 3);
+  });
+});
+
+test('status prints the 1h cache TTL from config', async () => {
+  await withCli({ ttlMs: 3600000 }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /캐시 TTL: 1시간/);
+  });
+});
+
+test('status prints "알 수 없음" when the cache TTL is unknown', async () => {
+  await withCli({ ttlMs: null }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /캐시 TTL: 알 수 없음/);
+  });
+});
+
+test('status adds a profile-unknown notice when settings cannot be read', async () => {
+  await withCli({ profileKnown: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /Orca 프로필: 확인 불가 \(전송 중지\)/);
+  });
+});
+
+test('status falls back to the TTL-specific active cap when absent (5m)', async () => {
+  await withCli({ ttlMs: 300000, includeActiveCap: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /claude  대기 · 다음 전송 3분 12초 후 · 연속 1\/3/);
+  });
+});
+
+test('status falls back to the TTL-specific active cap when absent (1h)', async () => {
+  await withCli({ ttlMs: 3600000, includeActiveCap: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /claude  대기 · 다음 전송 3분 12초 후 · 연속 1\/20/);
+  });
+});
+
+test('status uses the smaller active cap when the TTL is unknown', async () => {
+  await withCli({ ttlMs: null, includeActiveCap: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status'], env);
+    assert.equal(code, 0);
+    assert.match(stdout, /claude  대기 · 다음 전송 3분 12초 후 · 연속 1\/3/);
+  });
+});
+
+test('status --json exposes the TTL-specific active cap fallback', async () => {
+  await withCli({ ttlMs: 3600000, includeActiveCap: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status', '--json'], env);
+    assert.equal(code, 0);
+    const summary = JSON.parse(stdout);
+    assert.equal(summary.claudeCacheTtlMs, 3600000);
+    assert.equal(summary.maxConsecutiveKeepalivesActive, 20);
+  });
+});
+
+test('status --json reports profileSettings and no appTimer when unknown', async () => {
+  await withCli({ profileKnown: false }, async ({ env }) => {
+    const { code, stdout } = await runCli(['status', '--json'], env);
+    assert.equal(code, 0);
+    const summary = JSON.parse(stdout);
+    assert.equal('appTimer' in summary, false);
+    assert.deepEqual(summary.profileSettings, {
+      known: false,
+      source: null,
+      readAt: null,
+      reason: 'SETTINGS_UNKNOWN',
+    });
     assert.equal(summary.maxConsecutiveKeepalivesActive, 3);
   });
 });
