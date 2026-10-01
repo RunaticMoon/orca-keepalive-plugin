@@ -707,6 +707,92 @@ test('hold: EXPIRE/CLOCK_GAP 같은 예약 폐기도 hold를 지운다', () => {
 });
 
 // ---------------------------------------------------------------------------
+// hold: combined done + mainAgent waiting/blocked (검토 지적 낮음 1·2)
+// ---------------------------------------------------------------------------
+
+test('hold (i): working→done(mainAgent waiting)은 SUSPENDED로 hold를 잡고, waiting·done에서 id를 유지한다', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('done', 2000, { mainAgentState: 'waiting' }));
+
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.reason, 'INTERACTIVE_WAIT');
+  assert.equal(state.epoch, null);
+  // basisAt은 cacheBasisAt 규칙(마지막 working)을 따른다.
+  assert.deepEqual(state.hold, { id: 1, basisAt: 1000, attempted: false });
+  assert.equal(state.epochSeq, 1);
+  const hold = { ...state.hold };
+
+  // 대기 중 waiting 훅이 다시 와도 최초 hold id·basisAt은 불변이다.
+  state = reduce(state, hook('waiting', 3000));
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.deepEqual(state.hold, hold);
+  assert.equal(state.epochSeq, hold.id);
+
+  // 응답 없이 mainAgent done이 오면 hold의 캐시 기준을 승계해 ARMED가 된다.
+  state = reduce(state, hook('done', 4000, { mainAgentState: 'done' }));
+  assert.equal(state.phase, 'ARMED');
+  assert.equal(state.epoch.id, hold.id);
+  assert.equal(state.epoch.basisAt, hold.basisAt);
+  assert.equal(state.epoch.doneAt, 4000);
+  assert.equal(state.epoch.attempted, false);
+  assert.equal(state.hold, null);
+  assert.equal(state.epochSeq, hold.id);
+});
+
+test('hold (j): working→done(mainAgent blocked)도 SUSPENDED로 hold를 잡는다', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('done', 2000, { mainAgentState: 'blocked' }));
+
+  assert.equal(state.phase, 'SUSPENDED');
+  assert.equal(state.reason, 'INTERACTIVE_WAIT');
+  assert.equal(state.epoch, null);
+  assert.deepEqual(state.hold, { id: 1, basisAt: 1000, attempted: false });
+  assert.equal(state.epochSeq, 1);
+});
+
+test('hold (m): NEEDS_REVIEW 상태에서는 mainAgent waiting이어도 hold를 만들지 않는다', () => {
+  // awaitingTurn → TICK → NEEDS_REVIEW → working(phase 유지)로 mainAgentState 분기에 도달시킨다.
+  let state = reduce(awaitingTurn(3100), {
+    type: 'TICK',
+    now: 3100 + TIMING.turnStartConfirmMs + 1,
+  });
+  state = reduce(state, hook('working', 50000));
+  assert.equal(state.phase, 'NEEDS_REVIEW');
+  assert.equal(state.hold, null);
+
+  state = reduce(state, hook('done', 51000, { mainAgentState: 'waiting' }));
+  assert.equal(state.hold, null);
+  assert.equal(state.epoch, null);
+});
+
+test('hold (k): working→waiting→done(mainAgent working)은 BUSY, 오래된 hold는 버린다', () => {
+  let state = reduce(initialTargetState(TARGET), hook('working', 1000));
+  state = reduce(state, hook('waiting', 3000));
+  assert.notEqual(state.hold, null);
+
+  state = reduce(state, hook('done', 4000, { mainAgentState: 'working' }));
+  assert.equal(state.phase, 'BUSY');
+  assert.equal(state.reason, 'BUSY');
+  assert.equal(state.epoch, null);
+  assert.equal(state.hold, null);
+});
+
+test('hold (l): hold 필드가 없거나 객체가 아닌 state에 TICK을 적용해도 hold는 null로 정규화된다', () => {
+  const base = initialTargetState(TARGET);
+
+  const withoutHold = { ...base };
+  delete withoutHold.hold;
+  assert.equal('hold' in withoutHold, false);
+  const normalizedMissing = reduce(withoutHold, { type: 'TICK', now: 1000 });
+  assert.equal(normalizedMissing.hold, null);
+  // 입력 state는 변경되지 않는다.
+  assert.equal('hold' in withoutHold, false);
+
+  const normalizedBad = reduce({ ...base, hold: 'bad' }, { type: 'TICK', now: 1000 });
+  assert.equal(normalizedBad.hold, null);
+});
+
+// ---------------------------------------------------------------------------
 // 전송 거절/불확실
 // ---------------------------------------------------------------------------
 

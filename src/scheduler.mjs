@@ -115,7 +115,8 @@ function copyState(state) {
   return {
     ...state,
     epoch: state.epoch === null ? null : { ...state.epoch },
-    hold: state.hold === null ? null : { ...state.hold },
+    // hold 필드가 없거나 객체가 아니면(구버전 state·손상 입력) null로 정규화한다.
+    hold: state.hold && typeof state.hold === 'object' ? { ...state.hold } : null,
     attempt: state.attempt === null ? null : { ...state.attempt },
   };
 }
@@ -312,12 +313,25 @@ function reduceHook(state, input) {
   ) {
     // combined가 done이어도 mainAgent가 아직 끝나지 않았다.
     if (input.mainAgentState === 'waiting' || input.mainAgentState === 'blocked') {
-      // 대기 중이다: hold를 유지하고 전송도 계속 막는다.
+      // 대기 중이다: hold를 유지·생성하고 전송도 계속 막는다.
       next.phase = 'SUSPENDED';
       next.reason = 'INTERACTIVE_WAIT';
+      // waiting/blocked HOOK 없이 combined done에만 대기 상태가 실린 경우에도 대기 직전
+      // 관측을 hold로 잡는다(없으면 탭이 💤로 보인다). NEEDS_REVIEW는 기존 처리를 우선한다.
+      if (state.hold === null && state.seenWorking === true && state.phase !== 'NEEDS_REVIEW') {
+        const holdId = state.epochSeq + 1;
+        next.epochSeq = holdId;
+        next.hold = {
+          id: holdId,
+          basisAt: cacheBasisAt(state.lastWorkingAt, receivedAt),
+          attempted: false,
+        };
+      }
     } else {
       next.phase = 'BUSY';
       next.reason = 'BUSY';
+      // 대기가 풀리고 아직 작업 중이다: 대기 중 잡은 오래된 hold는 버린다.
+      next.hold = null;
     }
     next.epoch = null;
     return next;

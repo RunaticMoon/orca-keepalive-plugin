@@ -217,6 +217,8 @@ export function projectCacheStatus({
     phase === 'SUSPENDED' &&
     reason === 'INTERACTIVE_WAIT' &&
     isObject(state.hold) &&
+    isFiniteNumber(state.hold.id) &&
+    isFiniteNumber(state.hold.basisAt) &&
     historyExpiresAt !== null &&
     !expired
   ) {
