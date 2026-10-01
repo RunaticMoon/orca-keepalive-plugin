@@ -28,7 +28,7 @@ function snapshot(over = {}) {
   return {
     revision: 3,
     serverNow: 0,
-    appTimer: { known: true, enabled: true, ttlMs: 300000, source: 'sqlite', readAt: 0 },
+    profileSettings: { known: true, source: 'index', readAt: 0 },
     connection: { state: 'connected' },
     config: { paused: false },
     worktrees: [

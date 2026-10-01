@@ -442,24 +442,19 @@ export function createDashboardModel({
   }
 
   /**
+   * 런타임 뷰의 플러그인 프로필 설정 읽기 결과를 정규화한다. 항상 4개 키를
+   * 돌려주며, 알 수 없는 source·불량 값은 null로 낮춘다.
    * @param {Record<string, unknown>} view
-   * @returns {{known: boolean, enabled: boolean, ttlMs: number|null, source: 'sqlite'|'json'|null, readAt: number|null, reason?: string}}
+   * @returns {{known: boolean, source: 'index'|null, readAt: number|null, reason: string|null}}
    */
-  function appTimerOf(view) {
-    const raw = isPlainObject(view.appTimer) ? /** @type {Record<string, unknown>} */ (view.appTimer) : {};
-    /** @type {{known: boolean, enabled: boolean, ttlMs: number|null, source: 'sqlite'|'json'|null, readAt: number|null, reason?: string}} */
-    const timer = {
+  function profileSettingsOf(view) {
+    const raw = isPlainObject(view.profileSettings) ? /** @type {Record<string, unknown>} */ (view.profileSettings) : {};
+    return {
       known: raw.known === true,
-      enabled: raw.enabled === true,
-      ttlMs: finiteOrNull(raw.ttlMs),
-      source: raw.source === 'sqlite' || raw.source === 'json' ? raw.source : null,
+      source: raw.source === 'index' ? 'index' : null,
       readAt: finiteOrNull(raw.readAt),
+      reason: nonEmptyStringOrNull(raw.reason),
     };
-    const reason = nonEmptyStringOrNull(raw.reason);
-    if (reason !== null) {
-      timer.reason = reason;
-    }
-    return timer;
   }
 
   /**
@@ -473,17 +468,14 @@ export function createDashboardModel({
   }
 
   /**
-   * 앱 타이머/런타임 연결 게이트 사유. 통과하면 null.
-   * @param {{known: boolean, enabled: boolean}} timer
+   * 프로필 설정/런타임 연결 게이트 사유. 통과하면 null.
+   * @param {{known: boolean}} profileSettings
    * @param {{state: string}} connection
    * @returns {string|null}
    */
-  function runtimeGateReason(timer, connection) {
-    if (!timer.known) {
+  function runtimeGateReason(profileSettings, connection) {
+    if (!profileSettings.known) {
       return 'SETTINGS_UNKNOWN';
-    }
-    if (!timer.enabled) {
-      return 'APP_TIMER_OFF';
     }
     if (connection.state !== 'connected') {
       return connection.state === 'wrong_runtime' ? 'WRONG_RUNTIME' : 'RUNTIME_UNAVAILABLE';
@@ -494,7 +486,7 @@ export function createDashboardModel({
   /**
    * 정책 사유를 저장소에서 읽는다. scope가 유효하지 않으면 generic 사유를 돌려준다.
    * @param {{userDataKey: string, profileId: string, worktreeId: string, paneKey?: string|null}} scope
-   * @param {number|null} [ttlMs] 현재 앱 타이머 TTL. 연속 상한 선택에 쓴다.
+   * @param {number|null} [ttlMs] 현재 config 캐시 TTL. 연속 상한 선택에 쓴다.
    * @returns {{allowed: boolean, reason: string|null}}
    */
   function policyOf(scope, ttlMs) {
@@ -512,13 +504,13 @@ export function createDashboardModel({
   /**
    * 워크트리 effective/reason. budget 기반 사유는 무시하고 GLOBAL_PAUSED/
    * SCOPE_DISABLED만 반영한다.
-   * @param {{known: boolean, enabled: boolean}} timer
+   * @param {{known: boolean}} profileSettings
    * @param {{state: string}} connection
    * @param {{allowed: boolean, reason: string|null}} policy
    * @returns {{effectiveEnabled: boolean, reason: string|null}}
    */
-  function worktreeGate(timer, connection, policy) {
-    const gate = runtimeGateReason(timer, connection);
+  function worktreeGate(profileSettings, connection, policy) {
+    const gate = runtimeGateReason(profileSettings, connection);
     if (gate !== null) {
       return { effectiveEnabled: false, reason: gate };
     }
@@ -529,20 +521,20 @@ export function createDashboardModel({
   }
 
   /**
-   * 터미널 effective/reason. 우선순위: !supported → app/연결 → 정책 → 런타임 reason.
+   * 터미널 effective/reason. 우선순위: !supported → 설정/연결 → 정책 → 런타임 reason.
    * @param {boolean} supported
    * @param {string|null} unsupportedReason
-   * @param {{known: boolean, enabled: boolean}} timer
+   * @param {{known: boolean}} profileSettings
    * @param {{state: string}} connection
    * @param {{allowed: boolean, reason: string|null}} policy
    * @param {string|null} runtimeReason
    * @returns {{effectiveEnabled: boolean, reason: string|null}}
    */
-  function terminalGate(supported, unsupportedReason, timer, connection, policy, runtimeReason) {
+  function terminalGate(supported, unsupportedReason, profileSettings, connection, policy, runtimeReason) {
     if (!supported) {
       return { effectiveEnabled: false, reason: unsupportedReason };
     }
-    const gate = runtimeGateReason(timer, connection);
+    const gate = runtimeGateReason(profileSettings, connection);
     if (gate !== null) {
       return { effectiveEnabled: false, reason: gate };
     }
@@ -648,9 +640,15 @@ export function createDashboardModel({
    * @returns {object}
    */
   function snapshot() {
+    // 저장소 config는 함수 초반에 한 번만 읽어 TTL·상한·projection에 함께 쓴다.
+    const stored = store.snapshot();
+    const config = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config : {};
+    const configTtl = finiteOrNull(config.claudeCacheTtlMs);
+    const ttl = configTtl === 300000 || configTtl === 3600000 ? configTtl : null;
+
     const view = readRuntimeView();
     const { userDataKey, profileId } = identityOf(view);
-    const timer = appTimerOf(view);
+    const profileSettings = profileSettingsOf(view);
     const connection = connectionOf(view);
 
     const worktrees = [];
@@ -679,7 +677,7 @@ export function createDashboardModel({
           isPlainObject(override) && (override.worktree === true || override.worktree === false)
             ? override.worktree
             : null;
-        const gate = worktreeGate(timer, connection, policyOf(worktreeScope, timer.ttlMs));
+        const gate = worktreeGate(profileSettings, connection, policyOf(worktreeScope, ttl));
 
         const terminals = [];
         const rawTerminals = Array.isArray(rawWorktree.terminals) ? rawWorktree.terminals : [];
@@ -702,9 +700,9 @@ export function createDashboardModel({
           const terminalGateResult = terminalGate(
             supported,
             unsupportedReason,
-            timer,
+            profileSettings,
             connection,
-            policyOf(terminalScope, timer.ttlMs),
+            policyOf(terminalScope, ttl),
             runtimeReason,
           );
 
@@ -762,11 +760,9 @@ export function createDashboardModel({
     // 진단 target 해시 → 터미널 라벨. hashTarget이 없으면 빈 맵(targetLabel null).
     const labelsByHash = diagnosticLabelsByHash(view);
 
-    const stored = store.snapshot();
-    const config = isPlainObject(stored) && isPlainObject(stored.config) ? stored.config : {};
     const cap5m = finiteOrNull(config.maxConsecutiveKeepalives5m);
     const cap1h = finiteOrNull(config.maxConsecutiveKeepalives1h);
-    const capActive = capFor(timer.ttlMs, {
+    const capActive = capFor(ttl, {
       maxConsecutiveKeepalives5m: cap5m ?? 0,
       maxConsecutiveKeepalives1h: cap1h ?? 0,
     });
@@ -774,12 +770,13 @@ export function createDashboardModel({
     return {
       revision: isPlainObject(stored) && Number.isSafeInteger(stored.revision) ? stored.revision : 0,
       serverNow: now(),
-      appTimer: timer,
+      profileSettings,
       connection,
       config: {
         paused: config.paused === true,
         defaultWorktreeEnabled: config.defaultWorktreeEnabled === true,
         message: typeof config.message === 'string' ? config.message : '',
+        claudeCacheTtlMs: configTtl,
         margin5mMs: finiteOrNull(config.margin5mMs),
         margin1hMs: finiteOrNull(config.margin1hMs),
         quietOutputMs: finiteOrNull(config.quietOutputMs),
@@ -1099,7 +1096,7 @@ export function createDashboardModel({
   /**
    * 커맨드/알림용 한국어 요약(비밀·경로·원시 worktreeId 없음, 480자 이하).
    *
-   * 1행은 전역 상태(켜짐/꺼짐(일시정지) · 타이머 · 연결)를, 이후에는 워크트리별
+   * 1행은 전역 상태(켜짐/꺼짐(일시정지) · 캐시 TTL · 연결)를, 이후에는 워크트리별
    * 켜짐/꺼짐 목록을 한 줄씩 보여준다. `options.currentWorktreeId`(원시 Orca
    * worktreeId)를 해시해 현재 워크트리를 찾으면 맨 앞에 `▶ `를 붙인다.
    *
@@ -1114,14 +1111,12 @@ export function createDashboardModel({
     const serverNow = finiteOrNull(snap.serverNow) ?? 0;
     const worktrees = Array.isArray(snap.worktrees) ? snap.worktrees : [];
 
-    // 전역 상태 1행.
+    // 전역 상태 1행: 캐시 TTL은 config 값을 그대로 표시하고, 프로필 설정을 읽지
+    // 못하면 추가로 알린다.
     const headerParts = [paused ? '꺼짐(일시정지)' : '켜짐'];
-    if (!snap.appTimer.known) {
-      headerParts.push('앱 타이머 설정 알 수 없음');
-    } else if (snap.appTimer.enabled) {
-      headerParts.push(`타이머 켜짐(${TTL_TEXT[snap.appTimer.ttlMs] ?? '알 수 없음'})`);
-    } else {
-      headerParts.push('Orca 프롬프트 캐시 타이머 꺼짐');
+    headerParts.push(`캐시 TTL ${TTL_TEXT[snap.config.claudeCacheTtlMs] ?? '알 수 없음'}`);
+    if (!snap.profileSettings.known) {
+      headerParts.push('Orca 프로필 확인 불가');
     }
     headerParts.push(CONNECTION_TEXT[snap.connection.state] ?? snap.connection.state);
     headerParts.push(`워크트리 ${worktrees.length}개`);

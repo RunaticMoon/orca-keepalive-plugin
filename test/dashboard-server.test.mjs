@@ -550,11 +550,9 @@ test('GET /api/state는 캐시 상태 필드를 전달하고 알 수 없는 문�
     userDataKey: 'u'.repeat(64),
     profileId: 'p1',
     connection: { state: 'connected', reason: null },
-    appTimer: {
+    profileSettings: {
       known: true,
-      enabled: true,
-      ttlMs: 300000,
-      source: 'sqlite',
+      source: 'index',
       readAt: 1,
       reason: null,
     },

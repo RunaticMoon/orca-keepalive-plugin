@@ -82,7 +82,7 @@ function runtimeView(over = {}) {
     userDataKey: USER,
     profileId: 'p1',
     connection: { state: 'connected', reason: null },
-    appTimer: { known: true, enabled: true, ttlMs: 300000, source: 'sqlite', readAt: 1111, reason: null },
+    profileSettings: { known: true, source: 'index', readAt: 1111, reason: null },
     worktrees: [wt()],
     ...over,
   };
@@ -129,14 +129,15 @@ test('snapshot: 연결 전(userDataKey/profileId null)이면 worktrees는 빈 �
     userDataKey: null,
     profileId: null,
     connection: { state: 'unavailable', reason: 'runtime_unavailable' },
-    appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null, reason: 'settings_unknown' },
+    profileSettings: { known: false, source: null, readAt: null, reason: 'settings_unknown' },
   });
   const { model } = makeModel({ store, runtime });
 
   const snap = model.snapshot();
   assert.equal(snap.revision, 0);
   assert.deepEqual(snap.worktrees, []);
-  assert.equal(snap.appTimer.known, false);
+  assert.equal(snap.profileSettings.known, false);
+  assert.equal('appTimer' in snap, false);
   assert.equal(snap.connection.state, 'unavailable');
   assert.equal(snap.config.paused, false);
   assert.deepEqual(snap.diagnostics, []);
@@ -172,17 +173,45 @@ test('snapshot: config에 TTL별 상한과 active를 투영한다', async () => 
   let snap = model.snapshot();
   assert.equal(snap.config.maxConsecutiveKeepalives5m, 8);
   assert.equal(snap.config.maxConsecutiveKeepalives1h, 3);
-  // appTimer.ttlMs=300000(5분)이므로 5m 상한이 active.
-  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 8);
+  // 기본 config TTL은 1시간이므로 1h 상한이 active.
+  assert.equal(snap.config.claudeCacheTtlMs, 3600000);
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 3);
   assert.equal('maxConsecutiveKeepalives' in snap.config, false);
 
-  // TTL 미상이면 보수적으로 두 값 중 작은 값.
-  const unknownTimer = runtimeView({
-    appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null, reason: 'settings_unknown' },
+  // config TTL을 5분으로 바꾸면 5m 상한이 active.
+  await store.updateConfig({ claudeCacheTtlMs: 300000 });
+  snap = model.snapshot();
+  assert.equal(snap.config.claudeCacheTtlMs, 300000);
+  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 8);
+
+  // TTL을 알 수 없으면(불량 config) 보수적으로 두 값 중 작은 값.
+  const partialStore = {
+    ...store,
+    snapshot: () => ({ revision: 0, config: { maxConsecutiveKeepalives5m: 8, maxConsecutiveKeepalives1h: 3 } }),
+  };
+  const { model: unknownModel } = makeModel({ store: partialStore, runtime: runtimeView({ worktrees: [] }) });
+  assert.equal(unknownModel.snapshot().config.maxConsecutiveKeepalivesActive, 3);
+});
+
+test('snapshot: appTimer 키 없이 profileSettings 4키와 config.claudeCacheTtlMs를 노출', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView() });
+
+  const snap = model.snapshot();
+  assert.equal('appTimer' in snap, false);
+  assert.deepEqual(Object.keys(snap.profileSettings).sort(), ['known', 'readAt', 'reason', 'source']);
+  assert.deepEqual(snap.profileSettings, { known: true, source: 'index', readAt: 1111, reason: null });
+  assert.equal(snap.config.claudeCacheTtlMs, 3600000);
+});
+
+test('snapshot: profileSettings source는 index만 허용하고 나머지는 null로 낮춘다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView({ profileSettings: { known: true, source: 'sqlite', readAt: 'nope', reason: 5 } }),
   });
-  const { model: unknownModel } = makeModel({ store, runtime: unknownTimer });
-  snap = unknownModel.snapshot();
-  assert.equal(snap.config.maxConsecutiveKeepalivesActive, 3);
+
+  assert.deepEqual(model.snapshot().profileSettings, { known: true, source: null, readAt: null, reason: null });
 });
 
 test('snapshot: 같은 label 워크트리 2개와 split terminal은 각각 다른 targetId', async () => {
@@ -477,27 +506,34 @@ test('snapshot: needsReview budget은 cacheState/cacheStatus를 review로 우선
 /* 게이트 사유 우선순위                                                */
 /* ------------------------------------------------------------------ */
 
-test('게이트: 앱 타이머 off/unknown', async () => {
+test('게이트: 프로필 설정 unknown', async () => {
   const { store } = await newStore();
-
-  const off = makeModel({
-    store,
-    runtime: runtimeView({ appTimer: { known: true, enabled: false, ttlMs: null, source: 'sqlite', readAt: 1 } }),
-  });
-  let snap = off.model.snapshot();
-  assert.equal(snap.worktrees[0].effectiveEnabled, false);
-  assert.equal(snap.worktrees[0].reason, 'APP_TIMER_OFF');
-  assert.equal(snap.worktrees[0].terminals[0].effectiveEnabled, false);
-  assert.equal(snap.worktrees[0].terminals[0].reason, 'APP_TIMER_OFF');
 
   const unknown = makeModel({
     store,
-    runtime: runtimeView({ appTimer: { known: false, enabled: false, ttlMs: null, source: null, readAt: null, reason: 'settings_unknown' } }),
+    runtime: runtimeView({ profileSettings: { known: false, source: null, readAt: null, reason: 'settings_unknown' } }),
   });
-  snap = unknown.model.snapshot();
+  const snap = unknown.model.snapshot();
+  assert.equal(snap.worktrees[0].effectiveEnabled, false);
   assert.equal(snap.worktrees[0].reason, 'SETTINGS_UNKNOWN');
+  assert.equal(snap.worktrees[0].terminals[0].effectiveEnabled, false);
   assert.equal(snap.worktrees[0].terminals[0].reason, 'SETTINGS_UNKNOWN');
-  assert.equal(snap.appTimer.reason, 'settings_unknown');
+  assert.equal(snap.profileSettings.reason, 'settings_unknown');
+});
+
+test('게이트: 구 view의 appTimer.enabled=false 잔존은 영향을 주지 않는다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView({ appTimer: { known: true, enabled: false, ttlMs: null, source: 'sqlite', readAt: 1 } }),
+  });
+
+  const snap = model.snapshot();
+  assert.equal('appTimer' in snap, false);
+  assert.equal(snap.worktrees[0].effectiveEnabled, true);
+  assert.equal(snap.worktrees[0].reason, null);
+  assert.equal(snap.worktrees[0].terminals[0].effectiveEnabled, true);
+  assert.equal(snap.worktrees[0].terminals[0].reason, null);
 });
 
 test('게이트: 연결 끊김/wrong runtime 사유', async () => {
@@ -720,6 +756,42 @@ test('dispatch: config 검증 실패는 400 invalid_config', async () => {
   assert.equal(calls.policy, 0);
 });
 
+test('dispatch: config의 허용 밖 claudeCacheTtlMs는 400 invalid_config', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+  const rev = model.snapshot().revision;
+
+  await expectActionError(
+    model.dispatch({ type: 'config', patch: { claudeCacheTtlMs: 400 }, expectedRevision: rev }),
+    400,
+    'invalid_config',
+  );
+  assert.equal(calls.policy, 0);
+});
+
+test('dispatch: config claudeCacheTtlMs 수정의 revision 충돌은 409', async () => {
+  const { store } = await newStore();
+  const { model, calls } = makeModel({ store, runtime: runtimeView() });
+  const snap = model.snapshot();
+
+  await expectActionError(
+    model.dispatch({ type: 'config', patch: { claudeCacheTtlMs: 300000 }, expectedRevision: snap.revision + 1 }),
+    409,
+    'revision_conflict',
+  );
+  assert.equal(calls.policy, 0);
+
+  // 정상 revision이면 반영되고 새 snapshot의 TTL도 바뀐다.
+  const next = await model.dispatch({
+    type: 'config',
+    patch: { claudeCacheTtlMs: 300000 },
+    expectedRevision: snap.revision,
+  });
+  assert.equal(next.config.claudeCacheTtlMs, 300000);
+  assert.equal(next.config.maxConsecutiveKeepalivesActive, 8);
+  assert.equal(calls.policy, 1);
+});
+
 /* ------------------------------------------------------------------ */
 /* toggleWorktreeById / setPaused / statusSummary                       */
 /* ------------------------------------------------------------------ */
@@ -939,7 +1011,7 @@ test('statusSummary: 전역 1행 + 워크트리별 켜짐/꺼짐(기본값/직�
 
   const { text } = model.statusSummary();
   const lines = text.split('\n');
-  assert.equal(lines[0], '켜짐 · 타이머 켜짐(5분) · 연결됨 · 워크트리 3개');
+  assert.equal(lines[0], '켜짐 · 캐시 TTL 1시간 · 연결됨 · 워크트리 3개');
   assert.deepEqual(lines.slice(1), [
     'docs 꺼짐(기본값)',
     'feat-x 켜짐(직접 설정)',
@@ -1186,7 +1258,38 @@ test('statusSummary: 워크트리가 없으면 대상 워크트리 없음', asyn
   const { model } = makeModel({ store, runtime, now: () => 1_000_000 });
 
   const { text } = model.statusSummary();
-  assert.equal(text, '켜짐 · 타이머 켜짐(5분) · 연결됨 · 워크트리 0개\n대상 워크트리 없음');
+  assert.equal(text, '켜짐 · 캐시 TTL 1시간 · 연결됨 · 워크트리 0개\n대상 워크트리 없음');
+});
+
+test('statusSummary: config TTL을 캐시 TTL 문구로 표시한다(1시간/5분)', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({ store, runtime: runtimeView({ worktrees: [] }), now: () => 1_000_000 });
+
+  let header = model.statusSummary().text.split('\n')[0];
+  assert.match(header, /캐시 TTL 1시간/);
+
+  await store.updateConfig({ claudeCacheTtlMs: 300000 });
+  header = model.statusSummary().text.split('\n')[0];
+  assert.match(header, /캐시 TTL 5분/);
+
+  assert.equal(header.includes('Orca 프롬프트 캐시 타이머'), false);
+  assert.equal(header.includes('타이머 켜짐'), false);
+  assert.equal(header.includes('앱 타이머 설정'), false);
+});
+
+test('statusSummary: 프로필 unknown이면 Orca 프로필 확인 불가를 덧붙인다', async () => {
+  const { store } = await newStore();
+  const { model } = makeModel({
+    store,
+    runtime: runtimeView({
+      worktrees: [],
+      profileSettings: { known: false, source: null, readAt: null, reason: 'settings_unknown' },
+    }),
+    now: () => 1_000_000,
+  });
+
+  const header = model.statusSummary().text.split('\n')[0];
+  assert.equal(header, '켜짐 · 캐시 TTL 1시간 · Orca 프로필 확인 불가 · 연결됨 · 워크트리 0개');
 });
 
 test('statusSummary: 480자를 넘으면 뒤 워크트리를 잘라 … 외 N개로 끝낸다', async () => {
