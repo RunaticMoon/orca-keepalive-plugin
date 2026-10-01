@@ -259,7 +259,7 @@ ARMED -- 만료/clock jump/절전 gap --> EXPIRED
 any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 ```
 
-`SUSPENDED`는 원인별 표시 상태다. 일시적 출력/known draft는 epoch를 유지하며 마감 전 다시 검사할 수 있다. blocked/waiting, 설정 off, profile/runtime/PTY 변경, hook 상태 미상은 epoch를 폐기한다. NEEDS_REVIEW는 사용자가 입력창을 확인하고 “다음 작업부터 재개”를 누르기 전까지 유지한다. 이 버튼은 bytes를 지우거나 다시 Enter하지 않는다.
+`SUSPENDED`는 원인별 표시 상태다. 일시적 출력/known draft는 epoch를 유지하며 마감 전 다시 검사할 수 있다. **선택·권한 대기(waiting/blocked)는 예약을 버리지 않고 대기 직전 관측을 hold로 보존하며, 관측된 캐시의 예상 만료까지 탭을 `⚡`로 유지한다**(KASL-0367; 대기 중 전송은 하지 않는다). 설정 off, profile/runtime/PTY 변경, hook 상태 미상은 epoch를 폐기한다. NEEDS_REVIEW는 사용자가 입력창을 확인하고 “다음 작업부터 재개”를 누르기 전까지 유지한다. 이 버튼은 bytes를 지우거나 다시 Enter하지 않는다.
 
 입력 이벤트 처리 규칙:
 
@@ -271,6 +271,8 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 6. 설정 TTL/여유 변경 시 아직 시도하지 않은 epoch의 dueAt 재계산. 새 deadline이 이미 지났으면 next turn 대기. 안전 조건 변경은 즉시 재검사. elapsed clock은 monotonic clock, 표시 시각은 Date.now. 두 clock delta 차이 >5초 또는 tick gap>10초이면 epoch 전부 폐기(절전·시계 조정 뒤 폭주 방지).
 7. 한 epoch에서 mutation 예약 최대 1회. paste 이후에는 동일 epoch 자동 재시도 없음. preflight의 read failure만 아직 마감 전이면 polling으로 재평가한다.
 8. “TTL당 1회”는 **완료 기반 cache epoch당 1회**로 정의한다. keepalive 완료가 새로운 epoch를 열므로 대략 4분/58분마다 가능하다. 이전 전송 뒤 전체 TTL까지 별도 cooldown을 걸면 TTL보다 짧게 유지하려는 목표와 충돌하므로 사용하지 않는다.
+
+**대기 hold(§2-3, KASL-0367).** Claude가 선택지(AskUserQuestion)·권한 요청을 띄워 waiting/blocked가 오면 scheduler는 state에 `hold {id, basisAt, attempted}`를 둔다. 작업 중(BUSY)에서 대기로 진입하면 대기 진입 시각을 캐시 기준으로 새 hold를 잡고, 아직 보내지 않은 예약(ARMED/CHECKING) 중이면 그 예약의 id·기준·attempted를 승계한다. combined done이 왔지만 mainAgent가 waiting/blocked이면 cacheBasisAt 규칙으로 hold를 만들고, mainAgent가 working이면 hold를 버린다. 대기 중에는 전송하지 않는다(선택·권한 화면에 입력하면 사용자의 선택을 대신하게 된다). 응답으로 working이 오면 일반 새 턴으로 처리해 hold를 버리고 그 완료 뒤 새 예약을 잡으며, working 없이 곧바로 done(취소 등)이면 hold 기준으로 재예약한다(이미 지났으면 만료). hold는 메모리 전용이라 `epochs-v1` 저장 형식을 바꾸지 않고 플러그인 재시작 시 복원되지 않는다(한계).
 
 ### 5.5 전송 직전·단계 사이 안전 규칙
 
@@ -314,7 +316,7 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 
 새 상태 표시는 전송 예약(scheduler의 epoch)과 **관측 이력**, 그리고 그 둘을 사용자 문구로 바꾸는 **projection**을 분리한다. 실제 Anthropic 캐시 적중 여부가 아니라 관측한 턴과 유효 예약에 근거한 유지 상태다.
 
-**관측 이력(`src/cache-history.mjs`).** 순수 reducer `reduceCacheHistory(history, event)`가 표시 전용 이력을 관리한다. scheduler의 epoch를 대체하지 않고 전송 결정에 관여하지 않는다. 이력은 coordinator의 target entry에만 존재하며 `{epochId(영속 저장 안 함), doneAt, basisAt, expiresAt, lastBlockReason, expiredAt}`를 갖는다. event는 OPEN(인정된 새 epoch의 시각으로 교체·원인 초기화), RETIME(살아 있는 같은 epoch의 expiresAt 갱신, 이미 만료된 이력은 연장 금지), BLOCK(같은 epoch이고 만료 전일 때만 허용 reason 기록, 같은 reason 반복은 no-op), ADVANCE(`now >= expiresAt`이면 `expiredAt=expiresAt` 확정, 만료 24시간 경과 시 null), RESTORE(검증된 저장 레코드에서 복원, epochId=null), CLEAR(새 working/turn 인정 또는 다른 PTY 교체 시 삭제)이다. 허용 reason은 `contracts.EXPIRE_CAUSE_REASONS`뿐이고 `EXPIRED`·`NO_FRESH_TURN`·임의 문자열은 기록하지 않는다. coordinator는 `applyReduce`에서 **변경 전 state를 보존**해 이력을 갱신한다(epoch를 지운 뒤 시각을 찾지 않음). skipped 결과는 시작 때의 `key+target identity+generation+epochId`와 일치할 때만 반영하고, 매 tick `ADVANCE`로 만료 확정과 24시간 정리를 실행 중에도 처리한다.
+**관측 이력(`src/cache-history.mjs`).** 순수 reducer `reduceCacheHistory(history, event)`가 표시 전용 이력을 관리한다. scheduler의 epoch를 대체하지 않고 전송 결정에 관여하지 않는다. 이력은 coordinator의 target entry에만 존재하며 `{epochId(영속 저장 안 함), doneAt, basisAt, expiresAt, lastBlockReason, expiredAt}`를 갖는다. event는 OPEN(인정된 새 epoch의 시각으로 교체·원인 초기화), RETIME(살아 있는 같은 epoch의 expiresAt 갱신, 이미 만료된 이력은 연장 금지), BLOCK(같은 epoch이고 만료 전일 때만 허용 reason 기록, 같은 reason 반복은 no-op), ADVANCE(`now >= expiresAt`이면 `expiredAt=expiresAt` 확정, 만료 24시간 경과 시 null), RESTORE(검증된 저장 레코드에서 복원, epochId=null), CLEAR(새 working/turn 인정 또는 다른 PTY 교체 시 삭제)이다. 허용 reason은 `contracts.EXPIRE_CAUSE_REASONS`뿐이고 `EXPIRED`·`NO_FRESH_TURN`·임의 문자열은 기록하지 않는다. coordinator는 `applyReduce`에서 **변경 전 state를 보존**해 이력을 갱신한다(epoch를 지운 뒤 시각을 찾지 않음). skipped 결과는 시작 때의 `key+target identity+generation+epochId`와 일치할 때만 반영하고, 매 tick `ADVANCE`로 만료 확정과 24시간 정리를 실행 중에도 처리한다. epoch가 없는 대기 구간에서는 coordinator가 hold를 관측으로 삼아 같은 id로 OPEN/RETIME하고, 대기(SUSPENDED/`INTERACTIVE_WAIT`)면 `lastBlockReason=INTERACTIVE_WAIT`를 남긴다(KASL-0367).
 
 **저장 레코드 v2(`EpochMemoryRecordV2`).** `{kind:'armed'|'history', userDataKey, profileId, worktreeId, paneKey, ptyId, incarnationId, doneAt, basisAt, expiresAt, lastBlockReason, expiredAt, savedAt}`. 시각은 유한수를 검증하고 `expiredAt !== null`이면 `expiresAt`과 같아야 하며 반드시 `kind='history'`다. `kind='history'`는 `expiresAt`이 필수다. TTL을 알 수 없는 v1에서 올린 armed는 `basisAt`·`lastBlockReason`을 만들지 않고 `expiresAt=null`로 둔다. envelope는 `EPOCH_MEMORY_VERSION=2`이고 key `epochs-v1`을 유지한다.
 
@@ -322,7 +324,9 @@ any -- 대상 제거/PTY 변경/runtime 변경 --> UNKNOWN 또는 제거
 
 **projection(`src/cache-status.mjs`, 작업 J).** target state·관측 이력·정책·설정에서 `CacheDisplayFields`(`cacheState` `kept|none|review`, `cacheStatus` 9종, `indicatorOn`, `expiresAt`, `expiredAt`, `expireCause`, `blockedReason`, `dueAt`)를 계산해 RuntimeView와 title-indicator의 `desired.cacheState`에 같은 값을 공급한다. `indicatorOn`은 기존 paused/settings/connection/cwarm/scope/상한/storage 실패 조건을 유지하되 **`PARTIAL_OR_UNKNOWN_SEND` 자체는 표시를 끄는 이유에서 제외**한다(그 reason에 가려진 상한·memoryPaused 조건은 별도 확인). 이 예외는 탭 표시에만 적용하고 `safePolicy`나 실제 전송 gate는 바꾸지 않는다. `phase`/`reason`/`effectiveEnabled`는 호환용으로 유지하되 일반 사용자 화면에 phase를 출력하지 않는다.
 
-**탭 기호와 문구(§2-2, §2-7).** `indicatorOn=false` 또는 옵션 off면 기호 없음, `review`면 `⚠️ `, 유지 중(`working`/유효 `scheduled`/`sending`/`awaiting-turn`)이면 `⚡ `, 나머지는 `💤 `다. 같은 탭의 on pane만 `⚠️ > ⚡ > 💤` 순서로 합산하고 같은 기호에서는 rename하지 않는다. 대시보드는 내부 phase 대신 사용자용 문구(`캐시 유지 중 · …`, `캐시 만료됨 · HH:MM · <마지막 차단 사유>`, `예약 없음 · …`, `유지 중단 · …`, `확인 필요 · …`)를 표시하고, "유지 설정 켜짐/꺼짐"과 캐시 상태를 분리한다. 만료 원인은 실제 원인이 아니라 **마지막으로 기록된 전송 차단 사유**이며(예: Orca가 Claude Code의 흐린 프롬프트 제안을 초안으로 오판해 `DRAFT_PRESENT`가 기록될 수 있음), 만료 시각은 관측한 작업과 설정 TTL 기준의 예상이다. scheduler는 실제 만료 10초 전에 전송을 멈추며 그 구간은 `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 HH:MM`으로 표시한다(실제 `expiresAt`이 지나야 "캐시 만료됨").
+**탭 기호와 문구(§2-2, §2-7).** `indicatorOn=false` 또는 옵션 off면 기호 없음, `review`면 `⚠️ `, 유지 중(`working`/유효 `scheduled`/`sending`/`awaiting-turn`/hold가 있는 `interactive-wait`)이면 `⚡ `, 나머지는 `💤 `다. 같은 탭의 on pane만 `⚠️ > ⚡ > 💤` 순서로 합산하고 같은 기호에서는 rename하지 않는다. 대시보드는 내부 phase 대신 사용자용 문구(`캐시 유지 중 · …`(hold 있는 대기 포함), `캐시 만료됨 · HH:MM · <마지막 차단 사유>`, `예약 없음 · …`, `선택·권한 응답 대기 · 캐시 상태 확인 안 됨`, `유지 중단 · …`, `확인 필요 · …`)를 표시하고, "유지 설정 켜짐/꺼짐"과 캐시 상태를 분리한다. 만료 원인은 실제 원인이 아니라 **마지막으로 기록된 전송 차단 사유**이며(예: Orca가 Claude Code의 흐린 프롬프트 제안을 초안으로 오판해 `DRAFT_PRESENT`가 기록될 수 있음), 만료 시각은 관측한 작업과 설정 TTL 기준의 예상이다. scheduler는 실제 만료 10초 전에 전송을 멈추며 그 구간은 `예약 없음 · 안전 전송 시간이 지남 · 만료 예정 HH:MM`으로 표시한다(실제 `expiresAt`이 지나야 "캐시 만료됨").
+
+**KASL-0367 변경: 대기 hold.** 선택·권한 대기 중 예약을 폐기해 `💤`/`유지 중단`으로 표시하던 동작을 바꿨다. `projectCacheStatus`는 `SUSPENDED`+`INTERACTIVE_WAIT`이고 유한한 `state.hold(id,basisAt)`가 있으며 이력이 아직 실제 만료 전일 때 `kept`/`interactive-wait`로 투영하고(예상 만료 전 `⚡`), 그 밖의 대기는 `none`/`interactive-wait`(대시보드 `선택·권한 응답 대기 · 캐시 상태 확인 안 됨`)로 둔다. hold가 있고 이력이 만료를 지나면 기존대로 `none`/`expired`가 된다. `⚡`는 관측된 캐시 기준의 추정이며 실제 캐시 적중이나 전송 실행을 보증하지 않는다. hold는 메모리 전용이고 `epochs-v1` 저장 형식은 그대로라 재시작 시 복원되지 않는다(한계).
 
 ## 6. 모듈과 인터페이스
 

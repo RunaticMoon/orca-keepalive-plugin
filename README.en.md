@@ -64,6 +64,14 @@ A keepalive is only considered when **all** of these are true at inspection time
 
 If any signal is unknown, the plugin refuses to send rather than guessing.
 
+When Claude raises a choice (AskUserQuestion) or a permission request the plugin treats it
+as waiting/blocked and **never sends automatically**: typing into a choice or permission
+screen would answer on the user's behalf. Instead of dropping the reservation it keeps the
+pre-wait observation as a *hold* and keeps showing the cache basis and estimated expiry in
+the tab and dashboard. Once the user answers and work starts (`working`), a normal new turn
+schedules a fresh reservation after it completes. The hold lives in memory only, so a
+plugin restart does not restore it (limitation).
+
 ### Send timing
 
 Timing is based on the **cache basis time** (`basisAt`) and the TTL configured in
@@ -80,6 +88,11 @@ than 3 minutes earlier than the completion event, the observed completion time
 | `300000` ms (5 min) | `margin5mMs` = 60 s | `basisAt + TTL - 60 s` (≈ 4 minutes after the last request start) |
 | `3600000` ms (1 h) | `margin1hMs` = 120 s | `basisAt + TTL - 120 s` (≈ 58 minutes after the last request start) |
 
+- **Nothing is sent while waiting.** Waiting for a choice or permission never sends keepalive
+  input. The tab stays ⚡ until the observed cache's estimated expiry, then turns 💤. Once work
+  starts after the answer (`working`) a fresh reservation is scheduled after it completes; if
+  the turn ends without work (e.g. cancelled) the plugin reschedules from the held cache basis
+  (or expires it if that has already passed).
 - **At most one keepalive mutation per cache epoch.** A keepalive that is submitted
   starts a new working→done cycle, which opens a *new* epoch, so at most roughly one
   message per 4 minutes / 58 minutes.
@@ -477,10 +490,17 @@ alongside a cache state phrase:
 - `캐시 유지 중 · 만료 예정 HH:MM` — a valid reservation exists.
 - `캐시 유지 중 · 유지 메시지 전송 중` / `캐시 유지 중 · 작업 시작 확인 중` — a
   keepalive is being submitted / its turn start is being confirmed.
-- `캐시 만료됨 · HH:MM · <last recorded send block reason>` — the estimate passed.
+- `캐시 유지 중 · 선택·권한 응답 대기(응답 전 자동 전송 안 함) · 만료 예정 HH:MM` —
+  waiting for a choice/permission answer, with the observed cache's estimated expiry still
+  ahead.
+- `캐시 만료됨 · HH:MM · <last recorded send block reason>` — the estimate passed. If it
+  expired while waiting, the reason can read `권한·입력 응답 대기로 전송하지 못함`.
 - `예약 없음 · …` — no valid reservation (this includes the scheduler's 10-second
   safety stop and the initial "no turn observed yet" state).
-- `유지 중단 · …` — automatic keeping stopped (for example a permission/input wait).
+- `선택·권한 응답 대기 · 캐시 상태 확인 안 됨` — waiting, but no cache basis could be
+  observed (for example before any observation). Nothing is sent before the answer.
+- `유지 중단 · …` — automatic keeping stopped (for example the setting is off or the
+  runtime is disconnected).
 - `확인 필요 · 전송 결과를 확인하세요` — a send needs review.
 
 Two honesty notes appear with these phrases. **Expiry times are an estimate** from the
@@ -571,8 +591,8 @@ a cache state symbol to the Orca tab title of Claude terminals:
 
 | Symbol | Meaning |
 |---|---|
-| `⚡ ` | A cache is being kept: a turn is running, a reservation is scheduled, or a keepalive is being sent / its turn start is being confirmed. |
-| `💤 ` | No cache is being kept by the plugin right now: expired, no reservation, or automatic keeping stopped (for example a permission/input wait). This means "no automatic keepalive reservation", not necessarily that Anthropic's cache is gone. |
+| `⚡ ` | A cache is being kept: a turn is running, a reservation is scheduled, or a keepalive is being sent / its turn start is being confirmed, or a choice/permission wait is in progress before the observed cache's estimated expiry. |
+| `💤 ` | No cache is being kept by the plugin right now: expired, no reservation, a wait with no observable cache basis, or other automatic keeping stopped. A choice/permission wait still shows `⚡` before the estimated expiry and turns `💤` after it passes. This means "no automatic keepalive reservation", not necessarily that Anthropic's cache is gone. |
 | `⚠️ ` | A send result needs review / confirmation. |
 | (none) | The indicator is off, or keepalive does not apply to this tab. |
 
