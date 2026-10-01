@@ -7,7 +7,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import http from 'node:http'
@@ -15,6 +15,8 @@ import http from 'node:http'
 import { createPlugin } from '../../main.mjs'
 import { createCoordinator } from '../../src/coordinator.mjs'
 import { createEpochMemory } from '../../src/epoch-memory.mjs'
+import { DEFAULT_CONFIG } from '../../src/config.mjs'
+import { STATE_KEY } from '../../src/state-store.mjs'
 import { createFakeClock } from '../fixtures/fake-clock.mjs'
 import { startFakeRuntime } from '../fixtures/fake-runtime.mjs'
 import { createOrcaUserData } from '../fixtures/orca-userdata.mjs'
@@ -135,6 +137,11 @@ function twoWorktreeTerminals() {
  * 통합 하네스를 만든다. tmp userData + fake runtime + fake host + fake clock 위에서
  * 실제 createPlugin을 활성화한다.
  *
+ * `options.enabled`/`options.ttlMs`는 Orca fixture 타이머용이다(이제 제품 스케줄에
+ * 영향이 없음을 검증하는 용도). 플러그인 TTL은 `options.pluginTtlMs`(기본 5분)로
+ * 활성화 전 state-v1에 저장한다. `pluginTtlMs:null`이면 아무것도 저장하지 않아
+ * 제품 기본 config(1시간)를 그대로 쓴다.
+ *
  * @param {Object} [options]
  */
 async function createHarness(options = {}) {
@@ -160,6 +167,18 @@ async function createHarness(options = {}) {
   }
 
   const host = createFakeHost()
+  // 플러그인 TTL은 Orca fixture 타이머가 아니라 plugin config(claudeCacheTtlMs)에서
+  // 온다. 활성화 전에 state-v1을 채워 store.load가 이 config를 읽게 한다.
+  // pluginTtlMs:null이면 쓰지 않아 DEFAULT_CONFIG(1시간)를 그대로 쓴다.
+  if (options.pluginTtlMs !== null) {
+    const pluginTtlMs = options.pluginTtlMs ?? TTL_5M
+    host.storage.set(STATE_KEY, {
+      schemaVersion: 1,
+      revision: 0,
+      config: { ...DEFAULT_CONFIG, claudeCacheTtlMs: pluginTtlMs },
+      profiles: [],
+    })
+  }
   if (options.workspaceContext) {
     host.setWorkspaceContext(options.workspaceContext)
   }
@@ -332,28 +351,21 @@ async function createHarness(options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 시나리오 1. timer off → on, 기존 idle 무전송, 새 turn due에서 paste+Enter
+// 시나리오 1. Orca 타이머 off(fixture enabled:false)여도 플러그인 config TTL로 전송
 // ---------------------------------------------------------------------------
 
-test('scenario 1: timer off는 0, on 후 기존 idle 0, 새 turn due에서 paste 1+Enter 1', async () => {
-  const h = await createHarness({ enabled: false })
+test('scenario 1: Orca 타이머가 꺼져 있어도 fresh epoch due에 paste 1+Enter 1', async () => {
+  const h = await createHarness({ enabled: false, pluginTtlMs: TTL_5M })
   try {
     await h.start()
 
+    // Orca fixture의 타이머는 여전히 꺼져 있다(제품은 더 이상 이 값을 쓰지 않는다).
+    const orcaPayload = await h.userData.readPayload()
+    assert.equal(orcaPayload.enabled, false, 'Orca fixture 타이머는 off')
+
     const doneAt = await h.arm()
-    await h.advanceTo(doneAt + TTL_5M + TICK_MS)
-    await h.settleSend()
-    assert.equal(h.sendFrames().length, 0, 'timer off에서는 5분이 지나도 전송 0')
-
-    // DB 갱신으로 timer on. 기존 idle에는 전송하지 않는다.
-    await h.userData.setTimerSettings({ enabled: true, ttlMs: TTL_5M })
-    await h.advanceTo(h.clock.now() + TICK_MS * 2)
-    await h.settleSend()
-    assert.equal(h.sendFrames().length, 0, 'timer on만으로 기존 idle에 전송하지 않는다')
-
-    const doneAt2 = await h.arm()
     // basisAt은 done 이벤트 1초 전의 마지막 working 시각이므로 due도 1초 앞당겨진다.
-    const dueAt = doneAt2 - 1000 + DUE_5M
+    const dueAt = doneAt - 1000 + DUE_5M
     await h.advanceTo(dueAt - 1000)
     await h.settleSend()
     assert.equal(h.sendFrames().length, 0, 'due 1초 전에는 0')
@@ -376,24 +388,22 @@ test('scenario 1: timer off는 0, on 후 기존 idle 0, 새 turn due에서 paste
 })
 
 // ---------------------------------------------------------------------------
-// 시나리오 2. TTL 1h
+// 시나리오 2. config 미설정 → 제품 기본 1시간 TTL로 dueAt 계산(실제 대기 없음)
 // ---------------------------------------------------------------------------
 
-test('scenario 2: TTL 1h는 done+3480s 부근에서 전송한다', async () => {
-  const h = await createHarness({ enabled: true, ttlMs: TTL_1H })
+test('scenario 2: 플러그인 config가 없으면 기본 1시간 TTL로 dueAt을 계산한다', async () => {
+  const h = await createHarness({ pluginTtlMs: null })
   try {
     await h.start()
     const doneAt = await h.arm()
-    // basisAt은 done 이벤트 1초 전의 마지막 working 시각이므로 due도 1초 앞당겨진다.
-    const dueAt = doneAt - 1000 + DUE_1H
+    const basisAt = doneAt - 1000
 
-    await h.advanceTo(dueAt - 1000)
-    await h.settleSend()
-    assert.equal(h.sendFrames().length, 0, 'due 1초 전 0')
-
-    await h.advanceTo(dueAt + TICK_MS)
-    await h.waitForSendFrames(2)
-    assert.equal(h.sendFrames().length, 2, 'due에서 paste 1 + Enter 1')
+    // 실제 시간을 기다리지 않고 대시보드 snapshot의 dueAt/expiresAt만 검증한다.
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const term = await h.waitForTerminal((entry) => entry.cacheStatus === 'scheduled')
+    assert.equal(term.expiresAt, basisAt + TTL_1H, 'expiresAt = basisAt + 기본 1시간 TTL')
+    assert.equal(term.dueAt, basisAt + DUE_1H, 'dueAt = basisAt + TTL - margin1h')
+    assert.equal(h.sendFrames().length, 0, 'due 전이므로 전송 0')
   } finally {
     await h.cleanup()
   }
@@ -934,6 +944,105 @@ test('scenario 14: deactivate→재activate 뒤 저장된 예약을 ARMED로 복
       dashboard.state.diagnostics.some((entry) => entry.event === 'epoch_restored'),
       'epoch_restored 진단이 기록되어야 한다',
     )
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 15. 명시 5분 TTL + Orca fixture TTL 변경은 스케줄에 영향 없음
+// ---------------------------------------------------------------------------
+
+test('scenario 15: 명시 5분 config로 dueAt을 계산하고 Orca fixture TTL 변경에 영향받지 않는다', async () => {
+  const h = await createHarness({ enabled: true, ttlMs: TTL_1H, pluginTtlMs: TTL_5M })
+  try {
+    await h.start()
+    const doneAt = await h.arm()
+    const basisAt = doneAt - 1000
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const before = await h.waitForTerminal((entry) => entry.cacheStatus === 'scheduled')
+    assert.equal(before.expiresAt, basisAt + TTL_5M, 'expiresAt = basisAt + 명시 5분')
+    assert.equal(before.dueAt, basisAt + DUE_5M, 'dueAt = basisAt + 5분 TTL - margin5m')
+
+    // Orca fixture 타이머 TTL을 1시간으로 바꿔도 플러그인 config 스케줄은 그대로다.
+    await h.userData.setTimerSettings({ enabled: false, ttlMs: TTL_1H })
+    const payload = await h.userData.readPayload()
+    assert.equal(payload.ttlMs, TTL_1H, 'Orca fixture TTL은 1시간으로 바뀌었다')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const after = await h.waitForTerminal((entry) => entry.cacheStatus === 'scheduled')
+    assert.equal(after.dueAt, basisAt + DUE_5M, 'Orca fixture TTL 변경 뒤에도 5분 그대로')
+    assert.equal(after.expiresAt, basisAt + TTL_5M)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 16. config action으로 claudeCacheTtlMs 변경 → ARMED due 재계산
+// ---------------------------------------------------------------------------
+
+test('scenario 16: config action으로 claudeCacheTtlMs를 바꾸면 ARMED dueAt을 재계산한다', async () => {
+  const h = await createHarness({ enabled: true, pluginTtlMs: TTL_5M })
+  try {
+    await h.start()
+    const doneAt = await h.arm()
+    const basisAt = doneAt - 1000
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const before = await h.waitForTerminal((entry) => entry.cacheStatus === 'scheduled')
+    assert.equal(before.dueAt, basisAt + DUE_5M, '처음에는 5분 기준 dueAt')
+
+    const dashboard = await h.openDashboard()
+    const changed = await requestJson({
+      method: 'POST',
+      port: dashboard.port,
+      path: '/api/action',
+      token: dashboard.token,
+      origin: dashboard.origin,
+      body: {
+        type: 'config',
+        patch: { claudeCacheTtlMs: TTL_1H },
+        expectedRevision: dashboard.state.revision,
+      },
+    })
+    assert.equal(changed.status, 200, 'claudeCacheTtlMs 1시간 config POST 성공')
+
+    await h.advanceTo(h.clock.now() + TICK_MS * 3)
+    const after = await h.waitForTerminal(
+      (entry) => entry.cacheStatus === 'scheduled' && entry.dueAt === basisAt + DUE_1H,
+    )
+    assert.equal(after.dueAt, basisAt + DUE_1H, 'dueAt이 1시간 기준으로 재계산된다')
+    assert.equal(after.expiresAt, basisAt + TTL_1H, 'expiresAt도 1시간으로 재계산된다')
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 시나리오 17. 활성 프로필 index 손상/누락 → 전송 0(SETTINGS_UNKNOWN)
+// ---------------------------------------------------------------------------
+
+test('scenario 17: 활성 프로필 index가 손상되면 예약돼도 전송 0(SETTINGS_UNKNOWN)', async () => {
+  const h = await createHarness({ enabled: true, pluginTtlMs: TTL_5M })
+  try {
+    // 활성화 전에 index를 손상시킨다(프로필 unknown).
+    await writeFile(
+      join(h.userData.userDataPath, 'orca-profile-index.json'),
+      '{not-json',
+      'utf8',
+    )
+
+    await h.start()
+    const doneAt = await h.arm()
+    await h.advanceTo(doneAt + DUE_5M + TICK_MS)
+    await h.settleSend()
+    assert.equal(h.sendFrames().length, 0, '프로필 unknown이면 예약돼도 전송 0')
+
+    const dashboard = await h.openDashboard()
+    assert.equal(dashboard.status, 200)
+    assert.equal(dashboard.state.profileSettings.known, false, 'profileSettings.known=false')
   } finally {
     await h.cleanup()
   }
