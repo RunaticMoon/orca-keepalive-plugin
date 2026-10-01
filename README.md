@@ -13,7 +13,7 @@ Cache Keepalive는 [Orca](https://github.com/stablyai/orca)의 **유휴 Claude �
 - 게시자 slug: `runaticmoon` (플러그인 식별자 `runaticmoon.cache-keepalive`)
 - 라이선스: MIT ([LICENSE](LICENSE) 참고)
 - 저장소: https://github.com/RunaticMoon/orca-keepalive-plugin
-- 버전: `0.2.0`
+- 버전: `0.2.1`
 - 선언된 최소 Orca 엔진: `>=1.4.214`
 - 플러그인 API: `pluginApi 1` (`contributes`는 엄격 모드)
 - 런타임: Node >=22.5(개발은 Node 24에서 진행), 빌드 단계 없음, npm 의존성 없음
