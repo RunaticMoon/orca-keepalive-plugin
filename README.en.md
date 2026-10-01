@@ -74,8 +74,9 @@ estimated expiry is known is saved to `epochs-v1` as `kind='hold'`, so after a p
 the same terminal restores the waiting state plus the saved cache basis and estimated expiry
 and shows ⚡ (cache kept · waiting for a reply); nothing is sent before the reply either. If
 the estimated expiry passed while the plugin was offline the hold is restored as display-only
-expiry history (💤), and a hold that was already attempted or whose estimated expiry is
-unknown is saved as history only.
+expiry history (💤). A hold that was already attempted is saved as history only (no
+reservation); a hold whose estimated expiry is unknown has no history either, so it is not
+saved at all and is not restored on restart.
 
 ### Send timing
 
@@ -158,8 +159,9 @@ A **hold** record is restored the same way when the terminal is the same: the wa
 plus the saved cache basis and estimated expiry come back and show ⚡ (cache kept · waiting
 for a reply), nothing is sent before the reply, and if the estimated expiry passed while the
 plugin was offline it is restored as display-only expiry history (💤). A hold that was already
-attempted or whose estimated expiry is unknown comes back as history only (no reservation);
-an entry whose scope needs review (open/uncertain attempt) restores the display only.
+attempted comes back as history only (no reservation), and a hold whose estimated expiry is
+unknown has no history either, so it is not saved and never restored; an entry whose scope
+needs review (open/uncertain attempt) restores the display only.
 
 A **display-only history** record (and an armed record whose expected expiry already
 passed) is restored without creating a schedule: the tab symbol and the dashboard show
@@ -170,12 +172,13 @@ extends this limit.
 
 The storage envelope is version **2**. Version 1 records are still read the old way, but
 no history is reconstructed from them because a version 1 record has no TTL information.
-A `hold` record only adds a new `kind` without bumping the envelope version, so an earlier
-release that reads a version 2 envelope ignores the `hold` record alone and still reads
-armed and history records. An **older** plugin version cannot read a version 2 store and
-restores nothing from it, so downgrading loses the stored schedule and history. Expiry
-history that disappeared before you updated cannot be recovered; only history this version
-observed and saved is preserved.
+A `hold` record only adds a new `kind` without bumping the envelope version, so
+downgrading to a release that reads a version 2 envelope (0.1.9 and later, e.g. 0.2.1)
+ignores the `hold` record alone and still reads armed and history records. Envelope
+version 2 was introduced in 0.1.9, so earlier releases (0.1.8 and below) cannot read a
+version 2 store and restore nothing from it, so downgrading to them loses the stored
+schedule and history. Expiry history that disappeared before you updated cannot be
+recovered; only history this version observed and saved is preserved.
 
 ### Consecutive cap and reset
 

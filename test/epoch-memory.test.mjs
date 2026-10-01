@@ -320,6 +320,43 @@ test('load: v2 envelope의 hold를 적재하고, v1 레코드는 armed로 읽는
   assert.equal(v1memory.get('armed').kind, 'armed');
 });
 
+test('load: v2 envelope에 armed·history·hold가 섞여 있으면 셋 다 적재한다', async () => {
+  const armed = rec({ doneAt: 10000, basisAt: 9000, expiresAt: 310000 });
+  const pending = rec({ doneAt: 20000, basisAt: 19000, kind: 'history', expiresAt: 320000 });
+  const expired = rec({
+    doneAt: 30000,
+    basisAt: 29000,
+    kind: 'history',
+    expiresAt: 330000,
+    expiredAt: 330000,
+  });
+  const hold = rec({ doneAt: 40000, basisAt: 39000, kind: 'hold', expiresAt: 340000 });
+  const host = createFakeHost({
+    initial: {
+      version: 2,
+      entries: {
+        armed: { ...armed, savedAt: 1 },
+        pending: { ...pending, savedAt: 2 },
+        expired: { ...expired, savedAt: 3 },
+        hold: { ...hold, savedAt: 4 },
+      },
+    },
+  });
+  const memory = createEpochMemory({ hostCall: host.hostCall });
+  await memory.load();
+
+  assert.equal(memory.get('armed').kind, 'armed');
+  assert.equal(memory.get('pending').kind, 'history');
+  assert.equal(memory.get('pending').expiredAt, null);
+  assert.equal(memory.get('expired').kind, 'history');
+  assert.equal(memory.get('expired').expiredAt, 330000);
+  assert.equal(memory.get('hold').kind, 'hold');
+  assert.deepEqual(memory.get('armed'), { ...armed, savedAt: 1 });
+  assert.deepEqual(memory.get('pending'), { ...pending, savedAt: 2 });
+  assert.deepEqual(memory.get('expired'), { ...expired, savedAt: 3 });
+  assert.deepEqual(memory.get('hold'), { ...hold, savedAt: 4 });
+});
+
 test('prune: 만료된 hold는 history + expiredAt=expiresAt으로 전환', async () => {
   const host = createFakeHost();
   const memory = createEpochMemory({ hostCall: host.hostCall, now: () => 5000 });
